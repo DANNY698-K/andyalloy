@@ -1,0 +1,5 @@
+Flask
+Werkzeug
+requests
+psycopg2-binary
+gunicorn
