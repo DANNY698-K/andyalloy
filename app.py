@@ -20,7 +20,19 @@ except ImportError:
     psycopg2 = None
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "1495dff8208d99c1764d317cfecc295eee3e2cb9405f944deda5f3b8c53f2960")
+_SECRET_KEY_ENV = os.environ.get("SECRET_KEY")
+if _SECRET_KEY_ENV:
+    app.secret_key = _SECRET_KEY_ENV
+else:
+    # No SECRET_KEY set — generate a random one for this process instead of
+    # falling back to a fixed value (a fixed fallback baked into the source
+    # code is effectively a leaked key). Everyone's sessions reset whenever
+    # the server restarts until a real SECRET_KEY is set as an environment
+    # variable — set one on Render before going live.
+    app.secret_key = pysecrets.token_hex(32)
+    print("[ANDY] WARNING: no SECRET_KEY environment variable set — using a "
+          "temporary random key for this run. Sessions will reset on every "
+          "restart. Set SECRET_KEY as an environment variable before going live.")
 
 # ---------------------------------------------------------------------------
 # SECURITY HARDENING
@@ -546,8 +558,17 @@ def init_db():
     """)
     conn.commit()
 
-    owner_email = "danny@andy.local"
-    owner_password = "changeme123"
+    # Owner credentials come from environment variables so the real production
+    # password is never baked into the source code. ADMIN_EMAIL/ADMIN_PASSWORD
+    # must be set before going live; the fallback values below are for local
+    # testing only and print a loud warning so they're never mistaken for safe
+    # production defaults.
+    owner_email = os.environ.get("ADMIN_EMAIL", "danny@andy.local")
+    owner_password = os.environ.get("ADMIN_PASSWORD")
+    using_fallback_password = owner_password is None
+    if using_fallback_password:
+        owner_password = "changeme123"
+
     existing_owner_row = conn.execute("SELECT * FROM users WHERE email = ?", (owner_email,)).fetchone()
     if existing_owner_row is None:
         conn.execute(
@@ -556,8 +577,13 @@ def init_db():
             (owner_email, generate_password_hash(owner_password)),
         )
         conn.commit()
-        print(f"[ANDY] Seeded admin/owner login -> email: {owner_email}  password: {owner_password}")
-        print("[ANDY] Change this password immediately from Settings once you log in.")
+        if using_fallback_password:
+            print(f"[ANDY] WARNING: no ADMIN_PASSWORD environment variable set — seeded "
+                  f"owner login with a default password -> email: {owner_email}  password: {owner_password}")
+            print("[ANDY] This is NOT safe for production. Set ADMIN_EMAIL and ADMIN_PASSWORD "
+                  "as environment variables, then delete this account and restart so it reseeds correctly.")
+        else:
+            print(f"[ANDY] Seeded admin/owner login -> email: {owner_email}")
     elif existing_owner_row["role"] != "owner":
         # Leftover account from an older version of this app with the same email — upgrade it in place.
         conn.execute("UPDATE users SET role = 'owner' WHERE email = ?", (owner_email,))
@@ -4619,6 +4645,7 @@ def settings():
     return render_template("settings.html", user=user, active_page="settings", auto_open_auth=False)
 
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(debug=FLASK_DEBUG)
