@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, send_from_directory, jsonify
 from jinja2 import DictLoader
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -81,6 +81,7 @@ _SITE_CONTROL_EXEMPT_ENDPOINTS = {
     "admin_site", "admin_controls", "admin_dashboard", "admin_artisans", "add_artisan",
     "toggle_artisan", "admin_jobs", "admin_chats", "job_thread", "post_job_message",
     "admin_update_job", "settings", "forgot_password", "reset_password",
+    "service_worker", "push_icon", "push_key", "push_subscribe", "push_unsubscribe",
 }
 
 
@@ -200,8 +201,14 @@ def upload_to_cloudinary(file_storage):
             timeout=20,
         )
         data = resp.json()
-        return data.get("secure_url")
-    except Exception:
+        url = data.get("secure_url")
+        if not url:
+            print("[ANDY] Cloudinary upload failed:", data.get("error", data))
+            _rewind(file_storage)
+        return url
+    except Exception as exc:
+        print("[ANDY] Cloudinary upload error:", exc)
+        _rewind(file_storage)
         return None
 
 
@@ -224,13 +231,328 @@ def upload_video_to_cloudinary(file_storage):
             timeout=60,
         )
         data = resp.json()
-        return data.get("secure_url")
-    except Exception:
+        url = data.get("secure_url")
+        if not url:
+            print("[ANDY] Cloudinary upload failed:", data.get("error", data))
+            _rewind(file_storage)
+        return url
+    except Exception as exc:
+        print("[ANDY] Cloudinary upload error:", exc)
+        _rewind(file_storage)
         return None
 
 
 def upload_video_media(file_storage):
     return upload_video_to_cloudinary(file_storage)
+
+
+
+# ---------------------------------------------------------------------------
+# EMAIL ALERTS — the owner is emailed on every new customer/artisan message
+# and every feedback / bug report. Uses plain SMTP (Gmail works with an
+# "App Password"). Set these as environment variables:
+#   SMTP_USER=yourgmail@gmail.com   SMTP_PASSWORD=<16-char app password>
+# Optional: NOTIFY_EMAIL (who receives alerts), SMTP_HOST, SMTP_PORT.
+# ---------------------------------------------------------------------------
+import smtplib
+import threading
+from email.message import EmailMessage
+
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "oladimejipamilerin714@gmail.com")
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+
+
+def email_configured():
+    return bool(SMTP_USER and SMTP_PASSWORD and NOTIFY_EMAIL)
+
+
+def _send_email_blocking(to, subject, body):
+    msg = EmailMessage()
+    msg["Subject"] = " ".join(str(subject).split())[:200]
+    msg["From"] = SMTP_USER
+    msg["To"] = to
+    msg.set_content(body)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD.replace(" ", ""))
+        server.send_message(msg)
+
+
+def send_email_async(to, subject, body):
+    """Fire-and-forget so chatting never waits on the mail server."""
+    if not email_configured():
+        print("[ANDY] Email alert skipped (set SMTP_USER and SMTP_PASSWORD):", subject)
+        return None
+
+    def _run():
+        try:
+            _send_email_blocking(to, subject, body)
+        except Exception as exc:
+            print("[ANDY] Email alert failed:", exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
+def _notify_owner_of_message(sender, job, text, attachment_kind):
+    category = (job.get("category") or "")
+    name = sender.get("name") or "Someone"
+    if category == "Feedback":
+        subject = f"💡 New feedback from {name}"
+    elif category == "Bug Report":
+        subject = f"🐞 New bug report from {name}"
+    else:
+        subject = f"💬 New message from {name}"
+    link = url_for("job_thread", job_id=job["id"], _external=True)
+    body = (
+        f"{name} ({sender.get('role', 'user')}) wrote in \"{job.get('title', 'a chat')}\":\n\n"
+        f"{text or '(sent an attachment)'}\n"
+        + (f"\n[attachment: {attachment_kind}]\n" if attachment_kind else "")
+        + f"\nReply here: {link}\n"
+    )
+    send_email_async(NOTIFY_EMAIL, subject, body)
+
+
+def _rewind(file_storage):
+    """After a failed cloud upload, rewind so the local-disk fallback saves the full file."""
+    try:
+        file_storage.stream.seek(0)
+    except Exception:
+        pass
+
+
+print("[ANDY] Cloudinary:", "ON" if cloudinary_configured() else "OFF — set CLOUDINARY_CLOUD_NAME / _API_KEY / _API_SECRET (uploads use local disk)")
+print("[ANDY] Email alerts:", f"ON -> {NOTIFY_EMAIL}" if email_configured() else "OFF — set SMTP_USER and SMTP_PASSWORD")
+
+# ---------------------------------------------------------------------------
+# WEB PUSH — browser notifications (like Temu on the web). They appear even
+# when the ANDY tab is closed. Needs HTTPS (Render has it) and `pywebpush` in
+# requirements.txt. VAPID keys are created automatically the first time and
+# kept in the database; set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY to override.
+# ---------------------------------------------------------------------------
+import base64
+import json as _json
+
+_VAPID_CACHE = {}
+
+
+def _b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def get_vapid_keys():
+    """Return (public, private) VAPID keys, generating and storing them once."""
+    if _VAPID_CACHE:
+        return _VAPID_CACHE["pub"], _VAPID_CACHE["priv"]
+    pub, priv = os.environ.get("VAPID_PUBLIC_KEY", ""), os.environ.get("VAPID_PRIVATE_KEY", "")
+    if not (pub and priv):
+        conn = get_db()
+        rows = {r["k"]: r["v"] for r in conn.execute("SELECT k, v FROM app_kv WHERE k IN ('vapid_pub', 'vapid_priv')").fetchall()}
+        pub, priv = rows.get("vapid_pub", ""), rows.get("vapid_priv", "")
+        if not (pub and priv):
+            try:
+                from cryptography.hazmat.primitives.asymmetric import ec
+                from cryptography.hazmat.primitives import serialization
+                key = ec.generate_private_key(ec.SECP256R1())
+                priv = _b64url(key.private_numbers().private_value.to_bytes(32, "big"))
+                pub = _b64url(key.public_key().public_bytes(
+                    serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint))
+                conn.execute("INSERT INTO app_kv (k, v) VALUES ('vapid_pub', ?)", (pub,))
+                conn.execute("INSERT INTO app_kv (k, v) VALUES ('vapid_priv', ?)", (priv,))
+                conn.commit()
+            except Exception as exc:
+                print("[ANDY] Could not create push keys:", exc)
+                pub = priv = ""
+        conn.close()
+    if pub and priv:
+        _VAPID_CACHE.update(pub=pub, priv=priv)
+    return pub, priv
+
+
+def _push_blocking(subs, payload):
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        print("[ANDY] Push skipped: add `pywebpush` to requirements.txt")
+        return
+    pub, priv = get_vapid_keys()
+    if not priv:
+        return
+    dead = []
+    for sub in subs:
+        try:
+            webpush(
+                subscription_info={"endpoint": sub["endpoint"], "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}},
+                data=_json.dumps(payload),
+                vapid_private_key=priv,
+                vapid_claims={"sub": VAPID_SUBJECT},
+                ttl=86400,
+            )
+        except WebPushException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (404, 410):
+                dead.append(sub["endpoint"])
+            else:
+                print("[ANDY] Push failed:", exc)
+        except Exception as exc:
+            print("[ANDY] Push error:", exc)
+    if dead:
+        conn = get_db()
+        for ep in dead:
+            conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (ep,))
+        conn.commit()
+        conn.close()
+
+
+def send_push_to_users(user_ids, payload):
+    """Look up the users' devices, then send in the background so chat never waits."""
+    user_ids = [u for u in set(user_ids) if u]
+    if not user_ids:
+        return None
+    conn = get_db()
+    marks = ",".join("?" for _ in user_ids)
+    subs = [dict(r) for r in conn.execute(
+        f"SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id IN ({marks})", tuple(user_ids)).fetchall()]
+    conn.close()
+    if not subs:
+        return None
+    t = threading.Thread(target=_push_blocking, args=(subs, payload), daemon=True)
+    t.start()
+    return t
+
+
+def _notify_push(sender, job, text, attachment_kind):
+    conn = get_db()
+    owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
+    art_user = None
+    if job.get("artisan_id"):
+        row = conn.execute("SELECT user_id FROM artisans WHERE id=?", (job["artisan_id"],)).fetchone()
+        art_user = row["user_id"] if row else None
+    conn.close()
+    role = sender.get("role")
+    if role == "customer":
+        ids = owners + [art_user]
+    elif role == "owner":
+        ids = [job.get("customer_id"), art_user]
+    else:
+        ids = [job.get("customer_id")] + owners
+    ids = [i for i in ids if i and i != sender["id"]]
+    category = job.get("category") or ""
+    name = sender.get("name") or "Someone"
+    if category == "Feedback":
+        title = f"💡 Feedback from {name}"
+    elif category == "Bug Report":
+        title = f"🐞 Bug report from {name}"
+    else:
+        title = f"💬 {name}"
+    body = (text or "").strip()[:140] or "📎 Sent an attachment"
+    send_push_to_users(ids, {
+        "title": title, "body": body,
+        "url": url_for("job_thread", job_id=job["id"]), "tag": f"job-{job['id']}",
+    })
+
+
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:" + NOTIFY_EMAIL)
+PUSH_ICON_PNG = base64.b64decode("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")
+
+SERVICE_WORKER_JS = """
+self.addEventListener('install', function(e) { self.skipWaiting(); });
+self.addEventListener('activate', function(e) { e.waitUntil(self.clients.claim()); });
+
+self.addEventListener('push', function(event) {
+  var data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) {}
+  var url = data.url || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function(list) {
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i];
+        try { if (c.focused && new URL(c.url).pathname === url) return; } catch (e) {}
+      }
+      return self.registration.showNotification(data.title || 'ANDY', {
+        body: data.body || '',
+        icon: '/push-icon.png',
+        badge: '/push-icon.png',
+        tag: data.tag || 'andy',
+        renotify: true,
+        data: { url: url }
+      });
+    })
+  );
+});
+
+self.addEventListener('notificationclick', function(event) {
+  event.notification.close();
+  var url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function(list) {
+      for (var i = 0; i < list.length; i++) {
+        if ('focus' in list[i]) { list[i].navigate(url); return list[i].focus(); }
+      }
+      return self.clients.openWindow(url);
+    })
+  );
+});
+"""
+
+
+@app.route("/sw.js")
+def service_worker():
+    resp = Response(SERVICE_WORKER_JS, mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Service-Worker-Allowed"] = "/"
+    return resp
+
+
+@app.route("/push-icon.png")
+def push_icon():
+    resp = Response(PUSH_ICON_PNG, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/push/key")
+def push_key():
+    pub, priv = get_vapid_keys()
+    return jsonify({"enabled": bool(pub and priv), "key": pub})
+
+
+@app.route("/push/subscribe", methods=["POST"])
+def push_subscribe():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "auth"}), 401
+    try:
+        sub = _json.loads(request.form.get("subscription", ""))
+        endpoint = sub["endpoint"]
+        p256dh = sub["keys"]["p256dh"]
+        auth = sub["keys"]["auth"]
+    except Exception:
+        return jsonify({"error": "bad subscription"}), 400
+    if not str(endpoint).startswith("https://"):
+        return jsonify({"error": "bad endpoint"}), 400
+    conn = get_db()
+    conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (endpoint,))
+    conn.execute("INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)",
+                 (user["id"], endpoint, p256dh, auth))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/push/unsubscribe", methods=["POST"])
+def push_unsubscribe():
+    endpoint = request.form.get("endpoint", "")
+    if endpoint:
+        conn = get_db()
+        conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (endpoint,))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -258,11 +580,10 @@ ALLOWED_PHOTO_EXT = {"jpg", "jpeg", "png", "webp"}
 # "Method C" (manual tape entry) is always offered too, as the spec requires.
 # ---------------------------------------------------------------------------
 MEASUREMENT_REFERENCES = [
-    {"id": "door", "label": "Standard door width", "cm": 80},
-    {"id": "a4_long", "label": "A4 paper (long side)", "cm": 29.7},
-    {"id": "a4_short", "label": "A4 paper (short side)", "cm": 21.0},
-    {"id": "card", "label": "Bank/ID card", "cm": 8.56},
-    {"id": "custom", "label": "I have a tape measure (enter exact length)", "cm": None},
+    {"id": "a4", "label": "A4 paper, 29.7 x 21 cm (most accurate)", "mode": "rect", "w": 29.7, "h": 21.0},
+    {"id": "card", "label": "Bank / ID card, 8.56 x 5.4 cm (close-ups only)", "mode": "rect", "w": 8.56, "h": 5.398},
+    {"id": "custom_rect", "label": "Another rectangle (enter its size)", "mode": "rect", "w": None, "h": None},
+    {"id": "tape", "label": "Known length, two points (less accurate)", "mode": "line", "w": None, "h": None},
 ]
 
 PAYSTACK_SECRET_KEY = "sk_test_REPLACE_WITH_YOUR_OWN_TEST_KEY"
@@ -500,11 +821,28 @@ def init_db():
     _add_column_if_missing(conn, "products", "video_url", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "messages", "read_by_owner", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "messages", "read_by_customer", "INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "messages", "read_by_artisan", "INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "work_posts", "status", "TEXT DEFAULT 'approved'")
+    _add_column_if_missing(conn, "work_posts", "submitted_by", "INTEGER")
+    _add_column_if_missing(conn, "work_posts", "category", "TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "work_posts", "reject_reason", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "users", "has_seen_guide", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "users", "reset_token", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "users", "reset_token_expires", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "users", "avatar_filename", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "users", "bio", "TEXT DEFAULT ''")
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id {id_column},
+            user_id INTEGER NOT NULL,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE TABLE IF NOT EXISTS app_kv (k TEXT PRIMARY KEY, v TEXT)")
+    conn.commit()
     _add_column_if_missing(conn, "site_content", "maintenance_mode", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "site_content", "signups_enabled", "INTEGER DEFAULT 1")
     _add_column_if_missing(conn, "site_content", "catalog_enabled", "INTEGER DEFAULT 1")
@@ -732,14 +1070,30 @@ TEMPLATES = {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script>try{if(sessionStorage.getItem('andySplashSeen'))document.documentElement.classList.add('no-splash')}catch(e){}</script>
 </head>
 <body class="theme-{{ user.theme if user else 'green' }} {{ 'dark-mode' if user and user.dark_mode }}">
+
+{% if request.endpoint == 'home' %}
+<div id="splash" aria-label="ANDY">
+  <div class="splash-glow"></div>
+  <div class="splash-center">
+    <div class="splash-float">
+      <div class="splash-logo"><span class="logo-mark"></span><span class="splash-word">ANDY<span>.</span></span></div>
+    </div>
+    <div class="splash-shadow"></div>
+    <div class="splash-caption">The all-in-one service provider for you <span class="splash-smile">😊</span></div>
+  </div>
+  <div class="splash-bar"><i></i></div>
+  <div class="splash-tap">Tap to continue</div>
+</div>
+{% endif %}
 
 <div class="mobile-topbar">
   <span class="logo-mark"></span>
   <span class="mobile-topbar-title">ANDY.</span>
-  <a href="{{ url_for('contact_support') if (user and user.role == 'customer') else url_for('help_page') }}" class="help-icon-btn" title="Help / Customer Care">💬</a>
-  <button onclick="toggleMenu()" class="hamburger-btn">☰</button>
+  <a href="{{ url_for('contact_support') if (user and user.role in ('customer', 'artisan')) else url_for('help_page') }}" class="help-icon-btn" title="Help / Customer Care">💬</a>
+  <button onclick="toggleMenu()" class="hamburger-btn{% if user %} dup-tab{% endif %}">☰</button>
 </div>
 <div class="menu-overlay" onclick="toggleMenu()"></div>
 
@@ -758,43 +1112,37 @@ TEMPLATES = {
       </div>
     {% endif %}
 
-    {% if user and user.role == 'customer' %}
-      <div class="wallet-pill">🪙 {{ user.wallet }} CONNECT {% if user.is_pro %}<span class="pro-badge">PRO</span>{% endif %}</div>
-    {% endif %}
 
     <nav>
-      <a href="{{ url_for('home') }}" class="{{ 'active' if active_page == 'home' }}"><span class="icon">🏠</span><span>Home</span></a>
+      <a href="{{ url_for('home') }}" class="dup-tab {{ 'active' if active_page == 'home' }}"><span class="icon">🏠</span><span>Home</span></a>
 
       {% if not user or user.role == 'customer' %}
         <div class="nav-section-label">Browse</div>
-        <a href="{{ url_for('catalog') }}" class="{{ 'active' if active_page == 'catalog' }}"><span class="icon">🛒</span><span>Catalog</span></a>
+        <a href="{{ url_for('catalog') }}" class="dup-tab {{ 'active' if active_page == 'catalog' }}"><span class="icon">🛒</span><span>Catalog</span></a>
         <a href="{{ url_for('works') }}" class="{{ 'active' if active_page == 'works' }}"><span class="icon">📸</span><span>Our Work</span></a>
-        <a href="{{ url_for('reels') }}" class="{{ 'active' if active_page == 'reels' }}"><span class="icon">🎬</span><span>Reels</span></a>
-        <a href="{{ url_for('tipped_videos') }}" class="{{ 'active' if active_page == 'tipped_videos' }}"><span class="icon">⭐</span><span>Tipped Videos</span></a>
       {% endif %}
 
       {% if user %}
         <div class="nav-section-label">My Account</div>
         {% if user.role == 'customer' %}
-          <a href="{{ url_for('notifications_page') }}" class="{{ 'active' if active_page == 'notifications' }}"><span class="icon">🔔</span><span>Notifications</span>{% if customer_unread_count %}<span class="unread-badge">{{ customer_unread_count }}</span>{% endif %}</a>
+          <a href="{{ url_for('notifications_page') }}" class="{{ 'active' if active_page == 'notifications' }}"><span class="icon">🔔</span><span>Notifications</span><span class="unread-badge js-unread" {% if not customer_unread_count %}style="display:none"{% endif %}>{{ customer_unread_count }}</span></a>
           <a href="{{ url_for('request_service') }}" class="{{ 'active' if active_page == 'request_service' }}"><span class="icon">🛠️</span><span>Request a Service</span></a>
-          <a href="{{ url_for('my_jobs') }}" class="{{ 'active' if active_page == 'my_jobs' }}"><span class="icon">📋</span><span>My Jobs</span></a>
           <a href="{{ url_for('measure_tool') }}" class="{{ 'active' if active_page == 'measure' }}"><span class="icon">📐</span><span>Measure a Window</span></a>
           <a href="{{ url_for('measurement_history') }}" class="{{ 'active' if active_page == 'measure_history' }}"><span class="icon">📏</span><span>Saved Measurements</span></a>
-          <a href="{{ url_for('my_collection') }}" class="{{ 'active' if active_page == 'my_collection' }}"><span class="icon">💚</span><span>My Collection</span></a>
-          <a href="{{ url_for('wallet') }}" class="{{ 'active' if active_page == 'wallet' }}"><span class="icon">👛</span><span>Wallet</span></a>
           <a href="{{ url_for('cart') }}" class="{{ 'active' if active_page == 'cart' }}"><span class="icon">🧺</span><span>My Cart</span></a>
-          <a href="{{ url_for('pro_page') }}" class="{{ 'active' if active_page == 'pro' }}"><span class="icon">⭐</span><span>Go Pro</span></a>
         {% elif user.role == 'artisan' %}
-          <a href="{{ url_for('artisan_jobs') }}" class="{{ 'active' if active_page == 'artisan_jobs' }}"><span class="icon">📋</span><span>My Assigned Jobs</span></a>
+          <a href="{{ url_for('notifications_page') }}" class="{{ 'active' if active_page == 'notifications' }}"><span class="icon">🔔</span><span>Notifications</span><span class="unread-badge js-unread" {% if not customer_unread_count %}style="display:none"{% endif %}>{{ customer_unread_count }}</span></a>
+          <a href="{{ url_for('artisan_jobs') }}" class="dup-tab {{ 'active' if active_page == 'artisan_jobs' }}"><span class="icon">📋</span><span>My Assigned Jobs</span></a>
+          <a href="{{ url_for('artisan_work') }}" class="dup-tab {{ 'active' if active_page == 'artisan_work' }}"><span class="icon">📸</span><span>My Completed Work</span></a>
           <a href="{{ url_for('measure_tool') }}" class="{{ 'active' if active_page == 'measure' }}"><span class="icon">📐</span><span>Measure a Window</span></a>
           <a href="{{ url_for('measurement_history') }}" class="{{ 'active' if active_page == 'measure_history' }}"><span class="icon">📏</span><span>Saved Measurements</span></a>
           <a href="{{ url_for('dashboard') }}" class="{{ 'active' if active_page == 'dashboard' }}"><span class="icon">📊</span><span>Dashboard</span></a>
         {% elif user.role == 'owner' %}
           <a href="{{ url_for('admin_dashboard') }}" class="{{ 'active' if active_page == 'admin_dashboard' }}"><span class="icon">📊</span><span>Admin Overview</span></a>
-          <a href="{{ url_for('admin_chats') }}" class="{{ 'active' if active_page == 'admin_chats' }}"><span class="icon">💬</span><span>Chats</span>{% if admin_unread_count %}<span class="unread-badge">{{ admin_unread_count }}</span>{% endif %}</a>
-          <a href="{{ url_for('admin_artisans') }}" class="{{ 'active' if active_page == 'admin_artisans' }}"><span class="icon">🧑‍🔧</span><span>Artisans</span></a>
-          <a href="{{ url_for('admin_jobs') }}" class="{{ 'active' if active_page == 'admin_jobs' }}"><span class="icon">📋</span><span>All Jobs</span></a>
+          <a href="{{ url_for('admin_works') }}" class="{{ 'active' if active_page == 'admin_works' }}"><span class="icon">📸</span><span>Upload Our Work</span><span class="unread-badge" {% if not pending_work_count %}style="display:none"{% endif %}>{{ pending_work_count }}</span></a>
+          <a href="{{ url_for('admin_chats') }}" class="dup-tab {{ 'active' if active_page == 'admin_chats' }}"><span class="icon">💬</span><span>Chats</span><span class="unread-badge js-unread" {% if not admin_unread_count %}style="display:none"{% endif %}>{{ admin_unread_count }}</span></a>
+          <a href="{{ url_for('admin_artisans') }}" class="dup-tab {{ 'active' if active_page == 'admin_artisans' }}"><span class="icon">🧑‍🔧</span><span>Artisans</span></a>
+          <a href="{{ url_for('admin_jobs') }}" class="dup-tab {{ 'active' if active_page == 'admin_jobs' }}"><span class="icon">📋</span><span>All Jobs</span></a>
           <a href="{{ url_for('dashboard_catalog') }}" class="{{ 'active' if active_page == 'dashboard_catalog' }}"><span class="icon">🛒</span><span>Manage Catalog</span></a>
           <a href="{{ url_for('admin_site') }}" class="{{ 'active' if active_page == 'admin_site' }}"><span class="icon">🖼️</span><span>Site Content</span></a>
           <a href="{{ url_for('admin_controls') }}" class="{{ 'active' if active_page == 'admin_controls' }}"><span class="icon">🎛️</span><span>Site Controls</span></a>
@@ -805,8 +1153,10 @@ TEMPLATES = {
 
     <div class="bottom-links">
       <a href="{{ url_for('about') }}" class="{{ 'active' if active_page == 'about' }}"><span class="icon">ℹ️</span><span>About Andy</span></a>
-      {% if user and user.role == 'customer' %}
-        <a href="{{ url_for('contact_support') }}"><span class="icon">💬</span><span>Contact Andy</span></a>
+      {% if user and user.role in ('customer', 'artisan') %}
+        <a href="{{ url_for('contact_support') }}" class="dup-tab"><span class="icon">💬</span><span>Contact Andy</span></a>
+        <a href="{{ url_for('support_feedback') }}"><span class="icon">📝</span><span>Feedback</span></a>
+        <a href="{{ url_for('support_bug') }}"><span class="icon">🐞</span><span>Report a Bug</span></a>
       {% endif %}
       {% if user %}
         <a href="{{ url_for('settings') }}" class="{{ 'active' if active_page == 'settings' }}"><span class="icon">⚙️</span><span>Settings</span></a>
@@ -818,6 +1168,12 @@ TEMPLATES = {
   </div>
 
   <div class="content-area">
+    {% if user %}
+    <div id="pushBar" class="push-bar" style="display:none;">
+      <span>🔔 Get notified when someone sends you a message</span>
+      <span class="push-actions"><button type="button" id="pushOn">Turn on</button><button type="button" id="pushLater" class="push-later">Not now</button></span>
+    </div>
+    {% endif %}
     <main>
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
@@ -836,19 +1192,17 @@ TEMPLATES = {
   {% if user and user.role == 'artisan' %}
     <a href="{{ url_for('home') }}" class="{{ 'active' if active_page == 'home' }}"><span>🏠</span>Home</a>
     <a href="{{ url_for('artisan_jobs') }}" class="{{ 'active' if active_page == 'artisan_jobs' }}"><span>📋</span>Jobs</a>
-    <a href="{{ url_for('catalog') }}" class="{{ 'active' if active_page == 'catalog' }}"><span>🛒</span>Catalog</a>
+    <a href="{{ url_for('artisan_work') }}" class="{{ 'active' if active_page == 'artisan_work' }}"><span>📸</span>My Work</a>
     <button onclick="toggleMenu()"><span>⚙️</span>More</button>
   {% elif user and user.role == 'owner' %}
     <a href="{{ url_for('home') }}" class="{{ 'active' if active_page == 'home' }}"><span>🏠</span>Home</a>
-    <a href="{{ url_for('admin_chats') }}" class="{{ 'active' if active_page == 'admin_chats' }}"><span>💬</span>Chats{% if admin_unread_count %}<span class="unread-badge" style="position:absolute;margin-left:2px;">{{ admin_unread_count }}</span>{% endif %}</a>
+    <a href="{{ url_for('admin_chats') }}" class="{{ 'active' if active_page == 'admin_chats' }}"><span>💬</span>Chats<span class="unread-badge js-unread" style="position:absolute;margin-left:2px;{% if not admin_unread_count %}display:none;{% endif %}">{{ admin_unread_count }}</span></a>
     <a href="{{ url_for('admin_jobs') }}" class="{{ 'active' if active_page == 'admin_jobs' }}"><span>📋</span>Jobs</a>
     <a href="{{ url_for('admin_artisans') }}" class="{{ 'active' if active_page == 'admin_artisans' }}"><span>🧑‍🔧</span>Techs</a>
     <button onclick="toggleMenu()"><span>⚙️</span>More</button>
   {% else %}
     <a href="{{ url_for('home') }}" class="{{ 'active' if active_page == 'home' }}"><span>🏠</span>Home</a>
-    <a href="{{ url_for('reels') }}" class="{{ 'active' if active_page == 'reels' }}"><span>🎬</span>Reels</a>
     <a href="{{ url_for('catalog') }}" class="{{ 'active' if active_page == 'catalog' }}"><span>🛒</span>Catalogue</a>
-    <a href="{{ url_for('tipped_videos') }}" class="{{ 'active' if active_page == 'tipped_videos' }}"><span>⭐</span>Tipped</a>
     {% if user %}
       <button onclick="toggleMenu()"><span>⚙️</span>More</button>
     {% else %}
@@ -860,6 +1214,22 @@ TEMPLATES = {
 {% include "_auth_modal.html" %}
 
 <script>
+  window.updateUnreadBadges = function(n) {
+    n = parseInt(n, 10) || 0;
+    document.querySelectorAll('.js-unread').forEach(function(b) {
+      b.textContent = n; b.style.display = n ? '' : 'none';
+    });
+    document.title = (n ? '(' + n + ') ' : '') + document.title.replace(/^\\(\\d+\\)\\s*/, '');
+  };
+  {% if user and user.role in ('customer', 'owner', 'artisan') %}
+  setInterval(function() {
+    if (document.hidden) return;
+    fetch('{{ url_for("api_unread") }}', {credentials: 'same-origin'})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) { if (d) window.updateUnreadBadges(d.unread); })
+      .catch(function() {});
+  }, 5000);
+  {% endif %}
   function openAuth() {
     document.getElementById('authModal').classList.add('open');
   }
@@ -884,6 +1254,164 @@ TEMPLATES = {
   {% endif %}
 </script>
 
+
+{% if user and user.role == 'customer' and not user.has_seen_guide and request.endpoint == 'home' %}
+<script>
+window.startAndyTour = function() {
+  var defs = [
+    {sel: '.hero-name', title: 'Welcome to ANDY 😊', text: "Let me show you around. It takes about 20 seconds."},
+    {sel: 'a[href$="/catalog"]', title: 'Catalogue 🛒', text: 'Browse windows, doors and more, with prices and sizes, ready to order.'},
+    {sel: '.sidebar a[href$="/request-service"]', title: 'Request a Service 🛠️', text: 'Need something fixed or built? Start a request here and Andy takes it from there.'},
+    {sel: '.sidebar a[href$="/notifications"]', title: 'Notifications 🔔', text: 'A green number shows up here whenever Andy or your artisan replies.'},
+    {sel: '.help-icon-btn, .sidebar a[href$="/contact-support"]', title: 'Talk to Andy 💬', text: 'Tap here any time to chat directly, with photos and files.'},
+    {sel: '.bottom-tabs button', title: 'More ⚙️', text: 'Your cart, measurements, notifications, settings and everything else live in this menu.'},
+    {sel: '.sidebar a[href$="/settings"]', title: 'Settings ⚙️', text: 'Change your profile, theme and dark mode here.'}
+  ];
+
+  function visible(sel) {
+    var list = document.querySelectorAll(sel);
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.right > 0 && r.left < window.innerWidth && r.bottom > 0 && r.top < window.innerHeight + 2000) return list[i];
+    }
+    return null;
+  }
+
+  var steps = [];
+  defs.forEach(function(d) { var el = visible(d.sel); if (el) steps.push({el: el, title: d.title, text: d.text}); });
+  steps.push({el: null, title: "You're all set 🎉", text: 'Welcome to the family. Go ahead and explore ANDY.'});
+
+  var block = document.createElement('div'); block.className = 'tour-block';
+  var spot = document.createElement('div'); spot.className = 'tour-spot';
+  var card = document.createElement('div'); card.className = 'tour-card';
+  document.body.appendChild(block); document.body.appendChild(spot); document.body.appendChild(card);
+
+  var i = 0;
+  function finish() {
+    [block, spot, card].forEach(function(n) { n.remove(); });
+    window.removeEventListener('resize', place);
+    var fd = new FormData();
+    fd.append('csrf_token', '{{ csrf_token() }}');
+    fetch('{{ url_for("dismiss_guide") }}', {method: 'POST', body: fd, credentials: 'same-origin', redirect: 'manual'}).catch(function() {});
+  }
+  function place() {
+    var s = steps[i], last = i === steps.length - 1;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var w = Math.min(320, vw - 24);
+    card.style.width = w + 'px';
+    if (s.el) {
+      var r = s.el.getBoundingClientRect(), pad = 6;
+      spot.style.cssText = 'left:' + (r.left - pad) + 'px;top:' + (r.top - pad) + 'px;width:' + (r.width + pad * 2) + 'px;height:' + (r.height + pad * 2) + 'px;';
+      var left = Math.max(12, Math.min(r.left + r.width / 2 - w / 2, vw - w - 12));
+      var h = card.offsetHeight;
+      var top = (r.bottom + 16 + h < vh) ? r.bottom + 14 : Math.max(12, r.top - h - 14);
+      card.style.left = left + 'px'; card.style.top = top + 'px'; card.style.transform = 'none';
+    } else {
+      spot.style.cssText = 'left:' + (vw / 2) + 'px;top:' + (vh / 2) + 'px;width:0;height:0;';
+      card.style.left = '50%'; card.style.top = '50%'; card.style.transform = 'translate(-50%,-50%)';
+    }
+  }
+  function show() {
+    var s = steps[i], last = i === steps.length - 1;
+    if (s.el && s.el.scrollIntoView) s.el.scrollIntoView({block: 'center', inline: 'nearest'});
+    var dots = '';
+    for (var k = 0; k < steps.length; k++) dots += '<i class="' + (k === i ? 'on' : '') + '"></i>';
+    card.innerHTML = '<div class="tour-title">' + s.title + '</div><div class="tour-text">' + s.text + '</div>' +
+      '<div class="tour-foot"><div class="tour-dots">' + dots + '</div><div>' +
+      (last ? '' : '<button class="tour-skip" type="button">Skip</button>') +
+      '<button class="tour-next" type="button">' + (last ? "Let's go" : 'Next') + '</button></div></div>';
+    card.querySelector('.tour-next').onclick = function() { if (last) finish(); else { i++; show(); } };
+    var sk = card.querySelector('.tour-skip'); if (sk) sk.onclick = finish;
+    setTimeout(place, 60);
+  }
+  window.addEventListener('resize', place);
+  show();
+};
+</script>
+{% endif %}
+<script>
+(function() {
+  var sp = document.getElementById('splash');
+  function after() { if (window.startAndyTour) window.startAndyTour(); }
+  if (!sp || document.documentElement.classList.contains('no-splash')) { if (sp) sp.remove(); after(); return; }
+  document.body.style.overflow = 'hidden';
+  function close() {
+    if (sp.classList.contains('hide')) return;
+    sp.classList.add('hide');
+    try { sessionStorage.setItem('andySplashSeen', '1'); } catch (e) {}
+    document.body.style.overflow = '';
+    setTimeout(function() { sp.remove(); after(); }, 750);
+  }
+  sp.addEventListener('click', close);
+  setTimeout(close, 3800);
+})();
+</script>
+
+<script>
+(function() {
+  var bar = document.getElementById('pushBar');
+  if (!bar || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || !window.isSecureContext) return;
+  var csrf = '{{ csrf_token() }}';
+  function toKey(b) {
+    var pad = '='.repeat((4 - b.length % 4) % 4);
+    var raw = atob((b + pad).replace(/-/g, '+').replace(/_/g, '/'));
+    var out = new Uint8Array(raw.length);
+    for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+  function save(sub) {
+    var fd = new FormData();
+    fd.append('csrf_token', csrf);
+    fd.append('subscription', JSON.stringify(sub));
+    return fetch('/push/subscribe', { method: 'POST', body: fd, credentials: 'same-origin' });
+  }
+  function subscribe(key) {
+    return navigator.serviceWorker.register('/sw.js').then(function() { return navigator.serviceWorker.ready; })
+      .then(function(reg) {
+        return reg.pushManager.getSubscription().then(function(s) {
+          return s || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: toKey(key) });
+        });
+      }).then(save);
+  }
+  function dismissedRecently() {
+    try { var t = parseInt(localStorage.getItem('andyPushDismissed') || '0', 10); return t && Date.now() - t < 7 * 86400000; } catch (e) { return false; }
+  }
+  fetch('/push/key', { credentials: 'same-origin' }).then(function(r) { return r.json(); }).then(function(cfg) {
+    if (!cfg.enabled) return;
+    if (Notification.permission === 'granted') { subscribe(cfg.key).catch(function() {}); return; }
+    if (Notification.permission === 'denied' || dismissedRecently()) return;
+    bar.style.display = 'flex';
+    document.getElementById('pushOn').onclick = function() {
+      Notification.requestPermission().then(function(p) {
+        if (p !== 'granted') { bar.style.display = 'none'; return; }
+        subscribe(cfg.key).then(function() {
+          bar.innerHTML = '<span>✅ Notifications are on</span>';
+          setTimeout(function() { bar.style.display = 'none'; }, 2500);
+        }).catch(function() { bar.style.display = 'none'; });
+      });
+    };
+    document.getElementById('pushLater').onclick = function() {
+      try { localStorage.setItem('andyPushDismissed', String(Date.now())); } catch (e) {}
+      bar.style.display = 'none';
+    };
+  }).catch(function() {});
+
+  // On logout, stop sending this device the previous user's notifications.
+  document.addEventListener('click', function(e) {
+    var a = e.target.closest ? e.target.closest('a[href$="/logout"]') : null;
+    if (!a) return;
+    e.preventDefault();
+    var go = function() { window.location.href = a.href; };
+    var timer = setTimeout(go, 1200);
+    navigator.serviceWorker.getRegistration().then(function(reg) { return reg ? reg.pushManager.getSubscription() : null; })
+      .then(function(sub) {
+        if (!sub) return;
+        var fd = new FormData(); fd.append('csrf_token', csrf); fd.append('endpoint', sub.endpoint);
+        return fetch('/push/unsubscribe', { method: 'POST', body: fd, credentials: 'same-origin' });
+      }).catch(function() {}).then(function() { clearTimeout(timer); go(); });
+  });
+})();
+</script>
 </body>
 </html>
 ''',
@@ -1001,10 +1529,12 @@ MORE_TEMPLATES_1 = {
   <div class="hero-overlay">
     <div class="hero-name">ANDY</div>
     <div class="hero-title">{{ site.tagline }}</div>
+    {% if not user %}
     <div class="hero-actions">
       <a href="{{ url_for('request_service') if user else '#' }}" onclick="{{ '' if user else 'document.getElementById(\\'authModal\\').classList.add(\\'open\\');return false;' }}" class="btn btn-purple">Get Started</a>
       <a href="#how-it-works" class="btn btn-outline-light">Learn More</a>
     </div>
+    {% endif %}
   </div>
 </div>
 
@@ -1197,12 +1727,12 @@ MORE_TEMPLATES_1 = {
 {% endif %}
 
 <div class="chat-box">
-  <div class="chat-messages">
+  <div class="chat-messages" id="chatMessages" data-job="{{ job.id }}" data-me="{{ user.id }}" data-poll="{{ url_for('job_messages_json', job_id=job.id) }}">
     {% if not messages %}
-      <div class="empty-state">No messages yet.</div>
+      <div class="empty-state" id="chatEmpty">No messages yet.</div>
     {% endif %}
     {% for m in messages %}
-      <div class="msg-row {{ 'msg-row-me' if m.sender_id == user.id else 'msg-row-them' }}">
+      <div class="msg-row {{ 'msg-row-me' if m.sender_id == user.id else 'msg-row-them' }}" data-id="{{ m.id }}">
         {% if m.sender_id != user.id %}
           {% if m.sender_avatar %}
             <div class="profile-avatar msg-avatar" style="background-image:url('{{ m.sender_avatar|photo_url('avatars') }}');"></div>
@@ -1211,8 +1741,8 @@ MORE_TEMPLATES_1 = {
           {% endif %}
         {% endif %}
         <div class="msg {{ 'me' if m.sender_id == user.id else 'them' }}">
-          <div style="font-size:10px;opacity:0.7;margin-bottom:2px;">{{ m.sender_name }} · {{ m.sender_role|title }}</div>
-          {% if m.text %}{{ m.text }}{% endif %}
+          {% if m.sender_id != user.id %}<div class="msg-sender">{{ m.sender_name }} · {{ m.sender_role|title }}</div>{% endif %}
+          {% if m.text %}<span class="msg-text">{{ m.text }}</span>{% endif %}
           {% if m.attachment_filename %}
             {% if m.attachment_kind == 'image' %}
               <div><img src="{{ m.attachment_filename|photo_url('attachments') }}" style="max-width:180px;border-radius:8px;margin-top:6px;"></div>
@@ -1220,11 +1750,12 @@ MORE_TEMPLATES_1 = {
               <div><a href="{{ m.attachment_filename|photo_url('attachments') }}" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>
             {% endif %}
           {% endif %}
+          <span class="msg-meta">{{ (m.created_at|string)[11:16] }}{% if m.sender_id == user.id %} <span class="ticks {{ 'ticks-read' if m.is_read }}" data-tick="{{ m.id }}">{{ '✓✓' if m.is_read else '✓' }}</span>{% endif %}</span>
         </div>
       </div>
     {% endfor %}
   </div>
-  <form class="chat-input telegram-composer" method="POST" action="{{ url_for('post_job_message', job_id=job.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <form class="chat-input telegram-composer" id="chatForm" method="POST" action="{{ url_for('post_job_message', job_id=job.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="button" class="attach-btn" onclick="document.getElementById('chat-file-{{ job.id }}').click()" title="Attach a file or photo">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
@@ -1237,9 +1768,106 @@ MORE_TEMPLATES_1 = {
   <div id="chat-file-label-{{ job.id }}" style="font-size:11px;color:var(--text-muted);padding:4px 12px;"></div>
 </div>
 
+<script>
+(function() {
+  var box = document.getElementById('chatMessages');
+  if (!box) return;
+  var me = parseInt(box.dataset.me, 10);
+  var pollUrl = box.dataset.poll;
+  var form = document.getElementById('chatForm');
+  var busy = false;
+
+  function lastId() {
+    var rows = box.querySelectorAll('.msg-row[data-id]');
+    return rows.length ? parseInt(rows[rows.length - 1].dataset.id, 10) : 0;
+  }
+  function scrollDown() { box.scrollTop = box.scrollHeight; }
+  function esc(t) { var d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+
+  function render(m) {
+    var mine = m.sender_id === me;
+    var row = document.createElement('div');
+    row.className = 'msg-row ' + (mine ? 'msg-row-me' : 'msg-row-them');
+    row.dataset.id = m.id;
+    var h = '';
+    if (!mine) {
+      h += m.avatar_url
+        ? '<div class="profile-avatar msg-avatar" style="background-image:url(\'' + esc(m.avatar_url) + '\');"></div>'
+        : '<div class="profile-avatar profile-avatar-placeholder msg-avatar">' + esc((m.sender_name || '?')[0].toUpperCase()) + '</div>';
+    }
+    h += '<div class="msg ' + (mine ? 'me' : 'them') + '">';
+    if (!mine) h += '<div class="msg-sender">' + esc(m.sender_name) + ' · ' + esc(m.sender_role_label) + '</div>';
+    if (m.text) h += '<span class="msg-text">' + esc(m.text) + '</span>';
+    if (m.attachment_url) {
+      h += m.attachment_kind === 'image'
+        ? '<div><img src="' + esc(m.attachment_url) + '" style="max-width:180px;border-radius:8px;margin-top:6px;"></div>'
+        : '<div><a href="' + esc(m.attachment_url) + '" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>';
+    }
+    h += '<span class="msg-meta">' + esc(m.time);
+    if (mine) h += ' <span class="ticks ' + (m.is_read ? 'ticks-read' : '') + '" data-tick="' + m.id + '">' + (m.is_read ? '✓✓' : '✓') + '</span>';
+    h += '</span></div>';
+    row.innerHTML = h;
+    return row;
+  }
+
+  function apply(data) {
+    if (!data) return;
+    var empty = document.getElementById('chatEmpty');
+    var added = false;
+    (data.messages || []).forEach(function(m) {
+      if (box.querySelector('.msg-row[data-id="' + m.id + '"]')) return;
+      if (empty) { empty.remove(); empty = null; }
+      box.appendChild(render(m));
+      added = true;
+    });
+    (data.read_ids || []).forEach(function(id) {
+      var t = box.querySelector('[data-tick="' + id + '"]');
+      if (t && !t.classList.contains('ticks-read')) { t.classList.add('ticks-read'); t.textContent = '✓✓'; }
+    });
+    if (added) scrollDown();
+    if (window.updateUnreadBadges) window.updateUnreadBadges(data.unread);
+  }
+
+  function poll() {
+    if (busy || document.hidden) return;
+    busy = true;
+    fetch(pollUrl + '?after=' + lastId(), {credentials: 'same-origin', headers: {'X-Requested-With': 'fetch'}})
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(apply)
+      .catch(function() {})
+      .then(function() { busy = false; });
+  }
+  setInterval(poll, 2500);
+  document.addEventListener('visibilitychange', function() { if (!document.hidden) poll(); });
+  scrollDown();
+
+  if (form) {
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var input = form.querySelector('.chat-text-input');
+      var fileIn = form.querySelector('input[type=file]');
+      if (!input.value.trim() && !(fileIn.files && fileIn.files.length)) return;
+      var fd = new FormData(form);
+      var ids = box.querySelectorAll('.msg-row[data-id]');
+      fd.append('after', ids.length ? ids[ids.length - 1].dataset.id : 0);
+      var btn = form.querySelector('.send-btn');
+      btn.disabled = true;
+      fetch(form.action, {method: 'POST', body: fd, credentials: 'same-origin', headers: {'X-Requested-With': 'fetch'}})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          input.value = ''; fileIn.value = '';
+          var lbl = document.querySelector('[id^="chat-file-label-"]'); if (lbl) lbl.textContent = '';
+          apply(d);
+        })
+        .catch(function() { form.submit(); })
+        .then(function() { btn.disabled = false; input.focus(); });
+    });
+  }
+})();
+</script>
+
 {% endblock %}
 ''',
-
 }
 
 MORE_TEMPLATES_2 = {
@@ -1803,6 +2431,93 @@ MORE_TEMPLATES_3 = {
 {% endblock %}
 ''',
 
+"admin_works.html": '''{% extends "base.html" %}
+{% block content %}
+<div class="section-title">📸 Upload Our Work</div>
+<p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">Show customers the windows and doors you have finished. Everything here appears on the public <b>Our Work</b> page as ANDY's work.</p>
+
+<div class="settings-card">
+  <div class="settings-card-title">Upload a finished job</div>
+  <form method="POST" action="{{ url_for('works') }}" enctype="multipart/form-data" class="auth-form" style="margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="next" value="{{ url_for('admin_works') }}">
+    <input type="text" name="title" placeholder="Project title (e.g. 3-panel sliding window, Lekki)" required maxlength="120">
+    <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
+    <textarea name="description" placeholder="What was the job? Size, materials, result" rows="3"></textarea>
+    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple required>
+    <button class="btn btn-purple" type="submit">Publish to Our Work</button>
+  </form>
+</div>
+
+<div class="section-title" style="margin-top:22px;">⏳ Waiting for your review {% if pending %}<span class="unread-badge">{{ pending|length }}</span>{% endif %}</div>
+{% for w in pending %}
+  <div class="settings-card">
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Submitted by <b>{{ w.submitter or 'an artisan' }}</b> · only you can see this name</div>
+    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    <form method="POST" action="{{ url_for('admin_work_approve', work_id=w.id) }}" class="auth-form" style="margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="text" name="title" value="{{ w.title }}" maxlength="120">
+      <select name="category"><option value="">Category</option>{% for c in categories %}<option value="{{ c }}" {{ 'selected' if w.category == c }}>{{ c }}</option>{% endfor %}</select>
+      <textarea name="description" rows="2">{{ w.description }}</textarea>
+      <button class="btn btn-purple" type="submit">✅ Approve and publish</button>
+    </form>
+    <form method="POST" action="{{ url_for('admin_work_reject', work_id=w.id) }}" class="auth-form" style="margin-top:8px;display:flex;gap:8px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="text" name="reason" placeholder="Reason (optional, the artisan sees it)" maxlength="200" style="flex:1;">
+      <button class="btn btn-outline" type="submit">Reject</button>
+    </form>
+  </div>
+{% endfor %}
+{% if not pending %}<div class="empty-state">Nothing waiting. Work your artisans upload shows up here.</div>{% endif %}
+
+<div class="section-title" style="margin-top:22px;">✅ Published</div>
+{% for w in published %}
+  <div class="feed-post">
+    <div class="job-title" style="margin-bottom:6px;">{{ w.title }}{% if w.category %} <span class="work-tag">{{ w.category }}</span>{% endif %}{% if w.submitter %} <span class="work-tag">by {{ w.submitter }}</span>{% endif %}</div>
+    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos[:4] %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    <form method="POST" action="{{ url_for('delete_work', work_id=w.id) }}" style="margin-top:10px;" onsubmit="return confirm('Remove this from Our Work?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next" value="{{ url_for('admin_works') }}">
+      <button class="btn btn-outline" type="submit" style="font-size:11px;padding:6px 10px;">Remove</button>
+    </form>
+  </div>
+{% endfor %}
+{% if not published %}<div class="empty-state">No work published yet. Upload your first job above.</div>{% endif %}
+{% endblock %}
+''',
+
+"artisan_work.html": '''{% extends "base.html" %}
+{% block content %}
+<div class="section-title">📸 My Completed Work</div>
+<p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">Upload photos of jobs you have finished. Andy checks each one first. Approved work appears on the public Our Work page as ANDY's work.</p>
+
+<div class="settings-card">
+  <div class="settings-card-title">Add a finished job</div>
+  <form method="POST" enctype="multipart/form-data" class="auth-form" style="margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="text" name="title" placeholder="What did you make? (e.g. Sliding window, 150 x 120 cm)" required maxlength="120">
+    <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
+    <textarea name="description" placeholder="Materials, size, anything worth noting" rows="3"></textarea>
+    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple required>
+    <p style="font-size:12px;color:var(--text-muted);">Up to 8 clear photos. Do not include customer names or phone numbers.</p>
+    <button class="btn btn-purple" type="submit">Send to Andy for review</button>
+  </form>
+</div>
+
+<div class="section-title" style="margin-top:22px;">My submissions</div>
+{% for w in mine %}
+  <div class="feed-post">
+    <div class="job-title" style="margin-bottom:6px;">{{ w.title }}
+      <span class="work-status work-status-{{ w.status }}">{{ {'pending':'⏳ Waiting for review','approved':'✅ Live','rejected':'❌ Not approved'}[w.status] }}</span></div>
+    {% if w.status == 'rejected' and w.reject_reason %}<div class="feed-post-caption" style="color:#ef4444;">Andy says: {{ w.reject_reason }}</div>{% endif %}
+    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos[:4] %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    {% if w.status != 'approved' %}
+      <form method="POST" style="margin-top:10px;" onsubmit="return confirm('Remove this submission?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="action" value="delete"><input type="hidden" name="work_id" value="{{ w.id }}">
+        <button class="btn btn-outline" type="submit" style="font-size:11px;padding:6px 10px;">Remove</button>
+      </form>
+    {% endif %}
+  </div>
+{% endfor %}
+{% if not mine %}<div class="empty-state">You have not uploaded any work yet.</div>{% endif %}
+{% endblock %}
+''',
+
 "settings.html": '''{% extends "base.html" %}
 {% block content %}
 
@@ -2083,16 +2798,16 @@ function shareReel(title, url) {
 {% block content %}
 
 <div class="section-title">📐 Camera Window Measurement Assistant</div>
-<p style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">A quick preliminary estimate — not a replacement for a tape measure. Always confirm the real opening before fabrication.</p>
+<p style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">A quick estimate for quoting. Always confirm the real opening with a tape measure before cutting anything.</p>
 
 <div id="step-camera" class="measure-step">
   <div class="info-card" style="margin-bottom:14px;">
-    <b>Before you take the photo:</b>
+    <b>For an accurate reading:</b>
     <ol style="margin:8px 0 0 18px;padding:0;font-size:13px;line-height:1.7;">
-      <li>Stand directly in front of the window, phone level.</li>
-      <li>Make sure the whole opening is visible.</li>
-      <li>Good lighting, avoid blur.</li>
-      <li>Align the opening inside the guide frame below.</li>
+      <li>Stick or hold a flat <b>A4 sheet</b> on the glass or frame, <b>in the same plane as the window</b>, near the middle.</li>
+      <li>Stand <b>2 to 3 metres back</b>, directly in front, so the whole window and the sheet are in the photo.</li>
+      <li>Use the normal 1x camera. <b>Not ultra-wide</b> (0.5x), it bends the edges.</li>
+      <li>Good light, no blur.</li>
     </ol>
   </div>
   <div class="camera-wrap">
@@ -2104,45 +2819,68 @@ function shareReel(title, url) {
     <button type="button" class="btn btn-purple" id="captureBtn" onclick="capturePhoto()">📸 Capture</button>
     <label class="btn btn-outline" style="cursor:pointer;">
       Upload a photo instead
-      <input type="file" id="uploadFallback" accept="image/*" capture="environment" style="display:none;" onchange="handleUpload(event)">
+      <input type="file" id="uploadFallback" accept="image/*" style="display:none;" onchange="handleUpload(event)">
     </label>
   </div>
-  <p id="cameraError" style="font-size:12px;color:var(--gold);margin-top:8px;display:none;">Couldn't access your camera — use "Upload a photo instead."</p>
+  <p id="cameraError" style="font-size:12px;color:var(--gold);margin-top:8px;display:none;">Couldn't access your camera. Use "Upload a photo instead."</p>
 </div>
 
 <div id="step-reference" class="measure-step" style="display:none;">
-  <canvas id="photoCanvas"></canvas>
-  <div class="info-card" style="margin-top:12px;">
-    <b>Step 2 — Pick a reference</b>
-    <p style="font-size:12px;color:var(--text-muted);margin-top:4px;">No tape? Use something you already have.</p>
+  <div class="info-card" style="margin-bottom:12px;">
+    <b>Step 2: Mark your reference</b>
     <select id="referenceSelect" onchange="onReferenceChange()" style="margin-top:8px;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
       {% for r in references %}
-        <option value="{{ r.id }}" data-cm="{{ r.cm or '' }}">{{ r.label }}</option>
+        <option value="{{ r.id }}" data-mode="{{ r.mode }}" data-w="{{ r.w or '' }}" data-h="{{ r.h or '' }}">{{ r.label }}</option>
       {% endfor %}
     </select>
-    <input type="number" id="customCm" placeholder="Exact length in cm" style="display:none;margin-top:8px;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
-    <p id="refInstruction" style="font-size:12px;color:var(--text-muted);margin-top:10px;">Tap the two ends of your reference object in the photo above.</p>
+    <div id="customRectBox" style="display:none;gap:8px;margin-top:8px;">
+      <input type="number" id="customW" step="0.1" placeholder="Width cm" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;">
+      <input type="number" id="customH" step="0.1" placeholder="Height cm" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;">
+    </div>
+    <input type="number" id="customLen" step="0.1" placeholder="Exact length in cm" style="display:none;margin-top:8px;width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;">
+    <p id="refInstruction" style="font-size:13px;margin-top:10px;"></p>
   </div>
-  <button type="button" class="btn btn-purple" id="toEdgesBtn" onclick="goToEdges()" disabled style="margin-top:10px;width:100%;">Next: Mark Window Edges</button>
+  <canvas id="photoCanvas"></canvas>
+  <div style="display:flex;gap:8px;margin-top:8px;">
+    <button type="button" class="btn btn-outline" style="flex:1;" onclick="refEditor.undo()">Undo</button>
+    <button type="button" class="btn btn-outline" style="flex:1;" onclick="refEditor.reset()">Start over</button>
+  </div>
+  <p style="font-size:12px;color:var(--text-muted);margin-top:8px;">Tip: tap to drop a point, then drag it to fine-tune. A magnifier shows while you drag.</p>
+  <button type="button" class="btn btn-purple" id="toEdgesBtn" onclick="goToEdges()" disabled style="margin-top:10px;width:100%;">Next: mark the window corners</button>
 </div>
 
 <div id="step-edges" class="measure-step" style="display:none;">
+  <p id="edgeInstruction" class="info-card" style="margin-bottom:12px;font-size:13px;"></p>
   <canvas id="photoCanvas2"></canvas>
-  <p id="edgeInstruction" class="info-card" style="margin-top:12px;font-size:13px;">Tap the <b>LEFT</b> edge of the window, then the <b>RIGHT</b> edge.</p>
-  <button type="button" class="btn btn-purple" id="calcBtn" onclick="calculateMeasurement()" disabled style="width:100%;">Calculate</button>
+  <div style="display:flex;gap:8px;margin-top:8px;">
+    <button type="button" class="btn btn-outline" style="flex:1;" onclick="winEditor.undo()">Undo</button>
+    <button type="button" class="btn btn-outline" style="flex:1;" onclick="winEditor.reset()">Start over</button>
+  </div>
+  <button type="button" class="btn btn-purple" id="calcBtn" onclick="calculateMeasurement()" disabled style="width:100%;margin-top:10px;">Calculate</button>
 </div>
 
 <div id="step-result" class="measure-step" style="display:none;">
   <div id="confidenceBanner" class="info-card" style="display:none;background:rgba(217,166,61,0.1);border-color:var(--gold);">
     <b>⚠️ Low-confidence estimate</b>
-    <p style="font-size:12px;margin-top:4px;">We couldn't confidently determine the measurement from this photo. Try again with the reference object fully visible and placed further apart.</p>
+    <ul id="confidenceReasons" style="font-size:12px;margin:6px 0 0 16px;padding:0;"></ul>
   </div>
   <div class="settings-card">
     <div class="settings-card-title">Estimated Measurement</div>
     <div style="font-size:28px;font-family:'Sora',sans-serif;font-weight:700;margin:10px 0;">
       <span id="resultWidth">0</span> cm × <span id="resultHeight">0</span> cm
     </div>
-    <p style="font-size:12px;color:var(--text-muted);">These measurements are estimates based on the photo and reference scale. Confirm the actual opening dimensions before fabrication.</p>
+    <p id="accuracyLine" style="font-size:13px;margin-bottom:6px;"></p>
+    <p style="font-size:12px;color:var(--text-muted);">Width × height. Confirm the actual opening with a tape measure before fabrication.</p>
+  </div>
+
+  <div class="settings-card">
+    <div class="settings-card-title">Check against a tape (optional)</div>
+    <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Measured the real window? Enter it to see how far off this estimate is.</p>
+    <div style="display:flex;gap:8px;">
+      <input type="number" id="actualW" step="0.1" placeholder="Real width cm" oninput="checkActual()" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;">
+      <input type="number" id="actualH" step="0.1" placeholder="Real height cm" oninput="checkActual()" style="flex:1;padding:10px;border:1px solid var(--border);border-radius:8px;">
+    </div>
+    <p id="actualResult" style="font-size:13px;margin-top:8px;"></p>
   </div>
 
   <form method="POST" action="{{ url_for('save_measurement') }}" class="auth-form settings-card" id="saveForm">
@@ -2154,7 +2892,7 @@ function shareReel(title, url) {
     <input type="hidden" name="confidence" id="formConfidence">
     <input type="hidden" name="photo_data" id="formPhotoData">
     <input type="text" name="project_name" placeholder="Project / customer name (optional)">
-    <textarea name="notes" placeholder="Notes (optional)" rows="2"></textarea>
+    <textarea name="notes" id="formNotes" placeholder="Notes (optional)" rows="2"></textarea>
     <div style="display:flex;gap:10px;">
       <button type="button" class="btn btn-outline" style="flex:1;" onclick="location.reload()">Measure Again</button>
       <button type="submit" class="btn btn-gold" style="flex:1;">Save Measurement</button>
@@ -2166,30 +2904,33 @@ function shareReel(title, url) {
 var video = document.getElementById('cameraFeed');
 var stream = null;
 var capturedDataUrl = null;
+var photoImg = null;
+var refEditor = null, winEditor = null;
 
-navigator.mediaDevices && navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-  .then(function(s) { stream = s; video.srcObject = s; })
-  .catch(function() { document.getElementById('cameraError').style.display = 'block'; });
+if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } })
+    .then(function(s) { stream = s; video.srcObject = s; })
+    .catch(function() { document.getElementById('cameraError').style.display = 'block'; });
+} else {
+  document.getElementById('cameraError').style.display = 'block';
+}
 
 function capturePhoto() {
   var canvas = document.createElement('canvas');
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  capturedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  var url = canvas.toDataURL('image/jpeg', 0.92);
   flashCaptureSuccess();
   if (stream) { stream.getTracks().forEach(function(t){ t.stop(); }); }
-  setTimeout(function() { showReferenceStep(capturedDataUrl); }, 650);
+  setTimeout(function() { showReferenceStep(url); }, 650);
 }
 
 function handleUpload(evt) {
   var file = evt.target.files[0];
   if (!file) return;
   var reader = new FileReader();
-  reader.onload = function(e) {
-    capturedDataUrl = e.target.result;
-    showReferenceStep(capturedDataUrl);
-  };
+  reader.onload = function(e) { showReferenceStep(e.target.result); };
   reader.readAsDataURL(file);
 }
 
@@ -2204,148 +2945,268 @@ function flashCaptureSuccess() {
   }, 600);
 }
 
-// ---- Canvas marking engine (kept isolated so it can be swapped for real
-// computer-vision edge/reference detection later without touching the rest
-// of this page) ----
-var refPoints = [];
-var edgePoints = []; // [leftX,leftY, rightX,rightY, topX,topY, bottomX,bottomY]
-var imgNatural = { w: 0, h: 0 };
-
-function drawPhotoOnCanvas(canvasEl, dataUrl, onReady) {
+// Downscale big phone photos (keeps uploads small) and bake in orientation.
+function normalizeImage(dataUrl, cb) {
   var img = new Image();
   img.onload = function() {
-    imgNatural.w = img.width; imgNatural.h = img.height;
-    var maxW = Math.min(500, window.innerWidth - 40);
-    var scale = maxW / img.width;
-    canvasEl.width = maxW;
-    canvasEl.height = img.height * scale;
-    canvasEl._scale = scale;
-    canvasEl._img = img;
-    canvasEl.getContext('2d').drawImage(img, 0, 0, canvasEl.width, canvasEl.height);
-    if (onReady) onReady();
+    var s = Math.min(1, 1600 / Math.max(img.width, img.height));
+    var c = document.createElement('canvas');
+    c.width = Math.round(img.width * s);
+    c.height = Math.round(img.height * s);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    capturedDataUrl = c.toDataURL('image/jpeg', 0.9);
+    photoImg = new Image();
+    photoImg.onload = cb;
+    photoImg.src = capturedDataUrl;
   };
   img.src = dataUrl;
 }
 
-function showReferenceStep(dataUrl) {
-  document.getElementById('step-camera').style.display = 'none';
-  document.getElementById('step-reference').style.display = 'block';
-  var canvas = document.getElementById('photoCanvas');
-  drawPhotoOnCanvas(canvas, dataUrl);
-  canvas.onclick = function(e) {
-    if (refPoints.length >= 2) return;
-    var rect = canvas.getBoundingClientRect();
-    var x = e.clientX - rect.left, y = e.clientY - rect.top;
-    refPoints.push({x:x, y:y});
-    redrawReferenceCanvas();
-    if (refPoints.length === 2) checkReferenceReady();
-  };
+// ---------------------------------------------------------------------
+// Geometry. A homography maps the photo plane onto the real (cm) plane,
+// which removes the error caused by photographing at an angle.
+// ---------------------------------------------------------------------
+function solveLinear(A, b) {
+  var n = b.length, i, j, k;
+  for (i = 0; i < n; i++) A[i].push(b[i]);
+  for (i = 0; i < n; i++) {
+    var p = i;
+    for (j = i + 1; j < n; j++) if (Math.abs(A[j][i]) > Math.abs(A[p][i])) p = j;
+    if (Math.abs(A[p][i]) < 1e-10) return null;
+    var tmp = A[i]; A[i] = A[p]; A[p] = tmp;
+    for (j = i + 1; j < n; j++) {
+      var f = A[j][i] / A[i][i];
+      for (k = i; k <= n; k++) A[j][k] -= f * A[i][k];
+    }
+  }
+  var x = new Array(n);
+  for (i = n - 1; i >= 0; i--) {
+    var sum = A[i][n];
+    for (j = i + 1; j < n; j++) sum -= A[i][j] * x[j];
+    x[i] = sum / A[i][i];
+  }
+  return x;
+}
+function homography(src, dst) {
+  var A = [], b = [], i;
+  for (i = 0; i < 4; i++) {
+    var x = src[i].x, y = src[i].y, u = dst[i].x, v = dst[i].y;
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  return solveLinear(A, b);
+}
+function applyH(h, p) {
+  var d = h[6] * p.x + h[7] * p.y + 1;
+  return { x: (h[0] * p.x + h[1] * p.y + h[2]) / d, y: (h[3] * p.x + h[4] * p.y + h[5]) / d };
+}
+function dist(a, b) { return Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }
+function cornerAngle(c, a, b) {
+  var v1x = a.x - c.x, v1y = a.y - c.y, v2x = b.x - c.x, v2y = b.y - c.y;
+  var cos = (v1x * v2x + v1y * v2y) / (Math.sqrt(v1x * v1x + v1y * v1y) * Math.sqrt(v2x * v2x + v2y * v2y));
+  return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
 }
 
-function redrawReferenceCanvas() {
-  var canvas = document.getElementById('photoCanvas');
-  var ctx = canvas.getContext('2d');
-  ctx.drawImage(canvas._img, 0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#22C55E'; ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 2;
-  refPoints.forEach(function(p) { ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill(); });
-  if (refPoints.length === 2) {
-    ctx.beginPath(); ctx.moveTo(refPoints[0].x, refPoints[0].y); ctx.lineTo(refPoints[1].x, refPoints[1].y); ctx.stroke();
+// ---------------------------------------------------------------------
+// Point editor: tap to place, drag to adjust, magnifier while dragging.
+// ---------------------------------------------------------------------
+function PointEditor(canvas, labels, onChange) {
+  var self = this;
+  self.canvas = canvas; self.labels = labels; self.pts = []; self.active = -1; self.onChange = onChange;
+  var w = Math.min(560, window.innerWidth - 44);
+  canvas.width = w;
+  canvas.height = Math.round(photoImg.height * w / photoImg.width);
+  canvas.style.width = w + 'px';
+  self.scale = w / photoImg.width;
+
+  function pos(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * canvas.width / r.width, y: (e.clientY - r.top) * canvas.height / r.height };
   }
+  canvas.onpointerdown = function(e) {
+    e.preventDefault();
+    var p = pos(e), best = -1, bd = 30, i;
+    for (i = 0; i < self.pts.length; i++) { var d = dist(p, self.pts[i]); if (d < bd) { bd = d; best = i; } }
+    if (best < 0 && self.pts.length < self.labels.length) { self.pts.push(p); best = self.pts.length - 1; }
+    self.active = best;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    self.draw();
+  };
+  canvas.onpointermove = function(e) {
+    if (self.active < 0) return;
+    e.preventDefault();
+    var p = pos(e);
+    self.pts[self.active] = { x: Math.max(0, Math.min(canvas.width, p.x)), y: Math.max(0, Math.min(canvas.height, p.y)) };
+    self.draw();
+  };
+  canvas.onpointerup = canvas.onpointercancel = function() {
+    self.active = -1; self.draw(); self.onChange();
+  };
+  self.draw();
+}
+PointEditor.prototype.imgPts = function() {
+  var s = this.scale;
+  return this.pts.map(function(p) { return { x: p.x / s, y: p.y / s }; });
+};
+PointEditor.prototype.complete = function() { return this.pts.length === this.labels.length; };
+PointEditor.prototype.undo = function() { this.pts.pop(); this.draw(); this.onChange(); };
+PointEditor.prototype.reset = function() { this.pts = []; this.draw(); this.onChange(); };
+PointEditor.prototype.draw = function() {
+  var c = this.canvas, ctx = c.getContext('2d'), pts = this.pts, i;
+  ctx.drawImage(photoImg, 0, 0, c.width, c.height);
+  ctx.lineWidth = 2; ctx.strokeStyle = '#22C55E'; ctx.fillStyle = '#22C55E';
+  if (pts.length > 1) {
+    ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+    for (i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    if (this.labels.length === 4 && pts.length === 4) ctx.closePath();
+    ctx.stroke();
+  }
+  ctx.font = 'bold 12px sans-serif';
+  for (i = 0; i < pts.length; i++) {
+    ctx.beginPath(); ctx.arc(pts[i].x, pts[i].y, 6, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText(this.labels[i], pts[i].x + 9, pts[i].y - 8); ctx.fillStyle = '#22C55E';
+  }
+  if (this.active >= 0) {
+    var p = pts[this.active], r = 46, z = 3;
+    var lx = p.x < c.width / 2 ? c.width - r - 8 : r + 8;
+    var ly = p.y < 130 ? c.height - r - 8 : r + 8;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(lx, ly, r, 0, 7); ctx.clip();
+    var half = (r / z) / this.scale;
+    ctx.drawImage(photoImg, p.x / this.scale - half, p.y / this.scale - half, half * 2, half * 2, lx - r, ly - r, r * 2, r * 2);
+    ctx.restore();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(lx, ly, r, 0, 7); ctx.stroke();
+    ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(lx - 10, ly); ctx.lineTo(lx + 10, ly); ctx.moveTo(lx, ly - 10); ctx.lineTo(lx, ly + 10); ctx.stroke();
+  }
+};
+
+// ---------------------------------------------------------------------
+// Steps
+// ---------------------------------------------------------------------
+function refInfo() {
+  var sel = document.getElementById('referenceSelect');
+  var opt = sel.selectedOptions[0];
+  var mode = opt.getAttribute('data-mode');
+  var w = parseFloat(opt.getAttribute('data-w')) || 0, h = parseFloat(opt.getAttribute('data-h')) || 0;
+  if (sel.value === 'custom_rect') { w = parseFloat(document.getElementById('customW').value) || 0; h = parseFloat(document.getElementById('customH').value) || 0; }
+  var len = mode === 'line' ? (parseFloat(document.getElementById('customLen').value) || 0) : 0;
+  return { mode: mode, w: w, h: h, len: len, label: opt.textContent };
+}
+
+function showReferenceStep(dataUrl) {
+  normalizeImage(dataUrl, function() {
+    document.getElementById('step-camera').style.display = 'none';
+    document.getElementById('step-reference').style.display = 'block';
+    onReferenceChange();
+  });
 }
 
 function onReferenceChange() {
   var sel = document.getElementById('referenceSelect');
-  var isCustom = sel.value === 'custom';
-  document.getElementById('customCm').style.display = isCustom ? 'block' : 'none';
+  var info = refInfo();
+  document.getElementById('customRectBox').style.display = sel.value === 'custom_rect' ? 'flex' : 'none';
+  document.getElementById('customLen').style.display = info.mode === 'line' ? 'block' : 'none';
+  var labels = info.mode === 'line' ? ['1', '2'] : ['1 TL', '2 TR', '3 BR', '4 BL'];
+  document.getElementById('refInstruction').innerHTML = info.mode === 'line'
+    ? 'Tap the <b>two ends</b> of your known length. <i>Less accurate: only works well if you photographed straight-on.</i>'
+    : 'Tap the <b>4 corners</b> of the reference in order: <b>top-left, top-right, bottom-right, bottom-left</b> (as it looks in the photo).';
+  refEditor = new PointEditor(document.getElementById('photoCanvas'), labels, checkReferenceReady);
   checkReferenceReady();
 }
 
 function checkReferenceReady() {
-  var sel = document.getElementById('referenceSelect');
-  var isCustom = sel.value === 'custom';
-  var cmOk = isCustom ? parseFloat(document.getElementById('customCm').value) > 0 : true;
-  document.getElementById('toEdgesBtn').disabled = !(refPoints.length === 2 && cmOk);
+  var info = refInfo();
+  var dimsOk = info.mode === 'line' ? info.len > 0 : (info.w > 0 && info.h > 0);
+  document.getElementById('toEdgesBtn').disabled = !(refEditor && refEditor.complete() && dimsOk);
 }
-document.getElementById('customCm').addEventListener('input', checkReferenceReady);
-
-function getReferenceCm() {
-  var sel = document.getElementById('referenceSelect');
-  if (sel.value === 'custom') return parseFloat(document.getElementById('customCm').value) || 0;
-  return parseFloat(sel.selectedOptions[0].getAttribute('data-cm')) || 0;
-}
-function getReferenceLabel() {
-  var sel = document.getElementById('referenceSelect');
-  return sel.selectedOptions[0].textContent;
-}
-
-function dist(a, b) { return Math.sqrt(Math.pow(a.x-b.x,2) + Math.pow(a.y-b.y,2)); }
+['customW', 'customH', 'customLen'].forEach(function(id) { document.getElementById(id).addEventListener('input', checkReferenceReady); });
 
 function goToEdges() {
   document.getElementById('step-reference').style.display = 'none';
   document.getElementById('step-edges').style.display = 'block';
-  var canvas2 = document.getElementById('photoCanvas2');
-  drawPhotoOnCanvas(canvas2, capturedDataUrl, function() {
-    canvas2.onclick = function(e) {
-      if (edgePoints.length >= 4) return;
-      var rect = canvas2.getBoundingClientRect();
-      var x = e.clientX - rect.left, y = e.clientY - rect.top;
-      edgePoints.push({x:x, y:y});
-      redrawEdgeCanvas();
-      updateEdgeInstruction();
-    };
+  document.getElementById('edgeInstruction').innerHTML = 'Tap the <b>4 inside corners of the window opening</b> in order: <b>top-left, top-right, bottom-right, bottom-left</b>. Drag to fine-tune.';
+  winEditor = new PointEditor(document.getElementById('photoCanvas2'), ['1 TL', '2 TR', '3 BR', '4 BL'], function() {
+    document.getElementById('calcBtn').disabled = !winEditor.complete();
   });
 }
 
-function redrawEdgeCanvas() {
-  var canvas = document.getElementById('photoCanvas2');
-  var ctx = canvas.getContext('2d');
-  ctx.drawImage(canvas._img, 0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#22C55E'; ctx.strokeStyle = '#22C55E'; ctx.lineWidth = 2;
-  edgePoints.forEach(function(p) { ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill(); });
-  if (edgePoints.length >= 2) { ctx.beginPath(); ctx.moveTo(edgePoints[0].x, edgePoints[0].y); ctx.lineTo(edgePoints[1].x, edgePoints[1].y); ctx.stroke(); }
-  if (edgePoints.length >= 4) { ctx.beginPath(); ctx.moveTo(edgePoints[2].x, edgePoints[2].y); ctx.lineTo(edgePoints[3].x, edgePoints[3].y); ctx.stroke(); }
-}
-
-function updateEdgeInstruction() {
-  var msgs = [
-    'Tap the <b>LEFT</b> edge of the window, then the <b>RIGHT</b> edge.',
-    'Tap the <b>LEFT</b> edge of the window, then the <b>RIGHT</b> edge.',
-    'Now tap the <b>TOP</b> edge, then the <b>BOTTOM</b> edge.',
-    'Now tap the <b>TOP</b> edge, then the <b>BOTTOM</b> edge.',
-    'Ready to calculate.'
-  ];
-  document.getElementById('edgeInstruction').innerHTML = msgs[edgePoints.length];
-  document.getElementById('calcBtn').disabled = edgePoints.length < 4;
-}
+var lastResult = null;
 
 function calculateMeasurement() {
-  var canvas = document.getElementById('photoCanvas');
-  var refPx = dist(refPoints[0], refPoints[1]) / canvas._scale;
-  var refCm = getReferenceCm();
-  var scaleCmPerPx = refCm / refPx;
+  var info = refInfo();
+  var rp = refEditor.imgPts(), wp = winEditor.imgPts();
+  var widthCm, heightCm, reasons = [], refLen, minRefSide, relErr;
 
-  var canvas2 = document.getElementById('photoCanvas2');
-  var widthPx = dist(edgePoints[0], edgePoints[1]) / canvas2._scale;
-  var heightPx = dist(edgePoints[2], edgePoints[3]) / canvas2._scale;
+  if (info.mode === 'rect') {
+    var top = dist(rp[0], rp[1]), bottom = dist(rp[3], rp[2]), left = dist(rp[0], rp[3]), right = dist(rp[1], rp[2]);
+    var longer = Math.max(info.w, info.h), shorter = Math.min(info.w, info.h);
+    var rw = ((top + bottom) / 2) >= ((left + right) / 2) ? longer : shorter;
+    var rh = rw === longer ? shorter : longer;
+    var H = homography(rp, [{ x: 0, y: 0 }, { x: rw, y: 0 }, { x: rw, y: rh }, { x: 0, y: rh }]);
+    if (!H) { alert('Those reference corners do not form a valid shape. Please mark them again.'); return; }
+    var q = wp.map(function(p) { return applyH(H, p); });
+    var tC = dist(q[0], q[1]), bC = dist(q[3], q[2]), lC = dist(q[0], q[3]), rC = dist(q[1], q[2]);
+    widthCm = (tC + bC) / 2; heightCm = (lC + rC) / 2;
+    minRefSide = Math.min(top, bottom, left, right);
+    // A tiny reference makes the angle correction unstable, so fall back to a plain scale.
+    var simpleK = (rw / ((top + bottom) / 2) + rh / ((left + right) / 2)) / 2;
+    var simpleW = (dist(wp[0], wp[1]) + dist(wp[3], wp[2])) / 2 * simpleK;
+    var simpleH = (dist(wp[0], wp[3]) + dist(wp[1], wp[2])) / 2 * simpleK;
+    var unstable = !isFinite(widthCm) || !isFinite(heightCm) || minRefSide < 55 ||
+      Math.abs(widthCm - simpleW) / simpleW > 0.25 || Math.abs(heightCm - simpleH) / simpleH > 0.25;
+    if (unstable) {
+      widthCm = simpleW; heightCm = simpleH;
+      reasons.push('The reference is too small in the photo to correct for camera angle. Move closer, or use an A4 sheet.');
+    }
+    var angDev = Math.max(
+      Math.abs(cornerAngle(q[0], q[1], q[3]) - 90), Math.abs(cornerAngle(q[1], q[0], q[2]) - 90),
+      Math.abs(cornerAngle(q[2], q[1], q[3]) - 90), Math.abs(cornerAngle(q[3], q[0], q[2]) - 90));
+    var mism = Math.max(Math.abs(tC - bC) / widthCm, Math.abs(lC - rC) / heightCm);
+    if (!unstable && (angDev > 15 || mism > 0.25)) reasons.push('The window corners do not look square once corrected. The reference may not be flat on the window plane, or a corner is misplaced.');
+    refLen = rw;
+  } else {
+    var refPx = dist(rp[0], rp[1]);
+    var k = info.len / refPx;
+    widthCm = (dist(wp[0], wp[1]) + dist(wp[3], wp[2])) / 2 * k;
+    heightCm = (dist(wp[0], wp[3]) + dist(wp[1], wp[2])) / 2 * k;
+    minRefSide = refPx;
+    refLen = info.len;
+    reasons.push('A single known length cannot correct for camera angle. Use an A4 sheet for better accuracy.');
+  }
 
-  var widthCm = widthPx * scaleCmPerPx;
-  var heightCm = heightPx * scaleCmPerPx;
-
-  var lowConfidence = (refPx < 25) || (widthPx < 15) || (heightPx < 15);
+  relErr = 2.5 / Math.max(minRefSide, 1);
+  var errCm = Math.max(0.5, Math.round(Math.max(widthCm, heightCm) * relErr * 2) / 2);
+  lastResult = { w: widthCm, h: heightCm };
 
   document.getElementById('resultWidth').textContent = widthCm.toFixed(1);
   document.getElementById('resultHeight').textContent = heightCm.toFixed(1);
-  document.getElementById('confidenceBanner').style.display = lowConfidence ? 'block' : 'none';
+  document.getElementById('accuracyLine').textContent = 'Typical accuracy: about ± ' + errCm + ' cm.';
+  var banner = document.getElementById('confidenceBanner');
+  var list = document.getElementById('confidenceReasons');
+  list.innerHTML = '';
+  reasons.forEach(function(t) { var li = document.createElement('li'); li.textContent = t; list.appendChild(li); });
+  banner.style.display = reasons.length ? 'block' : 'none';
 
   document.getElementById('formWidth').value = widthCm.toFixed(1);
   document.getElementById('formHeight').value = heightCm.toFixed(1);
-  document.getElementById('formRefCm').value = refCm;
-  document.getElementById('formRefLabel').value = getReferenceLabel();
-  document.getElementById('formConfidence').value = lowConfidence ? 'low' : 'normal';
+  document.getElementById('formRefCm').value = refLen;
+  document.getElementById('formRefLabel').value = info.label;
+  document.getElementById('formConfidence').value = reasons.length ? 'low' : 'normal';
   document.getElementById('formPhotoData').value = capturedDataUrl;
 
   document.getElementById('step-edges').style.display = 'none';
   document.getElementById('step-result').style.display = 'block';
+}
+
+function checkActual() {
+  var aw = parseFloat(document.getElementById('actualW').value), ah = parseFloat(document.getElementById('actualH').value);
+  var out = document.getElementById('actualResult'), parts = [];
+  if (aw > 0) parts.push('Width off by ' + (lastResult.w - aw).toFixed(1) + ' cm (' + ((lastResult.w - aw) / aw * 100).toFixed(1) + '%)');
+  if (ah > 0) parts.push('Height off by ' + (lastResult.h - ah).toFixed(1) + ' cm (' + ((lastResult.h - ah) / ah * 100).toFixed(1) + '%)');
+  out.textContent = parts.join(' · ');
+  var notes = document.getElementById('formNotes');
+  if (parts.length && notes.value.indexOf('[Tape check]') < 0) notes.value = (notes.value ? notes.value + ' ' : '') + '[Tape check: ' + (aw > 0 ? 'W ' + aw : '') + (ah > 0 ? ' H ' + ah : '') + ' cm]';
 }
 </script>
 
@@ -2408,16 +3269,18 @@ function calculateMeasurement() {
   <div class="post-composer">
     <form method="POST" action="{{ url_for('works') }}" enctype="multipart/form-data" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="text" name="title" placeholder="Project title" required>
+      <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
       <textarea name="description" placeholder="What was the job?" rows="2"></textarea>
       <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple>
       <button class="btn btn-purple" type="submit">Post this work</button>
     </form>
   </div>
+  <a href="{{ url_for('admin_works') }}" style="display:block;font-size:13px;color:var(--accent);font-weight:600;margin:8px 0 14px;">Review work from artisans{% if pending_work_count %} ({{ pending_work_count }} waiting){% endif %} →</a>
 {% endif %}
 
 {% for w in work_posts %}
   <div class="feed-post">
-    <div class="job-title" style="margin-bottom:6px;">{{ w.title }}</div>
+    <div class="job-title" style="margin-bottom:6px;">{{ w.title }}{% if w.category %} <span class="work-tag">{{ w.category }}</span>{% endif %}</div>
     {% if w.description %}<div class="feed-post-caption">{{ w.description }}</div>{% endif %}
     {% if w.photos %}
       <div class="ba-grid">
@@ -2617,6 +3480,11 @@ a { text-decoration: none; color: inherit; }
   margin: 10px 22px; background: rgba(255,255,255,0.08); padding: 8px 12px;
   border-radius: 10px; font-size: 13px; font-family: 'IBM Plex Mono', monospace;
 }
+.sidebar .bottom-links a, .sidebar .bottom-links button {
+  display: flex; align-items: center; gap: 12px; padding: 11px 22px; color: rgba(255,255,255,0.75);
+  font-size: 14px; background: none; border: none; width: 100%; text-align: left; cursor: pointer;
+}
+.sidebar .bottom-links a:hover, .sidebar .bottom-links button:hover { background: rgba(255,255,255,0.06); color: #fff; }
 .sidebar .bottom-links { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 8px; }
 
 .content-area { flex: 1; min-width: 0; }
@@ -2772,6 +3640,8 @@ body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; 
 .menu-overlay { display: none; }
 
 @media (max-width: 720px) {
+  /* items already in the bottom tab bar / top bar are not repeated in the slide-out menu */
+  .sidebar .dup-tab, .mobile-topbar .dup-tab { display: none !important; }
   .mobile-topbar {
     display: flex;
     align-items: center;
@@ -2854,7 +3724,120 @@ body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; 
 .status-in_progress { background: rgba(46,158,124,0.15); color: var(--teal); }
 .status-completed { background: rgba(46,158,124,0.25); color: var(--teal); }
 .status-cancelled { background: rgba(192,57,43,0.15); color: #c0392b; }
-.unread-badge { background: #C0392B; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 10px; margin-left: 6px; display: inline-block; }
+
+
+
+/* --- Notification opt-in bar --- */
+.push-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  background: linear-gradient(135deg, var(--accent), #0e5a35); color: #fff; padding: 10px 16px; font-size: 13px; font-weight: 500; }
+.push-actions { display: flex; gap: 8px; }
+.push-bar button { border: none; border-radius: 8px; padding: 7px 14px; font-size: 12px; font-weight: 700; cursor: pointer; background: #fff; color: #0e5a35; }
+.push-bar .push-later { background: transparent; color: #fff; opacity: .85; }
+
+
+/* --- Our Work review --- */
+.work-tag { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 600; background: rgba(128,128,128,.18); border-radius: 10px; padding: 2px 8px; margin-left: 4px; vertical-align: middle; }
+.work-status { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 2px 9px; margin-left: 6px; vertical-align: middle; }
+.work-status-pending { background: rgba(217,166,61,.2); color: #d9a63d; }
+.work-status-approved { background: rgba(37,211,102,.18); color: #25D366; }
+.work-status-rejected { background: rgba(239,68,68,.18); color: #ef4444; }
+
+/* --- Splash screen --- */
+html.no-splash #splash { display: none; }
+#splash {
+  position: fixed; inset: 0; z-index: 20000; cursor: pointer;
+  background: radial-gradient(ellipse at 50% 42%, #0f1f14 0%, #050705 62%);
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  transition: opacity .7s ease, visibility .7s ease, transform .7s ease;
+}
+#splash.hide { opacity: 0; visibility: hidden; transform: scale(1.06); }
+.splash-glow {
+  position: absolute; width: 70vmin; height: 70vmin; border-radius: 50%;
+  background: radial-gradient(circle, var(--accent) 0%, transparent 68%);
+  opacity: .28; filter: blur(30px); animation: splashGlow 3.2s ease-in-out infinite;
+}
+.splash-center { position: relative; display: flex; flex-direction: column; align-items: center; padding: 0 20px; }
+.splash-float { animation: splashFloat 3.2s ease-in-out infinite, splashIn 1s cubic-bezier(.2,.9,.3,1.2) both; }
+.splash-logo {
+  display: flex; align-items: center; gap: .28em;
+  font-family: 'Sora', sans-serif; font-weight: 700; color: #fff;
+  font-size: clamp(54px, 17vw, 120px); letter-spacing: -.02em;
+  filter: drop-shadow(0 0 28px rgba(34,197,94,.45));
+}
+.splash-word span { color: var(--accent); }
+.splash-logo .logo-mark {
+  border-left: .55em solid transparent; border-right: .55em solid transparent;
+  border-bottom: .95em solid var(--accent);
+}
+.splash-logo .logo-mark::after {
+  left: -.3em; top: .35em; width: .6em; height: .6em;
+  border: .1em solid #050705; background: rgba(255,255,255,0.15);
+}
+.splash-shadow {
+  width: clamp(120px, 38vw, 260px); height: 14px; margin-top: 26px; border-radius: 50%;
+  background: radial-gradient(ellipse, rgba(0,0,0,.65), transparent 70%);
+  animation: splashShadow 3.2s ease-in-out infinite;
+}
+.splash-caption {
+  margin-top: 22px; color: rgba(255,255,255,.88); font-family: 'Sora', sans-serif; font-weight: 600;
+  font-size: clamp(14px, 4vw, 20px); letter-spacing: .01em; animation: splashUp .9s .9s ease both;
+}
+.splash-smile { display: inline-block; animation: splashPop 1.6s 1.6s ease-in-out infinite; }
+.splash-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.08); }
+.splash-bar i { display: block; height: 100%; width: 0; background: var(--accent); animation: splashBar 3.7s linear forwards; }
+.splash-tap { position: absolute; bottom: 22px; left: 0; right: 0; font-size: 12px; color: rgba(255,255,255,.4); animation: splashUp 1s 1.8s ease both; }
+@keyframes splashFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-16px); } }
+@keyframes splashShadow { 0%,100% { transform: scaleX(1); opacity: .9; } 50% { transform: scaleX(.78); opacity: .5; } }
+@keyframes splashGlow { 0%,100% { opacity: .22; transform: scale(1); } 50% { opacity: .38; transform: scale(1.08); } }
+@keyframes splashIn { from { opacity: 0; transform: scale(.4) translateY(30px); } to { opacity: 1; } }
+@keyframes splashUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes splashPop { 0%,100% { transform: scale(1) rotate(0); } 50% { transform: scale(1.3) rotate(-8deg); } }
+@keyframes splashBar { to { width: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .splash-float, .splash-glow, .splash-shadow, .splash-smile { animation: none; }
+}
+
+/* --- Spotlight tour --- */
+.tour-block { position: fixed; inset: 0; z-index: 9998; }
+.tour-spot {
+  position: fixed; z-index: 9999; border-radius: 12px; pointer-events: none;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,.78), 0 0 0 3px var(--accent), 0 0 24px 4px var(--accent);
+  transition: all .35s ease;
+}
+.tour-card {
+  position: fixed; z-index: 10000; background: #fff; color: #111; border-radius: 16px; padding: 16px 16px 14px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.45); font-size: 14px; line-height: 1.45; animation: splashUp .35s ease both;
+}
+body.dark-mode .tour-card, body.theme-green .tour-card { background: #151a16; color: #eef3ef; }
+.tour-title { font-family: 'Sora', sans-serif; font-weight: 700; font-size: 16px; margin-bottom: 4px; }
+.tour-text { opacity: .8; }
+.tour-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; gap: 10px; }
+.tour-dots { display: flex; gap: 4px; flex-wrap: wrap; }
+.tour-dots i { width: 6px; height: 6px; border-radius: 50%; background: rgba(128,128,128,.4); }
+.tour-dots i.on { background: var(--accent); width: 16px; border-radius: 4px; }
+.tour-skip { background: none; border: none; color: inherit; opacity: .6; font-size: 13px; padding: 8px 10px; cursor: pointer; }
+.tour-next { background: var(--accent); color: #fff; border: none; border-radius: 10px; padding: 9px 18px; font-weight: 600; font-size: 13px; cursor: pointer; }
+
+/* --- WhatsApp-style chat --- */
+.chat-box { height: 70vh; min-height: 360px; }
+.chat-messages { background: #ECE5DD; gap: 3px; }
+body.dark-mode .chat-messages, body.theme-green .chat-messages { background: #0B141A; }
+.msg { position: relative; max-width: 78%; padding: 6px 9px 4px; border-radius: 8px; font-size: 14px; line-height: 1.35; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); word-wrap: break-word; }
+.msg.me { background: #DCF8C6; color: #111; border-top-right-radius: 0; }
+.msg.them { background: #fff; color: #111; border-top-left-radius: 0; }
+body.dark-mode .msg.me, body.theme-green .msg.me { background: #005C4B; color: #E9EDEF; }
+body.dark-mode .msg.them, body.theme-green .msg.them { background: #202C33; color: #E9EDEF; }
+.msg-sender { font-size: 11px; font-weight: 600; color: #128C7E; margin-bottom: 2px; }
+.msg-meta { float: right; margin: 6px 0 0 10px; font-size: 10.5px; color: rgba(0,0,0,0.45); white-space: nowrap; }
+body.dark-mode .msg-meta, body.theme-green .msg-meta { color: rgba(255,255,255,0.55); }
+.ticks { font-size: 12px; letter-spacing: -2px; color: #8696A0; }
+.ticks-read { color: #34B7F1; }
+.msg::after { content: ""; display: block; clear: both; }
+.unread-badge { background: #25D366 !important; color: #fff; min-width: 20px; text-align: center; }
+.unread-dot { background: #25D366 !important; color: #fff; }
+.chat-row-preview-unread { color: #111; font-weight: 600; }
+
+.unread-badge-old { background: #C0392B; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 10px; margin-left: 6px; display: inline-block; }
 .steps-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-top: 10px; }
 .step-card { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
 body.dark-mode .step-card, body.theme-green .step-card { background: #0B0F0C; }
@@ -2931,7 +3914,7 @@ body.dark-mode .chat-row, body.theme-green .chat-row { background: #0B0F0C; }
 .chat-row-job { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
 .chat-row-preview { font-size: 12px; color: var(--text-muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-row-preview-unread { color: var(--navy); font-weight: 600; }
-.measure-step canvas { width: 100%; max-width: 500px; border-radius: 12px; display: block; margin: 0 auto; cursor: crosshair; border: 1px solid var(--border); }
+.measure-step canvas { touch-action: none; max-width: 100%; border-radius: 12px; display: block; margin: 0 auto; cursor: crosshair; border: 1px solid var(--border); }
 .camera-wrap { position: relative; max-width: 500px; margin: 0 auto; border-radius: 14px; overflow: hidden; background: #000; }
 .camera-wrap video { width: 100%; display: block; }
 .guide-frame {
@@ -2954,23 +3937,20 @@ app.jinja_loader = DictLoader(TEMPLATES)
 @app.context_processor
 def inject_unread_count():
     user = current_user()
-    if user and is_owner(user):
-        conn = get_db()
-        count = conn.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE sender_role != 'owner' AND read_by_owner = 0"
-        ).fetchone()["c"]
+    out = {"admin_unread_count": 0, "customer_unread_count": 0, "pending_work_count": 0}
+    if not user:
+        return out
+    conn = get_db()
+    try:
+        if is_owner(user):
+            out["admin_unread_count"] = _unread_for(user, conn)
+            out["pending_work_count"] = conn.execute(
+                "SELECT COUNT(*) AS c FROM work_posts WHERE status = 'pending'").fetchone()["c"]
+        elif is_customer(user) or is_artisan(user):
+            out["customer_unread_count"] = _unread_for(user, conn)
+    finally:
         conn.close()
-        return {"admin_unread_count": count, "customer_unread_count": 0}
-    if user and is_customer(user):
-        conn = get_db()
-        count = conn.execute("""
-            SELECT COUNT(*) AS c FROM messages
-            JOIN jobs ON messages.job_id = jobs.id
-            WHERE jobs.customer_id = ? AND messages.sender_role != 'customer' AND messages.read_by_customer = 0
-        """, (user["id"],)).fetchone()["c"]
-        conn.close()
-        return {"admin_unread_count": 0, "customer_unread_count": count}
-    return {"admin_unread_count": 0, "customer_unread_count": 0}
+    return out
 
 
 @app.route("/static/style.css")
@@ -3109,7 +4089,7 @@ def signup_customer():
     conn.close()
     session["user_id"] = uid
     flash(f"Welcome, {name}!", "success")
-    return redirect(url_for("andybot_guide"))
+    return redirect(url_for("home"))
 
 
 @app.route("/login", methods=["POST"])
@@ -3202,7 +4182,7 @@ def google_callback():
     conn.close()
     session["user_id"] = uid
     flash(f"Welcome, {name}!", "success")
-    return redirect(url_for("andybot_guide"))
+    return redirect(url_for("home"))
 
 
 @app.route("/logout")
@@ -3334,27 +4314,44 @@ def request_service():
                             active_page="request_service", auto_open_auth=False)
 
 
-@app.route("/contact-support")
-def contact_support():
+def _open_support_thread(category, title, description):
     user = require_login()
-    if not user or not is_customer(user):
+    if not user or not (is_customer(user) or is_artisan(user)):
+        return redirect(url_for("home"))
+    artisan_row = get_artisan_profile(user["id"]) if is_artisan(user) else None
+    if is_artisan(user) and not artisan_row:
         return redirect(url_for("home"))
     conn = get_db()
     existing = conn.execute(
-        "SELECT * FROM jobs WHERE customer_id=? AND category='General Support' AND status != 'completed' AND status != 'cancelled' ORDER BY id DESC LIMIT 1",
-        (user["id"],),
+        "SELECT * FROM jobs WHERE customer_id=? AND category=? AND status != 'completed' AND status != 'cancelled' ORDER BY id DESC LIMIT 1",
+        (user["id"], category),
     ).fetchone()
     if existing:
         conn.close()
         return redirect(url_for("job_thread", job_id=existing["id"]))
     cur = conn.execute(
-        "INSERT INTO jobs (customer_id, title, description, category, track, status) VALUES (?, 'General Support', 'Support conversation with Andy.', 'General Support', 'standard', 'submitted')",
-        (user["id"],),
+        "INSERT INTO jobs (customer_id, artisan_id, title, description, category, track, status) VALUES (?, ?, ?, ?, ?, 'standard', 'submitted')",
+        (user["id"], artisan_row["id"] if artisan_row else None, title, description, category),
     )
     job_id = cur.lastrowid
     conn.commit()
     conn.close()
     return redirect(url_for("job_thread", job_id=job_id))
+
+
+@app.route("/contact-support")
+def contact_support():
+    return _open_support_thread("General Support", "General Support", "Support conversation with Andy.")
+
+
+@app.route("/support/feedback")
+def support_feedback():
+    return _open_support_thread("Feedback", "Feedback", "Share your feedback with the Andy team.")
+
+
+@app.route("/support/bug")
+def support_bug():
+    return _open_support_thread("Bug Report", "Bug Report", "Tell us what went wrong and we will look into it.")
 
 
 @app.route("/my-jobs")
@@ -3379,7 +4376,8 @@ def artisan_jobs():
     rows = conn.execute("""
         SELECT jobs.*, users.name AS customer_name FROM jobs
         JOIN users ON jobs.customer_id = users.id
-        WHERE jobs.artisan_id = ? ORDER BY jobs.id DESC
+        WHERE jobs.artisan_id = ? AND COALESCE(jobs.category, '') NOT IN ('General Support', 'Feedback', 'Bug Report')
+        ORDER BY jobs.id DESC
     """, (tech["id"] if tech else -1,)).fetchall()
     conn.close()
     return render_template("artisan_jobs.html", user=user, jobs=[dict(r) for r in rows],
@@ -3413,18 +4411,16 @@ def job_thread(job_id):
         artisan_name = trow["name"] if trow else None
 
     attachments = [dict(a) for a in conn.execute("SELECT * FROM job_attachments WHERE job_id=?", (job_id,)).fetchall()]
+    _mark_read(conn, user, job_id)
     messages = [dict(m) for m in conn.execute("""
         SELECT messages.*, users.name AS sender_name, users.avatar_filename AS sender_avatar
         FROM messages JOIN users ON messages.sender_id = users.id
         WHERE messages.job_id=? ORDER BY messages.id
     """, (job_id,)).fetchall()]
 
-    if is_owner(user):
-        conn.execute("UPDATE messages SET read_by_owner = 1 WHERE job_id = ?", (job_id,))
-        conn.commit()
-    if is_customer(user):
-        conn.execute("UPDATE messages SET read_by_customer = 1 WHERE job_id = ?", (job_id,))
-        conn.commit()
+    _mark_read(conn, user, job_id)
+    for m in messages:
+        m["is_read"] = _is_read_by_other(m)
 
     artisans = []
     if is_owner(user):
@@ -3444,6 +4440,108 @@ def job_thread(job_id):
         review=review, is_owner_view=is_owner(user), is_customer_view=is_customer(user),
         active_page="my_jobs", auto_open_auth=False,
     )
+
+
+
+def _message_payload(m, user):
+    """Serialise one message row for the live-chat JSON feed."""
+    d = dict(m)
+    other_read = _is_read_by_other(d)
+    avatar = d.get("sender_avatar")
+    return {
+        "id": d["id"], "sender_id": d["sender_id"], "sender_name": d["sender_name"],
+        "sender_role_label": (d["sender_role"] or "").title(),
+        "text": d.get("text") or "",
+        "attachment_url": photo_url_filter(d["attachment_filename"], "attachments") if d.get("attachment_filename") else "",
+        "attachment_kind": d.get("attachment_kind") or "",
+        "avatar_url": photo_url_filter(avatar, "avatars") if avatar else "",
+        "time": str(d.get("created_at") or "")[11:16],
+        "is_read": bool(other_read),
+    }
+
+
+def _is_read_by_other(d):
+    role = d.get("sender_role")
+    if role == "customer":
+        return bool(d.get("read_by_owner"))
+    if role == "owner":
+        return bool(d.get("read_by_customer") or d.get("read_by_artisan"))
+    return bool(d.get("read_by_owner") or d.get("read_by_customer"))
+
+
+def _unread_for(user, conn):
+    if is_owner(user):
+        return conn.execute("SELECT COUNT(*) AS c FROM messages WHERE sender_role != 'owner' AND read_by_owner = 0").fetchone()["c"]
+    if is_customer(user):
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM messages JOIN jobs ON messages.job_id = jobs.id "
+            "WHERE jobs.customer_id = ? AND messages.sender_role != 'customer' AND messages.read_by_customer = 0",
+            (user["id"],)).fetchone()["c"]
+    if is_artisan(user):
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM messages JOIN jobs ON messages.job_id = jobs.id "
+            "WHERE jobs.artisan_id = (SELECT id FROM artisans WHERE user_id = ?) "
+            "AND messages.sender_role != 'artisan' AND messages.read_by_artisan = 0",
+            (user["id"],)).fetchone()["c"]
+    return 0
+
+
+def _mark_read(conn, user, job_id):
+    if is_owner(user):
+        conn.execute("UPDATE messages SET read_by_owner = 1 WHERE job_id = ? AND sender_role != 'owner'", (job_id,))
+    if is_customer(user):
+        conn.execute("UPDATE messages SET read_by_customer = 1 WHERE job_id = ? AND sender_role != 'customer'", (job_id,))
+    if is_artisan(user):
+        conn.execute("UPDATE messages SET read_by_artisan = 1 WHERE job_id = ? AND sender_role != 'artisan'", (job_id,))
+    conn.commit()
+
+
+_MSG_SELECT = """
+    SELECT messages.*, users.name AS sender_name, users.avatar_filename AS sender_avatar
+    FROM messages JOIN users ON messages.sender_id = users.id
+"""
+
+
+def _feed(conn, user, job_id, after):
+    _mark_read(conn, user, job_id)
+    new_rows = conn.execute(_MSG_SELECT + " WHERE messages.job_id=? AND messages.id>? ORDER BY messages.id", (job_id, after)).fetchall()
+    mine_rows = conn.execute(_MSG_SELECT + " WHERE messages.job_id=? AND messages.sender_id=? ORDER BY messages.id", (job_id, user["id"])).fetchall()
+    return {
+        "messages": [_message_payload(r, user) for r in new_rows],
+        "read_ids": [dict(r)["id"] for r in mine_rows if _is_read_by_other(dict(r))],
+        "unread": _unread_for(user, conn),
+    }
+
+
+@app.route("/job/<int:job_id>/messages.json")
+def job_messages_json(job_id):
+    user = require_login()
+    if not user:
+        return jsonify({"error": "auth"}), 401
+    conn = get_db()
+    job = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not job or not job_visible_to(user, dict(job)):
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    after = request.args.get("after", 0, type=int)
+    data = _feed(conn, user, job_id, after)
+    conn.close()
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/unread")
+def api_unread():
+    user = require_login()
+    if not user:
+        return jsonify({"unread": 0})
+    conn = get_db()
+    n = _unread_for(user, conn)
+    conn.close()
+    resp = jsonify({"unread": n})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/job/<int:job_id>/message", methods=["POST"])
@@ -3467,11 +4565,21 @@ def post_job_message(job_id):
     if text or attachment_value:
         owner_read_flag = 1 if user["role"] == "owner" else 0
         customer_read_flag = 1 if user["role"] == "customer" else 0
+        artisan_read_flag = 1 if user["role"] == "artisan" else 0
         conn.execute(
-            "INSERT INTO messages (job_id, sender_id, sender_role, text, attachment_filename, attachment_kind, read_by_owner, read_by_customer) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (job_id, user["id"], user["role"], text, attachment_value or "", attachment_kind or "", owner_read_flag, customer_read_flag),
+            "INSERT INTO messages (job_id, sender_id, sender_role, text, attachment_filename, attachment_kind, read_by_owner, read_by_customer, read_by_artisan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, user["id"], user["role"], text, attachment_value or "", attachment_kind or "", owner_read_flag, customer_read_flag, artisan_read_flag),
         )
         conn.commit()
+        if user["role"] != "owner":
+            _notify_owner_of_message(user, dict(job), text, attachment_kind)
+        _notify_push(user, dict(job), text, attachment_kind)
+    if request.headers.get("X-Requested-With") == "fetch":
+        # return everything newer than what the sender's page has
+        last_seen = request.form.get("after", 0, type=int) or 0
+        data = _feed(conn, user, job_id, last_seen)
+        conn.close()
+        return jsonify(data)
     conn.close()
     return redirect(url_for("job_thread", job_id=job_id))
 
@@ -4345,18 +5453,30 @@ def tipped_videos():
 @app.route("/notifications")
 def notifications_page():
     user = require_login()
-    if not user or not is_customer(user):
+    if not user or not (is_customer(user) or is_artisan(user)):
         return redirect(url_for("home"))
     conn = get_db()
-    rows = conn.execute("""
-        SELECT jobs.id AS job_id, jobs.title, jobs.status,
-               (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
-               (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
-               (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'customer' AND read_by_customer = 0) AS unread
-        FROM jobs WHERE jobs.customer_id = ?
-        AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'customer')
-        ORDER BY last_at DESC
-    """, (user["id"],)).fetchall()
+    if is_artisan(user):
+        tech = get_artisan_profile(user["id"])
+        rows = conn.execute("""
+            SELECT jobs.id AS job_id, jobs.title, jobs.status,
+                   (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
+                   (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
+                   (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'artisan' AND read_by_artisan = 0) AS unread
+            FROM jobs WHERE jobs.artisan_id = ?
+            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'artisan')
+            ORDER BY last_at DESC
+        """, (tech["id"] if tech else -1,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT jobs.id AS job_id, jobs.title, jobs.status,
+                   (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
+                   (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
+                   (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'customer' AND read_by_customer = 0) AS unread
+            FROM jobs WHERE jobs.customer_id = ?
+            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'customer')
+            ORDER BY last_at DESC
+        """, (user["id"],)).fetchall()
     conn.close()
     return render_template("notifications.html", user=user, conversations=[dict(r) for r in rows],
                             active_page="notifications", auto_open_auth=False)
@@ -4437,11 +5557,13 @@ def works():
             return redirect(url_for("works"))
         title = request.form.get("title", "").strip()
         description = request.form.get("description", "").strip()
+        category = request.form.get("category", "").strip()
+        category = category if category in WORK_CATEGORIES else ""
         if not title:
             flash("Give the project a title.", "error")
-            return redirect(url_for("works"))
+            return redirect(_safe_next(url_for("works")))
         conn = get_db()
-        cur = conn.execute("INSERT INTO work_posts (title, description) VALUES (?, ?)", (title, description))
+        cur = conn.execute("INSERT INTO work_posts (title, description, category, status) VALUES (?, ?, ?, 'approved')", (title, description, category))
         work_id = cur.lastrowid
         for f in request.files.getlist("photos"):
             stored, kind = _save_attachment(f, WORKS_UPLOAD_DIR)
@@ -4450,10 +5572,10 @@ def works():
         conn.commit()
         conn.close()
         flash("Work posted.", "success")
-        return redirect(url_for("works"))
+        return redirect(_safe_next(url_for("works")))
 
     conn = get_db()
-    rows = conn.execute("SELECT * FROM work_posts ORDER BY id DESC").fetchall()
+    rows = conn.execute("SELECT * FROM work_posts WHERE COALESCE(status, 'approved') = 'approved' ORDER BY id DESC").fetchall()
     posts = []
     for r in rows:
         w = dict(r)
@@ -4461,7 +5583,7 @@ def works():
         w["photos"] = [dict(p) for p in photos]
         posts.append(w)
     conn.close()
-    return render_template("works.html", user=user, work_posts=posts, is_owner_view=is_owner(user),
+    return render_template("works.html", user=user, work_posts=posts, is_owner_view=is_owner(user), categories=WORK_CATEGORIES,
                             active_page="works", auto_open_auth=False)
 
 
@@ -4483,7 +5605,165 @@ def delete_work(work_id):
     conn.commit()
     conn.close()
     flash("Work post removed.", "success")
-    return redirect(url_for("works"))
+    return redirect(_safe_next(url_for("works")))
+
+
+# ---------------------------------------------------------------------------
+# OUR WORK — owner uploads + artisan submissions reviewed by the owner.
+# Artisan work only goes live after approval, and is shown as ANDY's work
+# (no artisan name is ever shown to the public).
+# ---------------------------------------------------------------------------
+WORK_CATEGORIES = ["Windows", "Doors", "Partitions", "Gates & Rails", "Other"]
+
+
+def _safe_next(default):
+    nxt = request.form.get("next", "")
+    return nxt if nxt.startswith("/") and not nxt.startswith("//") else default
+
+
+def _load_work_posts(conn, where, params=()):
+    rows = conn.execute(
+        "SELECT work_posts.*, users.name AS submitter FROM work_posts "
+        "LEFT JOIN users ON work_posts.submitted_by = users.id "
+        f"WHERE {where} ORDER BY work_posts.id DESC", params).fetchall()
+    out = []
+    for r in rows:
+        w = dict(r)
+        w["photos"] = [dict(p) for p in conn.execute("SELECT * FROM work_photos WHERE work_id=?", (w["id"],)).fetchall()]
+        out.append(w)
+    return out
+
+
+def _delete_work_files(conn, work_id):
+    for p in conn.execute("SELECT * FROM work_photos WHERE work_id=?", (work_id,)).fetchall():
+        if not p["filename"].startswith("http"):
+            try:
+                os.remove(os.path.join(WORKS_UPLOAD_DIR, p["filename"]))
+            except OSError:
+                pass
+    conn.execute("DELETE FROM work_photos WHERE work_id=?", (work_id,))
+    conn.execute("DELETE FROM work_posts WHERE id=?", (work_id,))
+
+
+@app.route("/admin/works")
+def admin_works():
+    user = require_owner()
+    if not user:
+        return redirect(url_for("home"))
+    conn = get_db()
+    pending = _load_work_posts(conn, "work_posts.status = 'pending'")
+    published = _load_work_posts(conn, "COALESCE(work_posts.status, 'approved') = 'approved'")
+    conn.close()
+    return render_template("admin_works.html", user=user, pending=pending, published=published,
+                           categories=WORK_CATEGORIES, active_page="admin_works", auto_open_auth=False)
+
+
+@app.route("/admin/works/<int:work_id>/approve", methods=["POST"])
+def admin_work_approve(work_id):
+    user = require_owner()
+    if not user:
+        return redirect(url_for("home"))
+    conn = get_db()
+    w = conn.execute("SELECT * FROM work_posts WHERE id=?", (work_id,)).fetchone()
+    if not w:
+        conn.close()
+        return redirect(url_for("admin_works"))
+    title = request.form.get("title", "").strip() or w["title"]
+    description = request.form.get("description", "").strip()
+    category = request.form.get("category", "").strip()
+    category = category if category in WORK_CATEGORIES else ""
+    conn.execute("UPDATE work_posts SET title=?, description=?, category=?, status='approved', reject_reason='' WHERE id=?",
+                 (title, description, category, work_id))
+    conn.commit()
+    submitter = w["submitted_by"]
+    conn.close()
+    if submitter:
+        send_push_to_users([submitter], {"title": "✅ Your work is live", "body": f"“{title}” was approved and is now on Our Work.",
+                                         "url": url_for("artisan_work"), "tag": f"work-{work_id}"})
+    flash("Approved. It is now live on Our Work.", "success")
+    return redirect(url_for("admin_works"))
+
+
+@app.route("/admin/works/<int:work_id>/reject", methods=["POST"])
+def admin_work_reject(work_id):
+    user = require_owner()
+    if not user:
+        return redirect(url_for("home"))
+    reason = request.form.get("reason", "").strip()[:200]
+    conn = get_db()
+    w = conn.execute("SELECT * FROM work_posts WHERE id=?", (work_id,)).fetchone()
+    if w:
+        conn.execute("UPDATE work_posts SET status='rejected', reject_reason=? WHERE id=?", (reason, work_id))
+        conn.commit()
+    conn.close()
+    if w and w["submitted_by"]:
+        send_push_to_users([w["submitted_by"]], {"title": "Work not approved", "body": reason or f"“{w['title']}” wasn't approved this time.",
+                                                  "url": url_for("artisan_work"), "tag": f"work-{work_id}"})
+    flash("Sent back to the artisan.", "success")
+    return redirect(url_for("admin_works"))
+
+
+@app.route("/artisan/work", methods=["GET", "POST"])
+def artisan_work():
+    user = require_login()
+    if not user or not is_artisan(user):
+        return redirect(url_for("home"))
+    conn = get_db()
+    if request.method == "POST":
+        action = request.form.get("action", "submit")
+        if action == "delete":
+            w = conn.execute("SELECT * FROM work_posts WHERE id=? AND submitted_by=? AND status != 'approved'",
+                             (request.form.get("work_id", type=int), user["id"])).fetchone()
+            if w:
+                _delete_work_files(conn, w["id"])
+                conn.commit()
+                flash("Removed.", "success")
+            conn.close()
+            return redirect(url_for("artisan_work"))
+        title = " ".join(request.form.get("title", "").split())[:120]
+        description = request.form.get("description", "").strip()[:1000]
+        description = mask_phone_numbers(description) if description else description
+        category = request.form.get("category", "").strip()
+        category = category if category in WORK_CATEGORIES else ""
+        files = [f for f in request.files.getlist("photos") if f and f.filename][:8]
+        waiting = conn.execute("SELECT COUNT(*) AS c FROM work_posts WHERE submitted_by=? AND status='pending'", (user["id"],)).fetchone()["c"]
+        if not title or not files:
+            flash("Add a title and at least one photo.", "error")
+        elif waiting >= 10:
+            flash("You have 10 items waiting for review. Please wait for Andy to review them first.", "error")
+        else:
+            saved = []
+            for f in files:
+                stored, kind = _save_attachment(f, WORKS_UPLOAD_DIR)
+                if stored and kind == "image":
+                    saved.append(stored)
+            if not saved:
+                flash("Please upload JPG, PNG or WEBP photos.", "error")
+            else:
+                cur = conn.execute(
+                    "INSERT INTO work_posts (title, description, category, status, submitted_by) VALUES (?, ?, ?, 'pending', ?)",
+                    (title, description, category, user["id"]))
+                for stored in saved:
+                    conn.execute("INSERT INTO work_photos (work_id, filename) VALUES (?, ?)", (cur.lastrowid, stored))
+                conn.commit()
+                _notify_work_submitted(user, title)
+                flash("Sent to Andy for review. It goes live once approved.", "success")
+        conn.close()
+        return redirect(url_for("artisan_work"))
+    mine = _load_work_posts(conn, "work_posts.submitted_by = ?", (user["id"],))
+    conn.close()
+    return render_template("artisan_work.html", user=user, mine=mine, categories=WORK_CATEGORIES,
+                           active_page="artisan_work", auto_open_auth=False)
+
+
+def _notify_work_submitted(user, title):
+    conn = get_db()
+    owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
+    conn.close()
+    send_push_to_users(owners, {"title": "📸 New work to review", "body": f"{user['name']}: {title}"[:140],
+                                "url": url_for("admin_works"), "tag": "work-review"})
+    send_email_async(NOTIFY_EMAIL, f"📸 {user['name']} submitted work for review",
+                     f"{user['name']} uploaded \"{title}\".\n\nReview it: {url_for('admin_works', _external=True)}\n")
 
 
 # ---------------------------------------------------------------------------
