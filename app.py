@@ -3,6 +3,7 @@ from jinja2 import DictLoader
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import sqlite3
+from datetime import datetime
 import io
 import base64
 import os
@@ -42,7 +43,7 @@ else:
 FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "0") == "1"
 
 # Cap request size so a huge upload can't be used to exhaust memory/disk.
-app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024  # 30 MB
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB (videos with sound)
 
 # Session cookie hardening. SESSION_COOKIE_SECURE is left off by default so
 # local HTTP testing keeps working — set FORCE_HTTPS=1 once this is served
@@ -50,7 +51,7 @@ app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024  # 30 MB
 # ever sent over an encrypted connection.
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.environ.get("FORCE_HTTPS", "0") == "1"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("FORCE_HTTPS", "0") == "1" or bool(os.environ.get("RENDER"))
 
 
 @app.after_request
@@ -58,6 +59,9 @@ def set_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+    if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=15552000"
     return response
 
 
@@ -81,7 +85,7 @@ _SITE_CONTROL_EXEMPT_ENDPOINTS = {
     "admin_site", "admin_controls", "admin_dashboard", "admin_artisans", "add_artisan",
     "toggle_artisan", "admin_jobs", "admin_chats", "job_thread", "post_job_message",
     "admin_update_job", "settings", "forgot_password", "reset_password",
-    "service_worker", "push_icon", "push_key", "push_subscribe", "push_unsubscribe",
+    "service_worker", "push_icon", "push_key", "push_subscribe", "push_unsubscribe", "set_mode", "terms", "privacy", "staff_login",
 }
 
 
@@ -500,6 +504,44 @@ self.addEventListener('notificationclick', function(event) {
 """
 
 
+STAFF_LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ANDY staff login</title>
+<style>body{margin:0;background:#0A1020;color:#fff;font-family:-apple-system,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.box{width:100%;max-width:340px}h1{font-size:22px;margin:0 0 6px}p{color:#9ca3af;font-size:14px;margin:0 0 18px}
+input{width:100%;box-sizing:border-box;padding:14px;margin-bottom:12px;border-radius:10px;border:1px solid #1E2D4A;background:#111A2E;color:#fff;font-size:16px}
+button{width:100%;padding:14px;border:none;border-radius:10px;background:#22C55E;color:#04140A;font-weight:700;font-size:16px;cursor:pointer}a{color:#22C55E;font-size:13px}</style></head>
+<body><form class="box" method="POST" action="/login"><input type="hidden" name="csrf_token" value="__TOKEN__">
+<h1>Staff login</h1><p>For the ANDY owner and team.</p>
+<input type="email" name="email" placeholder="Email" autocomplete="username" required>
+<input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
+<button type="submit">Log in</button><p style="margin-top:14px"><a href="/forgot-password">Forgot password?</a></p></form></body></html>"""
+
+
+@app.route("/staff-login")
+def staff_login():
+    return Response(STAFF_LOGIN_HTML.replace("__TOKEN__", get_csrf_token()), mimetype="text/html")
+
+
+@app.route("/mode", methods=["POST"])
+def set_mode():
+    user = current_user()
+    if user:
+        conn = get_db()
+        conn.execute("UPDATE users SET dark_mode=? WHERE id=?", (1 if request.form.get("dark") == "1" else 0, user["id"]))
+        conn.commit()
+        conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/terms")
+def terms():
+    return render_template("terms.html", user=current_user(), active_page="terms", auto_open_auth=False)
+
+
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html", user=current_user(), active_page="privacy", auto_open_auth=False)
+
+
 @app.route("/sw.js")
 def service_worker():
     resp = Response(SERVICE_WORKER_JS, mimetype="application/javascript")
@@ -586,7 +628,11 @@ MEASUREMENT_REFERENCES = [
     {"id": "tape", "label": "Known length, two points (less accurate)", "mode": "line", "w": None, "h": None},
 ]
 
-PAYSTACK_SECRET_KEY = "sk_test_REPLACE_WITH_YOUR_OWN_TEST_KEY"
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+
+
+def paystack_configured():
+    return PAYSTACK_SECRET_KEY.startswith("sk_")
 PAYSTACK_PUBLIC_KEY = "pk_test_REPLACE_WITH_YOUR_OWN_TEST_KEY"
 CONNECT_COINS_PER_NAIRA = 1
 PRO_MEMBERSHIP_COST = 200  # CONNECT coins for a Pro upgrade
@@ -605,6 +651,7 @@ class _PGCursorWrapper:
     def __init__(self, cursor):
         self._cursor = cursor
         self.lastrowid = None
+        self.rowcount = getattr(cursor, "rowcount", -1)
 
     def fetchone(self):
         return self._cursor.fetchone()
@@ -639,6 +686,9 @@ class _PGConnWrapper:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         self._conn.close()
@@ -842,6 +892,25 @@ def init_db():
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS app_kv (k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS paystack_refs (reference TEXT PRIMARY KEY, user_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    _add_column_if_missing(conn, "jobs", "escrow_held", "INTEGER DEFAULT 0")
+    if not conn.execute("SELECT 1 FROM app_kv WHERE k='escrow_backfill'").fetchone():
+        # one-time: jobs already in progress were paid through the escrow flow
+        conn.execute("UPDATE jobs SET escrow_held = 1 WHERE status = 'in_progress'")
+        conn.execute("INSERT INTO app_kv (k, v) VALUES ('escrow_backfill', '1')")
+    _add_column_if_missing(conn, "work_photos", "kind", "TEXT DEFAULT 'image'")
+    conn.execute("CREATE TABLE IF NOT EXISTS work_likes (work_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (work_id, user_id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS review_likes (review_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (review_id, user_id))")
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS work_reviews (
+            id {id_column},
+            work_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            rating INTEGER NOT NULL,
+            text TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     _add_column_if_missing(conn, "site_content", "maintenance_mode", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "site_content", "signups_enabled", "INTEGER DEFAULT 1")
@@ -905,7 +974,7 @@ def init_db():
     owner_password = os.environ.get("ADMIN_PASSWORD")
     using_fallback_password = owner_password is None
     if using_fallback_password:
-        owner_password = "changeme123"
+        owner_password = pysecrets.token_urlsafe(10)   # random, shown once in the server log
 
     existing_owner_row = conn.execute("SELECT * FROM users WHERE email = ?", (owner_email,)).fetchone()
     if existing_owner_row is None:
@@ -916,10 +985,10 @@ def init_db():
         )
         conn.commit()
         if using_fallback_password:
-            print(f"[ANDY] WARNING: no ADMIN_PASSWORD environment variable set — seeded "
-                  f"owner login with a default password -> email: {owner_email}  password: {owner_password}")
-            print("[ANDY] This is NOT safe for production. Set ADMIN_EMAIL and ADMIN_PASSWORD "
-                  "as environment variables, then delete this account and restart so it reseeds correctly.")
+            print(f"[ANDY] WARNING: no ADMIN_PASSWORD environment variable set. Seeded the owner "
+                  f"login with a RANDOM one-time password -> email: {owner_email}  password: {owner_password}")
+            print("[ANDY] Log in, then change it in Settings. Set ADMIN_EMAIL and ADMIN_PASSWORD "
+                  "as environment variables for a stable production setup.")
         else:
             print(f"[ANDY] Seeded admin/owner login -> email: {owner_email}")
     elif existing_owner_row["role"] != "owner":
@@ -1024,32 +1093,32 @@ def _product_dict(row):
 
 CATEGORY_GRAPHICS = {
     "Windows": '''<svg viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg">
-        <rect width="200" height="130" fill="#0a0f0c"/>
+        <rect width="200" height="130" fill="#0A1426"/>
         <rect x="45" y="18" width="110" height="94" rx="3" fill="none" stroke="#22C55E" stroke-width="4"/>
         <line x1="100" y1="18" x2="100" y2="112" stroke="#22C55E" stroke-width="3"/>
         <line x1="45" y1="65" x2="155" y2="65" stroke="#22C55E" stroke-width="3"/>
-        <rect x="50" y="23" width="45" height="37" fill="#1a3324" opacity="0.7"/>
-        <rect x="105" y="23" width="45" height="37" fill="#1a3324" opacity="0.5"/>
-        <rect x="50" y="70" width="45" height="37" fill="#1a3324" opacity="0.5"/>
-        <rect x="105" y="70" width="45" height="37" fill="#1a3324" opacity="0.7"/>
+        <rect x="50" y="23" width="45" height="37" fill="#14294A" opacity="0.7"/>
+        <rect x="105" y="23" width="45" height="37" fill="#14294A" opacity="0.5"/>
+        <rect x="50" y="70" width="45" height="37" fill="#14294A" opacity="0.5"/>
+        <rect x="105" y="70" width="45" height="37" fill="#14294A" opacity="0.7"/>
     </svg>''',
     "Doors": '''<svg viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg">
-        <rect width="200" height="130" fill="#0a0f0c"/>
-        <rect x="70" y="14" width="60" height="108" rx="2" fill="#1a3324" opacity="0.6" stroke="#22C55E" stroke-width="4"/>
+        <rect width="200" height="130" fill="#0A1426"/>
+        <rect x="70" y="14" width="60" height="108" rx="2" fill="#14294A" opacity="0.6" stroke="#22C55E" stroke-width="4"/>
         <line x1="100" y1="14" x2="100" y2="122" stroke="#22C55E" stroke-width="2" opacity="0.5"/>
         <circle cx="118" cy="70" r="3.5" fill="#22C55E"/>
     </svg>''',
     "Partitions": '''<svg viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg">
-        <rect width="200" height="130" fill="#0a0f0c"/>
-        <rect x="35" y="16" width="32" height="100" fill="#1a3324" opacity="0.5" stroke="#22C55E" stroke-width="3"/>
-        <rect x="75" y="16" width="32" height="100" fill="#1a3324" opacity="0.7" stroke="#22C55E" stroke-width="3"/>
-        <rect x="115" y="16" width="32" height="100" fill="#1a3324" opacity="0.5" stroke="#22C55E" stroke-width="3"/>
-        <rect x="155" y="16" width="20" height="100" fill="#1a3324" opacity="0.3" stroke="#22C55E" stroke-width="2"/>
+        <rect width="200" height="130" fill="#0A1426"/>
+        <rect x="35" y="16" width="32" height="100" fill="#14294A" opacity="0.5" stroke="#22C55E" stroke-width="3"/>
+        <rect x="75" y="16" width="32" height="100" fill="#14294A" opacity="0.7" stroke="#22C55E" stroke-width="3"/>
+        <rect x="115" y="16" width="32" height="100" fill="#14294A" opacity="0.5" stroke="#22C55E" stroke-width="3"/>
+        <rect x="155" y="16" width="20" height="100" fill="#14294A" opacity="0.3" stroke="#22C55E" stroke-width="2"/>
     </svg>''',
     "Custom Solutions": '''<svg viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg">
-        <rect width="200" height="130" fill="#0a0f0c"/>
+        <rect width="200" height="130" fill="#0A1426"/>
         <circle cx="100" cy="65" r="34" fill="none" stroke="#22C55E" stroke-width="4"/>
-        <circle cx="100" cy="65" r="10" fill="#1a3324" stroke="#22C55E" stroke-width="3"/>
+        <circle cx="100" cy="65" r="10" fill="#14294A" stroke="#22C55E" stroke-width="3"/>
         <line x1="100" y1="20" x2="100" y2="32" stroke="#22C55E" stroke-width="4"/>
         <line x1="100" y1="98" x2="100" y2="110" stroke="#22C55E" stroke-width="4"/>
         <line x1="55" y1="65" x2="67" y2="65" stroke="#22C55E" stroke-width="4"/>
@@ -1066,13 +1135,14 @@ TEMPLATES = {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{% block title %}ANDY{% endblock %}</title>
+<title>{% block title %}ANDY | Aluminum made simple{% endblock %}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-<script>try{if(sessionStorage.getItem('andySplashSeen'))document.documentElement.classList.add('no-splash')}catch(e){}</script>
+<script>document.documentElement.classList.add('js');try{if(sessionStorage.getItem('andySplashSeen'))document.documentElement.classList.add('no-splash')}catch(e){}</script>
 </head>
-<body class="theme-{{ user.theme if user else 'green' }} {{ 'dark-mode' if user and user.dark_mode }}">
+{% set _m = request.cookies.get('andy_mode') %}{% set dark = (_m == 'dark') or (not _m and ((user and user.dark_mode) or default_mode == 'dark')) %}
+<body class="theme-{{ user.theme if user else 'green' }} {{ 'dark-mode' if dark }} {{ 'guest-site' if not user }}">
 
 {% if request.endpoint == 'home' %}
 <div id="splash" aria-label="ANDY">
@@ -1092,14 +1162,24 @@ TEMPLATES = {
 <div class="mobile-topbar">
   <span class="logo-mark"></span>
   <span class="mobile-topbar-title">ANDY.</span>
-  <a href="{{ url_for('contact_support') if (user and user.role in ('customer', 'artisan')) else url_for('help_page') }}" class="help-icon-btn" title="Help / Customer Care">💬</a>
-  <button onclick="toggleMenu()" class="hamburger-btn{% if user %} dup-tab{% endif %}">☰</button>
+  {% set sm = true %}<button type="button" class="mode-switch{{ ' sm' if sm }}" role="switch" aria-checked="{{ 'true' if dark else 'false' }}" aria-label="Dark mode" onclick="toggleMode()"><span class="ms-ico ms-sun">☀️</span><span class="ms-ico ms-moon">🌙</span><span class="ms-knob"></span></button>
+  <a href="{{ url_for('contact_support') if (user and user.role in ('customer', 'artisan')) else url_for('help_page') }}" class="help-icon-btn" title="Help / Customer Care" aria-label="Help and customer care">💬</a>
+  <button onclick="toggleMenu()" class="hamburger-btn{% if user %} dup-tab{% endif %}" aria-label="Open menu" aria-expanded="false">☰</button>
+</div>
+
+<div id="lb" class="lb" aria-hidden="true">
+  <div class="lb-top"><span class="lb-count"></span><button type="button" class="lb-close" aria-label="Close">✕</button></div>
+  <div class="lb-stage"><img class="lb-img" alt=""></div>
+  <button type="button" class="lb-nav lb-prev" aria-label="Previous">‹</button>
+  <button type="button" class="lb-nav lb-next" aria-label="Next">›</button>
+  <div class="lb-bottom"><span class="lb-cap"></span><button type="button" class="lb-rate" style="display:none;">⭐ Reviews</button></div>
 </div>
 <div class="menu-overlay" onclick="toggleMenu()"></div>
 
 <div class="app-shell">
-  <div class="sidebar" id="sidebar">
-    <div class="logo"><span class="logo-mark"></span>ANDY<span>.</span></div>
+  <div class="sidebar" id="sidebar" role="navigation" aria-label="Main menu">
+    <button type="button" class="menu-close" onclick="toggleMenu()" aria-label="Close menu">✕</button>
+    <div class="logo"><span class="logo-mark"></span><span class="nav-word">ANDY<span>.</span></span></div>
 
     {% if user %}
       <div class="sidebar-profile">
@@ -1152,6 +1232,7 @@ TEMPLATES = {
     </nav>
 
     <div class="bottom-links">
+      <div class="mode-row"><span>🌗 Dark mode</span><button type="button" class="mode-switch sm" role="switch" aria-checked="{{ 'true' if dark else 'false' }}" aria-label="Dark mode" onclick="toggleMode()"><span class="ms-ico ms-sun">☀️</span><span class="ms-ico ms-moon">🌙</span><span class="ms-knob"></span></button></div>
       <a href="{{ url_for('about') }}" class="{{ 'active' if active_page == 'about' }}"><span class="icon">ℹ️</span><span>About Andy</span></a>
       {% if user and user.role in ('customer', 'artisan') %}
         <a href="{{ url_for('contact_support') }}" class="dup-tab"><span class="icon">💬</span><span>Contact Andy</span></a>
@@ -1168,6 +1249,24 @@ TEMPLATES = {
   </div>
 
   <div class="content-area">
+    {% if not user %}
+    <header class="site-nav" id="siteNav">
+      <a class="site-nav-logo" href="{{ url_for('home') }}"><span class="logo-mark"></span><span class="nav-word">ANDY<span>.</span></span></a>
+      <nav class="site-nav-links">
+        <a href="{{ url_for('home') }}" class="{{ 'active' if active_page == 'home' }}">Home</a>
+        <a href="{{ url_for('home') }}#about">About</a>
+        <a href="{{ url_for('home') }}#how-it-works">How it works</a>
+        <a href="{{ url_for('works') }}" class="{{ 'active' if active_page == 'works' }}">Our Work</a>
+        <a href="{{ url_for('catalog') }}" class="{{ 'active' if active_page == 'catalog' }}">Catalogue</a>
+        <a href="{{ url_for('home') }}#contact">Contact</a>
+      </nav>
+      <div class="site-nav-cta">
+        <button type="button" class="mode-switch" role="switch" aria-checked="{{ 'true' if dark else 'false' }}" aria-label="Dark mode" onclick="toggleMode()"><span class="ms-ico ms-sun">☀️</span><span class="ms-ico ms-moon">🌙</span><span class="ms-knob"></span></button>
+        <button class="btn btn-outline" onclick="document.getElementById('authModal').classList.add('open');showStep('loginForm')">Login</button>
+        <button class="btn btn-purple" onclick="document.getElementById('authModal').classList.add('open')">Get Started</button>
+      </div>
+    </header>
+    {% endif %}
     {% if user %}
     <div id="pushBar" class="push-bar" style="display:none;">
       <span>🔔 Get notified when someone sends you a message</span>
@@ -1185,6 +1284,42 @@ TEMPLATES = {
 
       {% block content %}{% endblock %}
     </main>
+    {% if not user %}
+    <footer class="site-footer">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <div class="footer-logo"><span class="logo-mark"></span><span class="nav-word">ANDY<span>.</span></span></div>
+          <p class="footer-motto">Aluminum made simple.</p>
+          <p>Connecting you with skilled artisans for the work you need done. Artisans join Andy by invitation only.</p>
+        </div>
+        <div class="footer-col">
+          <h4>Explore</h4>
+          <a href="{{ url_for('home') }}">Home</a>
+          <a href="{{ url_for('home') }}#about">About</a>
+          <a href="{{ url_for('home') }}#how-it-works">How it works</a>
+          <a href="{{ url_for('works') }}">Our Work</a>
+          <a href="{{ url_for('catalog') }}">Catalogue</a>
+        </div>
+        <div class="footer-col">
+          <h4>Account</h4>
+          <a href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Sign up</a>
+          <a href="#" onclick="document.getElementById('authModal').classList.add('open');showStep('loginForm');return false;">Login</a>
+          <a href="{{ url_for('help_page') }}">Help</a>
+        </div>
+        <div class="footer-col">
+          <h4>Contact</h4>
+          {% if contact.phone %}<a href="tel:{{ contact.phone }}">📞 {{ contact.phone }}</a>{% endif %}
+          {% if contact.whatsapp %}<a href="https://wa.me/{{ contact.whatsapp }}" target="_blank" rel="noopener">💬 WhatsApp</a>{% endif %}
+          {% if contact.email %}<a href="mailto:{{ contact.email }}">✉️ {{ contact.email }}</a>{% endif %}
+          {% if contact.address %}<span>📍 {{ contact.address }}</span>{% endif %}
+          {% if not (contact.phone or contact.whatsapp or contact.email or contact.address) %}<span>Sign up to chat with Andy directly.</span>{% endif %}
+        </div>
+      </div>
+      <div class="footer-bottom">© {{ current_year }} ANDY. All rights reserved. <span class="footer-legal"><a href="{{ url_for('terms') }}">Terms &amp; Conditions</a><a href="{{ url_for('privacy') }}">Privacy Policy</a></span></div>
+    </footer>
+    {% else %}
+    <div class="app-footer">© {{ current_year }} ANDY · <a href="{{ url_for('terms') }}">Terms</a> · <a href="{{ url_for('privacy') }}">Privacy</a></div>
+    {% endif %}
   </div>
 </div>
 
@@ -1213,7 +1348,183 @@ TEMPLATES = {
 
 {% include "_auth_modal.html" %}
 
+
+
 <script>
+window.toggleMode = function() {
+  var dark = !document.body.classList.contains('dark-mode');
+  document.body.classList.toggle('dark-mode', dark);
+  document.cookie = 'andy_mode=' + (dark ? 'dark' : 'light') + '; path=/; max-age=31536000; SameSite=Lax';
+  [].forEach.call(document.querySelectorAll('.mode-switch'), function(b) { b.setAttribute('aria-checked', dark ? 'true' : 'false'); });
+  {% if user %}
+  var fd = new FormData(); fd.append('csrf_token', '{{ csrf_token() }}'); fd.append('dark', dark ? '1' : '0');
+  fetch('{{ url_for("set_mode") }}', { method: 'POST', body: fd, credentials: 'same-origin' }).catch(function() {});
+  {% endif %}
+};
+</script>
+<script>
+(function() {
+  var CSRF = '{{ csrf_token() }}';
+  var LOGGED_IN = {{ 'true' if user else 'false' }};
+  document.addEventListener('click', function(e) {
+    var b = e.target.closest ? e.target.closest('.like-btn') : null;
+    if (!b) return;
+    e.preventDefault();
+    if (!LOGGED_IN) { var m = document.getElementById('authModal'); if (m) m.classList.add('open'); return; }
+    if (b.dataset.busy) return;
+    b.dataset.busy = '1';
+    var fd = new FormData(); fd.append('csrf_token', CSRF);
+    fetch(b.dataset.url, { method: 'POST', body: fd, credentials: 'same-origin' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(d) {
+        if (!d) return;
+        b.classList.toggle('liked', d.liked);
+        b.querySelector('.like-icon').textContent = d.liked ? '♥' : '♡';
+        b.querySelector('.like-count').textContent = d.count;
+        if (d.liked) { b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop'); }
+      }).catch(function() {}).then(function() { delete b.dataset.busy; });
+  });
+  document.addEventListener('change', function(e) {
+    var inp = e.target;
+    if (!inp.matches || !inp.matches('input[type=file][data-maxmb]')) return;
+    var max = parseFloat(inp.dataset.maxmb) * 1024 * 1024, bad = [];
+    [].forEach.call(inp.files, function(f) { if (f.size > max) bad.push(f.name); });
+    if (bad.length) { alert('These files are too big (limit ' + inp.dataset.maxmb + ' MB): ' + bad.join(', ') + '. Trim the video or lower its quality and try again.'); inp.value = ''; }
+  });
+})();
+</script>
+<script>
+(function() {
+  var lb = document.getElementById('lb');
+  if (!lb) return;
+  var stage = lb.querySelector('.lb-stage'), img = lb.querySelector('.lb-img');
+  var cap = lb.querySelector('.lb-cap'), count = lb.querySelector('.lb-count');
+  var prev = lb.querySelector('.lb-prev'), next = lb.querySelector('.lb-next'), rate = lb.querySelector('.lb-rate');
+  var items = [], idx = 0, S = 1, X = 0, Y = 0, pointers = {}, startDist = 0, startS = 1, lastTap = 0, moved = false, startX = 0, startY = 0;
+
+  function apply() {
+    img.style.transform = 'translate(' + X + 'px,' + Y + 'px) scale(' + S + ')';
+    stage.classList.toggle('zoomed', S > 1);
+  }
+  function reset() { S = 1; X = 0; Y = 0; apply(); }
+  function show(i) {
+    idx = (i + items.length) % items.length;
+    img.src = items[idx].src;
+    cap.textContent = items[idx].cap;
+    count.textContent = items.length > 1 ? (idx + 1) + ' / ' + items.length : '';
+    prev.style.display = next.style.display = items.length > 1 ? '' : 'none';
+    rate.style.display = items[idx].rev ? '' : 'none';
+    reset();
+  }
+  function open(group, i) {
+    var els = [].slice.call(document.querySelectorAll('[data-lightbox="' + group + '"]'));
+    items = els.map(function(e) { return { src: e.getAttribute('data-full') || e.src, cap: e.getAttribute('data-caption') || '', rev: e.getAttribute('data-reviews') || '' }; });
+    lb.classList.add('open'); lb.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+    show(i);
+  }
+  function close() {
+    lb.classList.remove('open'); lb.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = ''; img.removeAttribute('src');
+  }
+  function zoomAt(cx, cy, ns) {
+    var r = stage.getBoundingClientRect();
+    var px = cx - (r.left + r.width / 2), py = cy - (r.top + r.height / 2);
+    X = px - (px - X) * (ns / S); Y = py - (py - Y) * (ns / S); S = ns;
+    if (S <= 1.01) { S = 1; X = 0; Y = 0; }
+    apply();
+  }
+
+  document.addEventListener('click', function(e) {
+    var t = e.target.closest ? e.target.closest('[data-lightbox]') : null;
+    if (!t) return;
+    e.preventDefault();
+    var g = t.getAttribute('data-lightbox');
+    open(g, [].slice.call(document.querySelectorAll('[data-lightbox="' + g + '"]')).indexOf(t));
+  });
+  lb.querySelector('.lb-close').onclick = close;
+  prev.onclick = function(e) { e.stopPropagation(); show(idx - 1); };
+  next.onclick = function(e) { e.stopPropagation(); show(idx + 1); };
+  rate.onclick = function() {
+    var id = items[idx].rev; close();
+    if (window.toggleReviews) window.toggleReviews(id, true);
+    var el = document.getElementById(id); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+  document.addEventListener('keydown', function(e) {
+    if (!lb.classList.contains('open')) return;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') show(idx - 1);
+    else if (e.key === 'ArrowRight') show(idx + 1);
+  });
+  stage.addEventListener('wheel', function(e) {
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, Math.max(1, Math.min(5, S * (e.deltaY < 0 ? 1.2 : 0.83))));
+  }, { passive: false });
+
+  function dist() { var k = Object.keys(pointers); var a = pointers[k[0]], b = pointers[k[1]]; return Math.hypot(a.x - b.x, a.y - b.y); }
+  stage.addEventListener('pointerdown', function(e) {
+    stage.setPointerCapture(e.pointerId);
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    moved = false; startX = e.clientX; startY = e.clientY;
+    if (Object.keys(pointers).length === 2) { startDist = dist(); startS = S; }
+  });
+  stage.addEventListener('pointermove', function(e) {
+    var p = pointers[e.pointerId]; if (!p) return;
+    var n = Object.keys(pointers).length;
+    if (n === 2) {
+      p.x = e.clientX; p.y = e.clientY;
+      var k = Object.keys(pointers), a = pointers[k[0]], b = pointers[k[1]];
+      zoomAt((a.x + b.x) / 2, (a.y + b.y) / 2, Math.max(1, Math.min(5, startS * dist() / startDist)));
+      moved = true; return;
+    }
+    var dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (Math.abs(e.clientX - startX) > 6 || Math.abs(e.clientY - startY) > 6) moved = true;
+    if (S > 1) { X += dx; Y += dy; apply(); }
+  });
+  function end(e) {
+    var p = pointers[e.pointerId]; if (!p) return;
+    var n = Object.keys(pointers).length;
+    delete pointers[e.pointerId];
+    if (n !== 1) return;
+    var dx = e.clientX - startX, dy = e.clientY - startY;
+    if (S === 1 && moved && Math.abs(dx) > 60 && Math.abs(dy) < 90 && items.length > 1) { show(dx < 0 ? idx + 1 : idx - 1); return; }
+    if (S === 1 && moved && dy > 110 && Math.abs(dx) < 90) { close(); return; }
+    if (!moved) {
+      var now = Date.now();
+      if (now - lastTap < 320) { lastTap = 0; zoomAt(e.clientX, e.clientY, S > 1 ? 1 : 2.5); return; }
+      lastTap = now;
+      setTimeout(function() { if (lastTap && Date.now() - lastTap >= 300 && S === 1 && e.target === stage) close(); }, 320);
+    }
+  }
+  stage.addEventListener('pointerup', end);
+  stage.addEventListener('pointercancel', function(e) { delete pointers[e.pointerId]; });
+})();
+
+window.toggleReviews = function(id, forceOpen) {
+  var box = document.getElementById(id); if (!box) return;
+  var panel = box.querySelector('.rev-panel');
+  panel.hidden = forceOpen ? false : !panel.hidden;
+  box.classList.toggle('open', !panel.hidden);
+};
+if (location.hash.indexOf('#reviews-') === 0) {
+  window.toggleReviews(location.hash.slice(1), true);
+  var _r = document.getElementById(location.hash.slice(1)); if (_r) setTimeout(function() { _r.scrollIntoView({ block: 'center' }); }, 300);
+}
+</script>
+<script>
+  (function() {
+    var els = document.querySelectorAll('.reveal');
+    if (!('IntersectionObserver' in window)) { els.forEach(function(e) { e.classList.add('in'); }); }
+    else {
+      var io = new IntersectionObserver(function(entries) {
+        entries.forEach(function(en) { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
+      }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+      els.forEach(function(e) { io.observe(e); });
+    }
+    var nav = document.getElementById('siteNav');
+    if (nav) window.addEventListener('scroll', function() { nav.classList.toggle('scrolled', window.scrollY > 10); }, { passive: true });
+  })();
   window.updateUnreadBadges = function(n) {
     n = parseInt(n, 10) || 0;
     document.querySelectorAll('.js-unread').forEach(function(b) {
@@ -1242,8 +1553,12 @@ TEMPLATES = {
     });
   }
   function toggleMenu() {
-    document.body.classList.toggle('menu-open');
+    var open = document.body.classList.toggle('menu-open');
+    [].forEach.call(document.querySelectorAll('.hamburger-btn, .bottom-tabs button'), function(b) { b.setAttribute('aria-expanded', open ? 'true' : 'false'); });
   }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.body.classList.contains('menu-open')) toggleMenu();
+  });
   document.addEventListener('DOMContentLoaded', function() {
     document.querySelectorAll('.sidebar a, .sidebar button').forEach(function(el) {
       el.addEventListener('click', function() { document.body.classList.remove('menu-open'); });
@@ -1438,6 +1753,7 @@ window.startAndyTour = function() {
         <input type="email" name="email" placeholder="Email address" required>
         <input type="password" name="password" placeholder="Create a password (min 6 chars)" required>
         <button class="btn btn-purple" type="submit">Create my account</button>
+        <p class="terms-note">Terms and conditions apply. By continuing you agree to our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> and <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
       </form>
       <p style="font-size:12px;text-align:center;margin-top:14px;color:var(--text-muted);">
         Already with us? <a href="#" style="color:var(--accent);font-weight:600;" onclick="showStep('loginForm')">Log in instead</a>
@@ -1451,6 +1767,7 @@ window.startAndyTour = function() {
         <input type="email" name="email" placeholder="Email address" required>
         <input type="password" name="password" placeholder="Password" required>
         <button class="btn btn-purple" type="submit">Log in</button>
+        <p class="terms-note">Terms and conditions apply. By continuing you agree to our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> and <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
       </form>
       <p style="font-size:12px;text-align:center;margin-top:10px;">
         <a href="{{ url_for('forgot_password') }}" style="color:var(--text-muted);">Forgot your password?</a>
@@ -1472,18 +1789,19 @@ MORE_TEMPLATES_1 = {
 "home.html": '''{% extends "base.html" %}
 {% block content %}
 
-<div class="hero" style="{% if hero_photos %}background-image:url('{{ hero_photos[0].filename|photo_url(\'hero\') }}');{% endif %}">
+{% set hero_bg = (hero_photos[0].filename|photo_url("hero")) if hero_photos else "" %}
+<div class="hero" style="{% if hero_bg %}background-image:url('{{ hero_bg }}');{% endif %}">
   {% if not hero_photos %}
   <div class="hero-default-bg">
     <svg width="100%" height="100%" viewBox="0 0 800 400" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMax slice">
       <defs>
         <linearGradient id="skyG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#0a0f0c"/>
-          <stop offset="100%" stop-color="#0f1a13"/>
+          <stop offset="0%" stop-color="#0A1426"/>
+          <stop offset="100%" stop-color="#10203A"/>
         </linearGradient>
         <linearGradient id="glassG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#1a3324"/>
-          <stop offset="100%" stop-color="#0d1a12"/>
+          <stop offset="0%" stop-color="#14294A"/>
+          <stop offset="100%" stop-color="#0C1A30"/>
         </linearGradient>
       </defs>
       <rect x="0" y="0" width="800" height="400" fill="url(#skyG)"/>
@@ -1527,75 +1845,165 @@ MORE_TEMPLATES_1 = {
   </div>
   {% endif %}
   <div class="hero-overlay">
-    <div class="hero-name">ANDY</div>
-    <div class="hero-title">{{ site.tagline }}</div>
-    {% if not user %}
+    <div class="hero-kicker">Aluminum made simple</div>
+    <h1 class="hero-name hero-headline">Find the Right Professional for the Job.</h1>
+    {% set old_tag = "Connecting you with trusted artisans when you need them." %}
+    <p class="hero-title">{% if site.tagline and site.tagline != old_tag %}{{ site.tagline }}{% else %}From home repairs to installations, Andy helps you connect with professionals for the work you need done.{% endif %}</p>
+    {% if not user or user.role == 'customer' %}
     <div class="hero-actions">
-      <a href="{{ url_for('request_service') if user else '#' }}" onclick="{{ '' if user else 'document.getElementById(\\'authModal\\').classList.add(\\'open\\');return false;' }}" class="btn btn-purple">Get Started</a>
-      <a href="#how-it-works" class="btn btn-outline-light">Learn More</a>
+      {% if user %}<a href="{{ url_for('request_service') }}" class="btn btn-purple">Request a Service</a>
+      {% else %}<a href="#" onclick="document.getElementById('authModal').classList.add('open');return false;" class="btn btn-purple">Request a Service</a>{% endif %}
+      <a href="#services" class="btn btn-outline-light">Explore Services</a>
     </div>
     {% endif %}
   </div>
 </div>
 
-<div class="section">
-  <div class="section-title">What Andy Offers</div>
-  <div class="info-card">
-    <p>{% if site.what_offers %}{{ site.what_offers }}{% else %}Andy connects you with carefully selected, staffed artisans for your aluminum and fabrication service needs. We don't just list anyone — every artisan on Andy is personally vetted and managed, so you get dependable, trustworthy help every time.{% endif %}</p>
-  </div>
-</div>
+<section class="lp-section" id="about">
+  {% include "_about_section.html" %}
+</section>
 
-<div class="section" id="how-it-works">
-  <div class="section-title">How Andy Works</div>
-  <div class="steps-grid">
-    <div class="step-card"><div class="step-num">1</div><div class="step-title">Tell Andy what you need</div><div class="step-desc">Describe the job, add photos or files if it helps explain it.</div></div>
-    <div class="step-card"><div class="step-num">2</div><div class="step-title">Andy connects you</div><div class="step-desc">We match you with the right staffed artisan for the job.</div></div>
-    <div class="step-card"><div class="step-num">3</div><div class="step-title">Get the job handled</div><div class="step-desc">Your artisan takes care of the work, with Andy overseeing it.</div></div>
-    <div class="step-card"><div class="step-num">4</div><div class="step-title">Larger projects</div><div class="step-desc">Sufficiently large projects can be routed to EAS, our larger-project team.</div></div>
+<section class="lp-section" id="how-it-works">
+  <div class="lp-head reveal"><span class="lp-eyebrow">How it works</span><h2 class="lp-title">Four simple steps</h2></div>
+  <div class="lp-grid lp-steps">
+    <div class="lp-card reveal" style="--d:0ms"><div class="lp-step-num">1</div><h3>Tell Andy what you need</h3><p>Describe the job, add photos or files if it helps explain it.</p></div>
+    <div class="lp-card reveal" style="--d:120ms"><div class="lp-step-num">2</div><h3>Andy connects you</h3><p>Andy connects you with a suitable artisan for the job.</p></div>
+    <div class="lp-card reveal" style="--d:240ms"><div class="lp-step-num">3</div><h3>Get the job handled</h3><p>Your artisan does the work. Chat with Andy and follow your request's status in the app.</p></div>
+    <div class="lp-card reveal" style="--d:360ms"><div class="lp-step-num">4</div><h3>Larger projects</h3><p>Larger projects can be directed to EAS where appropriate.</p></div>
   </div>
-</div>
+</section>
 
-<div class="section">
-  <div class="section-title">Our Work</div>
-  {% if hero_photos %}
-    <div class="ba-grid">
-      {% for p in hero_photos[:4] %}
-        <div class="gallery-photo" style="background-image:url('{{ p.filename|photo_url('hero') }}');"></div>
+<section class="lp-section" id="work">
+  <div class="lp-head reveal"><span class="lp-eyebrow">Our Work</span><h2 class="lp-title">Jobs we have finished</h2></div>
+  {% if recent_works %}
+    <div class="lp-grid lp-work">
+      {% for w in recent_works %}
+        {% set wp = (w.photo|photo_url("works")) if w.photo else "" %}
+        <a class="lp-work-card reveal" href="{{ url_for('works') }}" style="--d:{{ loop.index0 * 90 }}ms">
+          <div class="lp-work-img" style="{% if wp %}--bg:url('{{ wp }}');{% endif %}">{% if wp %}<img src="{{ wp }}" alt="{{ w.title }}" loading="lazy">{% elif w.video %}<video src="{{ w.video|photo_url("works") }}#t=0.1" muted playsinline preload="metadata"></video><span class="lp-play">▶</span>{% endif %}</div>
+          <div class="lp-work-info"><b>{{ w.title }}</b>{% if w.category %}<span class="work-tag">{{ w.category }}</span>{% endif %}</div>
+        </a>
       {% endfor %}
+    </div>
+    <div style="margin-top:22px;" class="reveal"><a class="btn btn-outline" href="{{ url_for('works') }}">See all our work →</a></div>
+  {% elif hero_photos %}
+    <div class="ba-grid">
+      {% for p in hero_photos[:4] %}{% set hp = p.filename|photo_url("hero") %}<div class="gallery-photo" style="background-image:url('{{ hp }}');"></div>{% endfor %}
     </div>
   {% else %}
     <div class="empty-state">Photos of completed work coming soon.</div>
   {% endif %}
-</div>
+</section>
 
-{% if not user %}
-<div class="section cta-section">
-  <div class="section-title">Ready to get started?</div>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;">
-    <button class="btn btn-purple" onclick="document.getElementById('authModal').classList.add('open')">Sign Up to Andy</button>
-    <button class="btn btn-outline" onclick="document.getElementById('authModal').classList.add('open');showStep('loginForm')">Login to Andy</button>
+<section class="lp-section" id="contact">
+  <div class="lp-contact reveal">
+    <h2 class="lp-title">Ready to get started?</h2>
+    <p class="lp-lead">Tell Andy what you need and we will connect you with the right artisan.</p>
+    {% if not user %}
+    <div class="lp-cta-row">
+      <button class="btn btn-purple" onclick="document.getElementById('authModal').classList.add('open')">Sign Up to Andy</button>
+      <button class="btn btn-outline" onclick="document.getElementById('authModal').classList.add('open');showStep('loginForm')">Login to Andy</button>
+    </div>
+    <p class="terms-note" style="text-align:center;margin-top:16px;">Terms and conditions apply. <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> · <a href="{{ url_for('privacy') }}">Privacy Policy</a></p>
+    {% elif user.role == 'customer' %}
+    <div class="lp-cta-row"><a class="btn btn-purple" href="{{ url_for('request_service') }}">Request a Service</a></div>
+    {% endif %}
+    {% if contact.phone or contact.whatsapp or contact.email or contact.address %}
+    <div class="lp-contact-list">
+      {% if contact.phone %}<a href="tel:{{ contact.phone }}">📞 {{ contact.phone }}</a>{% endif %}
+      {% if contact.whatsapp %}<a href="https://wa.me/{{ contact.whatsapp }}" target="_blank" rel="noopener">💬 WhatsApp us</a>{% endif %}
+      {% if contact.email %}<a href="mailto:{{ contact.email }}">✉️ {{ contact.email }}</a>{% endif %}
+      {% if contact.address %}<span>📍 {{ contact.address }}</span>{% endif %}
+    </div>
+    {% endif %}
   </div>
-</div>
-{% endif %}
+</section>
 
 {% endblock %}
 ''',
 
-"about.html": '''{% extends "base.html" %}
-{% block content %}
-
-<div class="section-title">About Andy</div>
-<div class="info-card">
-  <p>{% if site.about_text %}{{ site.about_text }}{% else %}Andy helps customers connect with carefully selected artisans for their service needs. Our aim is to make finding reliable technical help easier, more organized, and more convenient — while building a dependable network of capable artisans.{% endif %}</p>
+"_about_section.html": '''<div class="lp-head reveal">
+  <span class="lp-eyebrow">About</span>
+  <h2 class="lp-title">About Andy</h2>
+  <p class="lp-lead">{% if site.about_text %}{{ site.about_text }}{% else %}Andy helps customers connect with skilled artisans for their service needs. Our aim is to make finding reliable technical help easier, more organized and more convenient.{% endif %}</p>
 </div>
 
-<div class="section">
-  <div class="section-title">How we work</div>
-  <div class="info-card">
-    <p>Andy is not the artisan. We manage the connection between customers and our staffed artisan network. Artisans join Andy only by invitation — we personally select and manage everyone on the platform to keep quality high and dependable.</p>
+<div class="lp-offer-intro reveal">
+  <h3>What Andy offers</h3>
+  <p>{% if site.what_offers %}{{ site.what_offers }}{% else %}Tell Andy what you need and we will connect you with an artisan from our network. Artisans join Andy by invitation, and every job runs through Andy, so you can chat, share photos and follow its progress in one place.{% endif %}</p>
+</div>
+
+<div class="svc-grid" id="services">
+  <div class="svc-card reveal" style="--d:0ms">
+    <div class="svc-art svc-art-1"><svg viewBox="0 0 400 300" class="svc-svg" role="img" aria-label="3D aluminum sliding window"><defs>
+<linearGradient id="w-alu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6F9FC"/><stop offset=".45" stop-color="#C9D3DE"/><stop offset="1" stop-color="#8E9AA8"/></linearGradient>
+<linearGradient id="w-alu-h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#E9EEF4"/><stop offset=".5" stop-color="#BCC7D3"/><stop offset="1" stop-color="#8794A3"/></linearGradient>
+<linearGradient id="w-side" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8F9BAA"/><stop offset="1" stop-color="#586474"/></linearGradient>
+<linearGradient id="w-top" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#CBD5E0"/><stop offset="1" stop-color="#F3F7FB"/></linearGradient>
+<linearGradient id="w-glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A8EAFF"/><stop offset=".5" stop-color="#43A6DD"/><stop offset="1" stop-color="#1A5E96"/></linearGradient>
+<linearGradient id="w-glass2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9BE6FF" stop-opacity=".9"/><stop offset="1" stop-color="#2A78B4" stop-opacity=".85"/></linearGradient>
+<filter id="w-blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="7"/></filter>
+</defs><ellipse cx="195" cy="268" rx="135" ry="11" fill="#000" opacity=".5" filter="url(#w-blur)"/><g stroke="#5EE9A0" stroke-width="1.2" stroke-dasharray="4 4" opacity=".75" fill="none"><path d="M80 38 H280"/><path d="M80 32 V44 M280 32 V44"/><path d="M52 70 V230"/><path d="M46 70 H58 M46 230 H58"/></g><g fill="#5EE9A0" font-family="DM Sans, sans-serif" font-size="11" opacity=".9"><text x="158" y="31">150 cm</text><text x="8" y="154" transform="rotate(-90 20 150)">120 cm</text></g><polygon points="280.0,70.0 306.0,50.0 306.0,210.0 280.0,230.0" fill="url(#w-side)"/><polygon points="80.0,70.0 106.0,50.0 306.0,50.0 280.0,70.0" fill="url(#w-top)"/><polygon points="280.0,70.0 306.0,50.0 306.0,210.0 280.0,230.0" fill="none" stroke="#475262" stroke-width="1"/><rect x="80" y="70" width="200" height="160" rx="3" fill="url(#w-alu)" stroke="#7F8C9B" stroke-width="1.5"/><rect x="96" y="86" width="168" height="128" fill="#16456E"/><rect x="96" y="86" width="88" height="128" fill="url(#w-alu-h)" stroke="#7F8C9B"/><rect x="104" y="94" width="72" height="112" fill="url(#w-glass)" stroke="#5A6878" stroke-width="1"/><clipPath id="w-cl"><rect x="104" y="94" width="72" height="112" rx="2"/></clipPath>
+<g clip-path="url(#w-cl)"><g class="svc-shine" ><polygon points="94.0,206.0 129.2,94.0 143.6,94.0 118.4,206.0" fill="#fff" opacity=".38"/><polygon points="136.4,206.0 161.6,94.0 167.4,94.0 142.2,206.0" fill="#fff" opacity=".2"/></g></g><rect x="178" y="86" width="86" height="128" fill="url(#w-alu-h)" stroke="#6C7988" stroke-width="1.3"/><rect x="186" y="94" width="70" height="112" fill="url(#w-glass)" stroke="#5A6878" stroke-width="1"/><clipPath id="w-cr"><rect x="186" y="94" width="70" height="112" rx="2"/></clipPath>
+<g clip-path="url(#w-cr)"><g class="svc-shine" style="animation-delay:.6s"><polygon points="176.0,206.0 210.5,94.0 224.5,94.0 200.0,206.0" fill="#fff" opacity=".38"/><polygon points="217.5,206.0 242.0,94.0 247.6,94.0 223.1,206.0" fill="#fff" opacity=".2"/></g></g><rect x="180" y="138" width="5" height="30" rx="2.5" fill="#44505F"/><rect x="180.8" y="139" width="1.6" height="28" rx=".8" fill="#9FB0C2"/><path d="M82 72 H278" stroke="#fff" stroke-width="1.6" opacity=".8"/><path d="M82 72 V228" stroke="#fff" stroke-width="1.2" opacity=".6"/><polygon points="72.0,230.0 98.0,214.0 314.0,214.0 288.0,230.0" fill="url(#w-top)" stroke="#8794A3" stroke-width=".8"/><rect x="72" y="230" width="216" height="12" fill="url(#w-alu)" stroke="#7F8C9B"/><polygon points="288.0,230.0 314.0,214.0 314.0,226.0 288.0,242.0" fill="url(#w-side)"/></svg></div>
+    <h3>Windows</h3>
+    <p>Sliding and fixed aluminum windows, made to size.</p>
+  </div>
+  <div class="svc-card reveal" style="--d:110ms">
+    <div class="svc-art svc-art-2"><svg viewBox="0 0 400 300" class="svc-svg" role="img" aria-label="3D aluminum and glass door"><defs>
+<linearGradient id="d-alu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6F9FC"/><stop offset=".45" stop-color="#C9D3DE"/><stop offset="1" stop-color="#8E9AA8"/></linearGradient>
+<linearGradient id="d-alu-h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#E9EEF4"/><stop offset=".5" stop-color="#BCC7D3"/><stop offset="1" stop-color="#8794A3"/></linearGradient>
+<linearGradient id="d-side" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8F9BAA"/><stop offset="1" stop-color="#586474"/></linearGradient>
+<linearGradient id="d-top" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#CBD5E0"/><stop offset="1" stop-color="#F3F7FB"/></linearGradient>
+<linearGradient id="d-glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A8EAFF"/><stop offset=".5" stop-color="#43A6DD"/><stop offset="1" stop-color="#1A5E96"/></linearGradient>
+<linearGradient id="d-glass2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9BE6FF" stop-opacity=".9"/><stop offset="1" stop-color="#2A78B4" stop-opacity=".85"/></linearGradient>
+<filter id="d-blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="7"/></filter>
+</defs><ellipse cx="205" cy="272" rx="120" ry="11" fill="#000" opacity=".5" filter="url(#d-blur)"/><g stroke="#5EE9A0" stroke-width="1.2" stroke-dasharray="4 4" opacity=".75" fill="none"><path d="M96 36 V250"/><path d="M90 36 H102 M90 250 H102"/><path d="M130 22 H250"/><path d="M130 16 V28 M250 16 V28"/></g><g fill="#5EE9A0" font-family="DM Sans, sans-serif" font-size="11" opacity=".9"><text x="170" y="15">90 cm</text><text x="62" y="148" transform="rotate(-90 70 142)">210 cm</text></g><polygon points="250.0,40.0 274.0,26.0 274.0,242.0 250.0,256.0" fill="url(#d-side)"/><polygon points="130.0,40.0 154.0,26.0 274.0,26.0 250.0,40.0" fill="url(#d-top)"/><rect x="130" y="40" width="120" height="216" rx="3" fill="url(#d-alu)" stroke="#7F8C9B" stroke-width="1.5"/><rect x="142" y="52" width="96" height="198" fill="#14405F"/><rect x="142" y="52" width="96" height="198" fill="url(#d-alu-h)" stroke="#6C7988" stroke-width="1.3"/><rect x="154" y="64" width="72" height="112" rx="2" fill="url(#d-glass)" stroke="#546273"/><clipPath id="d-c"><rect x="154" y="64" width="72" height="112" rx="2"/></clipPath>
+<g clip-path="url(#d-c)"><g class="svc-shine" ><polygon points="144.0,176.0 179.2,64.0 193.6,64.0 168.4,176.0" fill="#fff" opacity=".38"/><polygon points="186.4,176.0 211.6,64.0 217.4,64.0 192.2,176.0" fill="#fff" opacity=".2"/></g></g><rect x="154" y="190" width="72" height="48" rx="2" fill="url(#d-alu)" stroke="#7F8C9B"/><rect x="158" y="194" width="64" height="40" rx="1.5" fill="none" stroke="#fff" stroke-opacity=".7"/><rect x="158" y="194" width="64" height="40" rx="1.5" fill="none" stroke="#8794A3" stroke-opacity=".6" transform="translate(1 1)"/><rect x="224" y="118" width="7" height="74" rx="3.5" fill="#3F4A58"/><rect x="225.3" y="120" width="2" height="70" rx="1" fill="#B8C6D6"/><circle cx="227.5" cy="124" r="3" fill="#6E7B8B"/><circle cx="227.5" cy="186" r="3" fill="#6E7B8B"/><rect x="139" y="84" width="5" height="16" rx="1.5" fill="#4C5766"/><rect x="139" y="150" width="5" height="16" rx="1.5" fill="#4C5766"/><rect x="139" y="216" width="5" height="16" rx="1.5" fill="#4C5766"/><path d="M132 42 H248" stroke="#fff" stroke-width="1.6" opacity=".8"/><rect x="122" y="256" width="136" height="9" rx="2" fill="#5B6877"/><polygon points="258.0,256.0 280.0,243.0 280.0,252.0 258.0,265.0" fill="#46515F"/></svg></div>
+    <h3>Doors</h3>
+    <p>Strong, smooth-running aluminum and glass doors.</p>
+  </div>
+  <div class="svc-card reveal" style="--d:220ms">
+    <div class="svc-art svc-art-3"><svg viewBox="0 0 400 300" class="svc-svg" role="img" aria-label="3D glass partition wall"><defs>
+<linearGradient id="p-alu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6F9FC"/><stop offset=".45" stop-color="#C9D3DE"/><stop offset="1" stop-color="#8E9AA8"/></linearGradient>
+<linearGradient id="p-alu-h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#E9EEF4"/><stop offset=".5" stop-color="#BCC7D3"/><stop offset="1" stop-color="#8794A3"/></linearGradient>
+<linearGradient id="p-side" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8F9BAA"/><stop offset="1" stop-color="#586474"/></linearGradient>
+<linearGradient id="p-top" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#CBD5E0"/><stop offset="1" stop-color="#F3F7FB"/></linearGradient>
+<linearGradient id="p-glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A8EAFF"/><stop offset=".5" stop-color="#43A6DD"/><stop offset="1" stop-color="#1A5E96"/></linearGradient>
+<linearGradient id="p-glass2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9BE6FF" stop-opacity=".9"/><stop offset="1" stop-color="#2A78B4" stop-opacity=".85"/></linearGradient>
+<filter id="p-blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="7"/></filter>
+<linearGradient id="p-floor" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9BE6FF" stop-opacity=".25"/><stop offset="1" stop-color="#9BE6FF" stop-opacity="0"/></linearGradient></defs><polygon points="44.0,252.0 352.0,214.0 366.0,238.0 34.0,286.0" fill="url(#p-floor)"/><ellipse cx="200" cy="262" rx="165" ry="10" fill="#000" opacity=".35" filter="url(#p-blur)"/><polygon points="48.0,50.0 133.4,68.0 133.4,230.6 48.0,242.0" fill="url(#p-glass2)" stroke="#4E6F8E" stroke-width="1"/><polygon points="48.0,130.6 133.4,136.3 133.4,162.3 48.0,161.4" fill="#fff" opacity=".3"/><polygon points="57.9,52.0 82.8,55.4 82.8,236.6 53.2,240.0" fill="#fff" opacity=".22"/><polygon points="140.4,68.0 210.4,83.0 210.4,221.1 140.4,230.6" fill="url(#p-glass2)" stroke="#4E6F8E" stroke-width="1"/><polygon points="140.4,136.3 210.4,141.0 210.4,163.1 140.4,162.3" fill="#fff" opacity=".3"/><polygon points="147.9,70.0 168.7,72.5 168.7,225.8 144.1,228.6" fill="#fff" opacity=".22"/><polygon points="217.4,83.0 278.2,96.2 278.2,212.7 217.4,221.1" fill="url(#p-glass2)" stroke="#4E6F8E" stroke-width="1"/><polygon points="217.4,141.0 278.2,145.1 278.2,163.8 217.4,163.1" fill="#fff" opacity=".3"/><polygon points="223.6,85.0 241.9,87.0 241.9,216.6 220.2,219.1" fill="#fff" opacity=".22"/><polygon points="285.2,96.2 349.0,110.0 349.0,204.0 285.2,212.7" fill="url(#p-glass2)" stroke="#4E6F8E" stroke-width="1"/><polygon points="285.2,145.1 349.0,149.5 349.0,164.5 285.2,163.8" fill="#fff" opacity=".3"/><polygon points="291.8,98.2 310.9,100.3 310.9,208.1 288.2,210.7" fill="#fff" opacity=".22"/><rect x="264.3" y="147.9" width="4.5" height="22.2" rx="2" fill="#3F4A58"/><polygon points="40.5,46.0 47.5,46.0 47.5,246.0 40.5,246.0" fill="url(#p-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="133.3,64.0 139.4,64.0 139.4,234.6 133.3,234.6" fill="url(#p-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="210.8,79.0 216.0,79.0 216.0,225.1 210.8,225.1" fill="url(#p-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="279.0,92.2 283.3,92.2 283.3,216.7 279.0,216.7" fill="url(#p-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="350.3,106.0 353.7,106.0 353.7,208.0 350.3,208.0" fill="url(#p-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="40.0,36.0 355.0,96.0 355.0,110.0 40.0,50.0" fill="url(#p-alu)" stroke="#7F8C9B" stroke-width="1"/><polygon points="40.0,36.0 52.0,28.0 362.0,88.0 355.0,96.0" fill="url(#p-top)" stroke="#8794A3" stroke-width=".8"/><polygon points="40.0,242.0 355.0,204.0 355.0,218.0 40.0,256.0" fill="url(#p-alu)" stroke="#7F8C9B" stroke-width="1"/><polygon points="355.0,96.0 362.0,88.0 362.0,210.0 355.0,218.0" fill="url(#p-side)"/></svg></div>
+    <h3>Partitioning</h3>
+    <p>Clean glass and aluminum partitions for offices and homes.</p>
+  </div>
+  <div class="svc-card reveal" style="--d:330ms">
+    <div class="svc-art svc-art-4"><svg viewBox="0 0 400 300" class="svc-svg" role="img" aria-label="3D glass curtain wall building"><defs>
+<linearGradient id="c-alu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F6F9FC"/><stop offset=".45" stop-color="#C9D3DE"/><stop offset="1" stop-color="#8E9AA8"/></linearGradient>
+<linearGradient id="c-alu-h" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#E9EEF4"/><stop offset=".5" stop-color="#BCC7D3"/><stop offset="1" stop-color="#8794A3"/></linearGradient>
+<linearGradient id="c-side" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#8F9BAA"/><stop offset="1" stop-color="#586474"/></linearGradient>
+<linearGradient id="c-top" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#CBD5E0"/><stop offset="1" stop-color="#F3F7FB"/></linearGradient>
+<linearGradient id="c-glass" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#A8EAFF"/><stop offset=".5" stop-color="#43A6DD"/><stop offset="1" stop-color="#1A5E96"/></linearGradient>
+<linearGradient id="c-glass2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9BE6FF" stop-opacity=".9"/><stop offset="1" stop-color="#2A78B4" stop-opacity=".85"/></linearGradient>
+<filter id="c-blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="7"/></filter>
+<linearGradient id="c-sky" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#BDF0FF"/><stop offset=".5" stop-color="#58B4E8"/><stop offset="1" stop-color="#1E67A3"/></linearGradient><linearGradient id="c-sky2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4C9CD3"/><stop offset=".6" stop-color="#1E5C93"/><stop offset="1" stop-color="#103B66"/></linearGradient></defs><ellipse cx="205" cy="270" rx="150" ry="10" fill="#000" opacity=".45" filter="url(#c-blur)"/><polygon points="40.0,78.0 208.0,34.0 208.0,258.0 40.0,226.0" fill="url(#c-sky)" stroke="#2F5F8C" stroke-width="1.2"/><polygon points="40.0,78.0 73.6,69.2 73.6,92.5 40.0,99.1" fill="#fff" opacity="0.10"/><polygon points="40.0,162.6 73.6,162.5 73.6,185.8 40.0,183.7" fill="#fff" opacity="0.10"/><polygon points="40.0,183.7 73.6,185.8 73.6,209.1 40.0,204.9" fill="#fff" opacity="0.10"/><polygon points="73.6,69.2 107.2,60.4 107.2,85.9 73.6,92.5" fill="#fff" opacity="0.10"/><polygon points="73.6,92.5 107.2,85.9 107.2,111.4 73.6,115.8" fill="#fff" opacity="0.10"/><polygon points="73.6,185.8 107.2,187.8 107.2,213.3 73.6,209.1" fill="#fff" opacity="0.10"/><polygon points="73.6,209.1 107.2,213.3 107.2,238.8 73.6,232.4" fill="#fff" opacity="0.10"/><polygon points="107.2,85.9 140.8,79.3 140.8,106.9 107.2,111.4" fill="#fff" opacity="0.10"/><polygon points="107.2,111.4 140.8,106.9 140.8,134.6 107.2,136.9" fill="#fff" opacity="0.10"/><polygon points="107.2,213.3 140.8,217.5 140.8,245.2 107.2,238.8" fill="#fff" opacity="0.10"/><polygon points="140.8,106.9 174.4,102.5 174.4,132.3 140.8,134.6" fill="#fff" opacity="0.10"/><polygon points="140.8,134.6 174.4,132.3 174.4,162.1 140.8,162.2" fill="#fff" opacity="0.10"/><polygon points="174.4,132.3 208.0,130.0 208.0,162.0 174.4,162.1" fill="#fff" opacity="0.10"/><polygon points="174.4,162.1 208.0,162.0 208.0,194.0 174.4,191.9" fill="#fff" opacity="0.10"/><line x1="40.0" y1="99.1" x2="208.0" y2="66.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="100.7" x2="208.0" y2="67.6" stroke="#5C6B7C" stroke-width="1"/><line x1="40.0" y1="120.3" x2="208.0" y2="98.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="121.9" x2="208.0" y2="99.6" stroke="#5C6B7C" stroke-width="1"/><line x1="40.0" y1="141.4" x2="208.0" y2="130.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="143.0" x2="208.0" y2="131.6" stroke="#5C6B7C" stroke-width="1"/><line x1="40.0" y1="162.6" x2="208.0" y2="162.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="164.2" x2="208.0" y2="163.6" stroke="#5C6B7C" stroke-width="1"/><line x1="40.0" y1="183.7" x2="208.0" y2="194.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="185.3" x2="208.0" y2="195.6" stroke="#5C6B7C" stroke-width="1"/><line x1="40.0" y1="204.9" x2="208.0" y2="226.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="40.0" y1="206.5" x2="208.0" y2="227.6" stroke="#5C6B7C" stroke-width="1"/><line x1="73.6" y1="69.2" x2="73.6" y2="232.4" stroke="#DCE5EE" stroke-width="2.2"/><line x1="107.2" y1="60.4" x2="107.2" y2="238.8" stroke="#DCE5EE" stroke-width="2.2"/><line x1="140.8" y1="51.6" x2="140.8" y2="245.2" stroke="#DCE5EE" stroke-width="2.2"/><line x1="174.4" y1="42.8" x2="174.4" y2="251.6" stroke="#DCE5EE" stroke-width="2.2"/><polygon points="368.0,92.0 208.0,34.0 208.0,258.0 368.0,214.0" fill="url(#c-sky2)" stroke="#2F5F8C" stroke-width="1.2"/><polygon points="368.0,92.0 314.7,72.7 314.7,95.0 368.0,109.4" fill="#fff" opacity="0.16"/><polygon points="368.0,161.7 314.7,161.8 314.7,184.1 368.0,179.1" fill="#fff" opacity="0.16"/><polygon points="368.0,179.1 314.7,184.1 314.7,206.4 368.0,196.6" fill="#fff" opacity="0.16"/><polygon points="314.7,72.7 261.3,53.3 261.3,80.5 314.7,95.0" fill="#fff" opacity="0.16"/><polygon points="314.7,95.0 261.3,80.5 261.3,107.6 314.7,117.2" fill="#fff" opacity="0.16"/><polygon points="314.7,184.1 261.3,189.0 261.3,216.2 314.7,206.4" fill="#fff" opacity="0.16"/><polygon points="314.7,206.4 261.3,216.2 261.3,243.3 314.7,228.7" fill="#fff" opacity="0.16"/><polygon points="261.3,80.5 208.0,66.0 208.0,98.0 261.3,107.6" fill="#fff" opacity="0.16"/><polygon points="261.3,107.6 208.0,98.0 208.0,130.0 261.3,134.8" fill="#fff" opacity="0.16"/><polygon points="261.3,216.2 208.0,226.0 208.0,258.0 261.3,243.3" fill="#fff" opacity="0.16"/><line x1="368.0" y1="109.4" x2="208.0" y2="66.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="111.0" x2="208.0" y2="67.6" stroke="#5C6B7C" stroke-width="1"/><line x1="368.0" y1="126.9" x2="208.0" y2="98.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="128.5" x2="208.0" y2="99.6" stroke="#5C6B7C" stroke-width="1"/><line x1="368.0" y1="144.3" x2="208.0" y2="130.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="145.9" x2="208.0" y2="131.6" stroke="#5C6B7C" stroke-width="1"/><line x1="368.0" y1="161.7" x2="208.0" y2="162.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="163.3" x2="208.0" y2="163.6" stroke="#5C6B7C" stroke-width="1"/><line x1="368.0" y1="179.1" x2="208.0" y2="194.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="180.7" x2="208.0" y2="195.6" stroke="#5C6B7C" stroke-width="1"/><line x1="368.0" y1="196.6" x2="208.0" y2="226.0" stroke="#DCE5EE" stroke-width="2.2"/><line x1="368.0" y1="198.2" x2="208.0" y2="227.6" stroke="#5C6B7C" stroke-width="1"/><line x1="314.7" y1="72.7" x2="314.7" y2="228.7" stroke="#DCE5EE" stroke-width="2.2"/><line x1="261.3" y1="53.3" x2="261.3" y2="243.3" stroke="#DCE5EE" stroke-width="2.2"/><polygon points="204.5,34.0 211.5,34.0 211.5,258.0 204.5,258.0" fill="url(#c-alu-h)" stroke="#7F8C9B" stroke-width=".8"/><polygon points="37.0,72.0 208.0,26.0 371.0,86.0 371.0,93.0 208.0,35.0 37.0,79.0" fill="url(#c-alu)" stroke="#7F8C9B" stroke-width="1"/><polygon points="37.0,72.0 208.0,26.0 371.0,86.0 208.0,18.0" fill="url(#c-top)" stroke="#8794A3" stroke-width=".8"/><polygon points="37.0,226.0 208.0,258.0 371.0,214.0 371.0,221.0 208.0,266.0 37.0,233.0" fill="url(#c-side)"/><g class="svc-twinkle"><path d="M300 120 L304 130 L314 134 L304 138 L300 148 L296 138 L286 134 L296 130 Z" fill="#fff" opacity=".9"/></g></svg></div>
+    <h3>Curtain Walls</h3>
+    <p>Sleek glass facades that give buildings a modern look.</p>
+  </div>
+  <div class="svc-card reveal" style="--d:440ms">
+    <div class="svc-art svc-art-5"><svg viewBox="0 0 400 300" class="svc-svg" role="img" aria-label="3D wrench and gear for maintenance"><defs><radialGradient id="m-gear" cx=".35" cy=".3" r=".9"><stop offset="0" stop-color="#F8FBFE"/><stop offset=".5" stop-color="#B9C5D2"/><stop offset="1" stop-color="#6D7A8A"/></radialGradient><linearGradient id="m-steel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#F4F8FC"/><stop offset=".45" stop-color="#BAC6D3"/><stop offset="1" stop-color="#6F7D8D"/></linearGradient><linearGradient id="m-green" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6EF0A6"/><stop offset="1" stop-color="#14934A"/></linearGradient><filter id="m-blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="7"/></filter><mask id="m-jaw" maskUnits="userSpaceOnUse" x="-140" y="-140" width="360" height="360"><rect x="-140" y="-140" width="360" height="360" fill="#fff"/><rect x="-13" y="-72" width="26" height="54" rx="3" fill="#000"/></mask></defs><ellipse cx="200" cy="270" rx="150" ry="11" fill="#000" opacity=".5" filter="url(#m-blur)"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(9.0 11.0)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(8.1 9.9)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(7.2 8.8)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(6.3 7.7)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(5.4 6.6)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(4.5 5.5)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(3.6 4.4)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(2.7 3.3)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(1.8 2.2)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" transform="translate(0.9 1.1)" fill="#4A5666" fill-rule="evenodd"/><path d="M201.8,155.3 L217.8,165.3 L212.5,188.8 L193.8,190.9 L192.8,192.6 L199.8,210.0 L181.7,225.9 L165.3,216.6 L163.5,217.4 L159.0,235.6 L135.0,237.8 L127.2,220.7 L125.3,220.2 L110.9,232.4 L90.2,220.0 L94.0,201.6 L92.7,200.1 L73.9,201.5 L64.4,179.3 L78.4,166.6 L78.2,164.7 L62.2,154.7 L67.5,131.2 L86.2,129.1 L87.2,127.4 L80.2,110.0 L98.3,94.1 L114.7,103.4 L116.5,102.6 L121.0,84.4 L145.0,82.2 L152.8,99.3 L154.7,99.8 L169.1,87.6 L189.8,100.0 L186.0,118.4 L187.3,119.9 L206.1,118.5 L215.6,140.7 L201.6,153.4 Z M166,160 A26,26 0 1,0 114,160 A26,26 0 1,0 166,160 Z" fill="url(#m-gear)" fill-rule="evenodd" stroke="#5B6879" stroke-width="1.2"/><circle cx="140" cy="160" r="46" fill="none" stroke="#fff" stroke-opacity=".5" stroke-width="2"/><circle cx="140" cy="160" r="26" fill="#1E2733"/><circle cx="140" cy="160" r="26" fill="none" stroke="#9AA8B8" stroke-width="2"/><path d="M96 132 A52 52 0 0 1 150 108" stroke="#fff" stroke-opacity=".7" stroke-width="3" fill="none" stroke-linecap="round"/><g transform="translate(262 150) rotate(-42)"><g fill="#3E4958" mask="url(#m-jaw)"><g transform="translate(7.2 9.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(6.4 8.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(5.6 7.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(4.8 6.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(4.0 5.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(3.2 4.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(2.4 3.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(1.6 2.0)"><circle cx="0" cy="-8" r="40"/></g><g transform="translate(0.8 1.0)"><circle cx="0" cy="-8" r="40"/></g></g><g fill="#3E4958"><g transform="translate(7.2 9.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(6.4 8.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(5.6 7.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(4.8 6.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(4.0 5.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(3.2 4.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(2.4 3.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(1.6 2.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g><g transform="translate(0.8 1.0)"><rect x="-14" y="10" width="28" height="170" rx="14"/></g></g><rect x="-14" y="10" width="28" height="170" rx="14" fill="url(#m-steel)" stroke="#667385" stroke-width="1.2"/><g mask="url(#m-jaw)"><circle cx="0" cy="-8" r="40" fill="url(#m-steel)" stroke="#667385" stroke-width="1.2"/></g><rect x="-14" y="-52" width="28" height="42" rx="3" fill="#10161F" opacity=".0"/><rect x="-6" y="40" width="4" height="120" rx="2" fill="#fff" opacity=".7"/><circle cx="0" cy="164" r="6" fill="#4A5666"/><circle cx="0" cy="164" r="6" fill="none" stroke="#C9D3DE"/></g><polygon points="361.1,87.0 342.0,98.0 322.9,87.0 322.9,65.0 342.0,54.0 361.1,65.0" fill="#3E4958"/><polygon points="357.1,81.0 338.0,92.0 318.9,81.0 318.9,59.0 338.0,48.0 357.1,59.0" fill="url(#m-green)" stroke="#0D6B33" stroke-width="1.2"/><circle cx="338" cy="70" r="9" fill="#12331F"/><circle cx="338" cy="70" r="9" fill="none" stroke="#8BF5B8"/><g class="svc-twinkle" style="animation-delay:0s"><path transform="translate(300 28) scale(0.9)" d="M0 -12 L3 -3 L12 0 L3 3 L0 12 L-3 3 L-12 0 L-3 -3 Z" fill="#7CF5B0"/></g><g class="svc-twinkle" style="animation-delay:0.8s"><path transform="translate(84 62) scale(0.7)" d="M0 -12 L3 -3 L12 0 L3 3 L0 12 L-3 3 L-12 0 L-3 -3 Z" fill="#7CF5B0"/></g><g class="svc-twinkle" style="animation-delay:1.4s"><path transform="translate(372 140) scale(0.6)" d="M0 -12 L3 -3 L12 0 L3 3 L0 12 L-3 3 L-12 0 L-3 -3 Z" fill="#7CF5B0"/></g></svg></div>
+    <h3>Maintenance</h3>
+    <p>Repairs, servicing and quick fixes to keep everything working.</p>
   </div>
 </div>
 
+<div class="lp-note reveal"><b>How we work.</b> Andy is not the artisan. We manage the connection between customers and our staffed artisan network. Artisans join Andy by invitation only.</div>
+''',
+
+"about.html": '''{% extends "base.html" %}
+{% block content %}
+<section class="lp-section" id="about" style="padding-top:8px;">
+  {% include "_about_section.html" %}
+</section>
 {% endblock %}
 ''',
 
@@ -1654,10 +2062,10 @@ MORE_TEMPLATES_1 = {
   </div>
   <div class="job-desc">{{ job.description }}</div>
   {% if attachments %}
-    <div class="ba-grid" style="margin-top:10px;">
+    <div class="gal" style="margin-top:10px;">
       {% for a in attachments %}
         {% if a.kind == 'image' %}
-          <div class="gallery-photo" style="background-image:url('{{ a.filename|photo_url('attachments') }}');"></div>
+          {% set au = a.filename|photo_url("attachments") %}<img src="{{ au }}" alt="Attachment" loading="lazy" data-lightbox="att{{ job.id }}" data-full="{{ au }}" data-caption="{{ job.title }}">
         {% else %}
           <a href="{{ a.filename|photo_url('attachments') }}" target="_blank" class="file-chip">📎 {{ a.filename.split('_', 1)[-1] }}</a>
         {% endif %}
@@ -1683,16 +2091,29 @@ MORE_TEMPLATES_1 = {
         <option value="standard" {{ 'selected' if job.track == 'standard' }}>Standard Andy Job</option>
         <option value="eas" {{ 'selected' if job.track == 'eas' }}>Large Project → EAS</option>
       </select>
+      <label style="font-size:12px;color:var(--text-muted);">Status</label>
+      <select name="status">
+        {% for st in statuses %}<option value="{{ st }}" {{ 'selected' if job.status == st }}>{{ st.replace('_', ' ')|title }}</option>{% endfor %}
+      </select>
       <label style="font-size:12px;color:var(--text-muted);">Agreed price (CONNECT)</label>
-      <input type="number" name="amount" value="{{ job.amount }}">
+      <input type="number" name="amount" min="0" value="{{ job.amount }}">
       <button class="btn btn-purple" type="submit">Save</button>
     </form>
   </div>
 {% endif %}
 
 {% if is_customer_view and job.status == 'assigned' and job.amount and job.amount > 0 %}
+  {% if payments_enabled %}
   <form method="POST" action="{{ url_for('pay_for_job', job_id=job.id) }}" style="margin-bottom:16px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button class="btn btn-gold" type="submit" style="width:100%;">Pay ₦{{ "{:,}".format(job.amount) }} &amp; Confirm — held in escrow</button>
+  </form>
+  {% else %}
+  <div class="info-card" style="margin-bottom:16px;font-size:14px;">Agreed price: <b>₦{{ "{:,}".format(job.amount) }}</b>. Andy will share payment details in this chat.</div>
+  {% endif %}
+{% endif %}
+{% if is_customer_view and job.status in ('submitted', 'assigned') and job.category not in ('General Support', 'Feedback', 'Bug Report') %}
+  <form method="POST" action="{{ url_for('cancel_job', job_id=job.id) }}" style="margin-bottom:16px;" onsubmit="return confirm('Cancel this request?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-outline" type="submit" style="width:100%;">Cancel this request</button>
   </form>
 {% endif %}
 {% if is_customer_view and job.status == 'in_progress' %}
@@ -1876,6 +2297,14 @@ MORE_TEMPLATES_2 = {
 {% block content %}
 
 <div class="section-title">📊 Admin Overview</div>
+{% for w in warnings %}<div class="info-card" style="border-color:#ef4444;background:rgba(239,68,68,.08);margin-bottom:10px;font-size:14px;">⚠️ {{ w }}</div>{% endfor %}
+{% if resets %}
+<div class="info-card" style="margin-bottom:14px;">
+  <b>🔑 Password reset requests</b>
+  <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Only you can see these links. Send one to the customer (for example in chat). Each works for 1 hour.</p>
+  {% for r in resets %}<div style="font-size:13px;margin-bottom:8px;word-break:break-all;"><b>{{ r.name }}</b> ({{ r.email }})<br><a href="{{ r.link }}" style="color:var(--accent);">{{ r.link }}</a></div>{% endfor %}
+</div>
+{% endif %}
 <div class="stats-grid">
   <div class="stat-tile"><div class="stat-num">{{ stats.customers }}</div><div class="stat-label">Customers</div></div>
   <div class="stat-tile"><div class="stat-num">{{ stats.artisans }}</div><div class="stat-label">Active Artisans</div></div>
@@ -2443,7 +2872,8 @@ MORE_TEMPLATES_3 = {
     <input type="text" name="title" placeholder="Project title (e.g. 3-panel sliding window, Lekki)" required maxlength="120">
     <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
     <textarea name="description" placeholder="What was the job? Size, materials, result" rows="3"></textarea>
-    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple required>
+    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm,.m4v" multiple required data-maxmb="95">
+    <p class="media-hint">Photos and videos. Videos keep their sound. Under 95 MB each.</p>
     <button class="btn btn-purple" type="submit">Publish to Our Work</button>
   </form>
 </div>
@@ -2452,7 +2882,7 @@ MORE_TEMPLATES_3 = {
 {% for w in pending %}
   <div class="settings-card">
     <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;">Submitted by <b>{{ w.submitter or 'an artisan' }}</b> · only you can see this name</div>
-    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    {% if w.photos %}<div class="gal {{ 'single' if w.photos|length == 1 }}">{% for ph in w.photos %}{% set pu = ph.filename|photo_url("works") %}{% if ph.kind == 'video' %}<video class="gal-video" src="{{ pu }}#t=0.1" controls playsinline preload="metadata"></video>{% else %}<img src="{{ pu }}" alt="{{ w.title }}" loading="lazy" data-lightbox="aw{{ w.id }}" data-full="{{ pu }}" data-caption="{{ w.title }}">{% endif %}{% endfor %}</div>{% endif %}
     <form method="POST" action="{{ url_for('admin_work_approve', work_id=w.id) }}" class="auth-form" style="margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="text" name="title" value="{{ w.title }}" maxlength="120">
       <select name="category"><option value="">Category</option>{% for c in categories %}<option value="{{ c }}" {{ 'selected' if w.category == c }}>{{ c }}</option>{% endfor %}</select>
@@ -2471,7 +2901,7 @@ MORE_TEMPLATES_3 = {
 {% for w in published %}
   <div class="feed-post">
     <div class="job-title" style="margin-bottom:6px;">{{ w.title }}{% if w.category %} <span class="work-tag">{{ w.category }}</span>{% endif %}{% if w.submitter %} <span class="work-tag">by {{ w.submitter }}</span>{% endif %}</div>
-    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos[:4] %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    {% if w.photos %}<div class="gal {{ 'single' if w.photos|length == 1 }}">{% for ph in w.photos %}{% set pu = ph.filename|photo_url("works") %}{% if ph.kind == 'video' %}<video class="gal-video" src="{{ pu }}#t=0.1" controls playsinline preload="metadata"></video>{% else %}<img src="{{ pu }}" alt="{{ w.title }}" loading="lazy" data-lightbox="pw{{ w.id }}" data-full="{{ pu }}" data-caption="{{ w.title }}">{% endif %}{% endfor %}</div>{% endif %}
     <form method="POST" action="{{ url_for('delete_work', work_id=w.id) }}" style="margin-top:10px;" onsubmit="return confirm('Remove this from Our Work?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="next" value="{{ url_for('admin_works') }}">
       <button class="btn btn-outline" type="submit" style="font-size:11px;padding:6px 10px;">Remove</button>
@@ -2493,8 +2923,8 @@ MORE_TEMPLATES_3 = {
     <input type="text" name="title" placeholder="What did you make? (e.g. Sliding window, 150 x 120 cm)" required maxlength="120">
     <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
     <textarea name="description" placeholder="Materials, size, anything worth noting" rows="3"></textarea>
-    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple required>
-    <p style="font-size:12px;color:var(--text-muted);">Up to 8 clear photos. Do not include customer names or phone numbers.</p>
+    <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm,.m4v" multiple required data-maxmb="95">
+    <p style="font-size:12px;color:var(--text-muted);">Up to 8 photos or videos (videos keep their sound, under 95 MB each). Do not show customer names or phone numbers.</p>
     <button class="btn btn-purple" type="submit">Send to Andy for review</button>
   </form>
 </div>
@@ -2505,7 +2935,7 @@ MORE_TEMPLATES_3 = {
     <div class="job-title" style="margin-bottom:6px;">{{ w.title }}
       <span class="work-status work-status-{{ w.status }}">{{ {'pending':'⏳ Waiting for review','approved':'✅ Live','rejected':'❌ Not approved'}[w.status] }}</span></div>
     {% if w.status == 'rejected' and w.reject_reason %}<div class="feed-post-caption" style="color:#ef4444;">Andy says: {{ w.reject_reason }}</div>{% endif %}
-    {% if w.photos %}<div class="ba-grid">{% for ph in w.photos[:4] %}<div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>{% endfor %}</div>{% endif %}
+    {% if w.photos %}<div class="gal {{ 'single' if w.photos|length == 1 }}">{% for ph in w.photos %}{% set pu = ph.filename|photo_url("works") %}{% if ph.kind == 'video' %}<video class="gal-video" src="{{ pu }}#t=0.1" controls playsinline preload="metadata"></video>{% else %}<img src="{{ pu }}" alt="{{ w.title }}" loading="lazy" data-lightbox="mw{{ w.id }}" data-full="{{ pu }}" data-caption="{{ w.title }}">{% endif %}{% endfor %}</div>{% endif %}
     {% if w.status != 'approved' %}
       <form method="POST" style="margin-top:10px;" onsubmit="return confirm('Remove this submission?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="action" value="delete"><input type="hidden" name="work_id" value="{{ w.id }}">
@@ -2515,6 +2945,109 @@ MORE_TEMPLATES_3 = {
   </div>
 {% endfor %}
 {% if not mine %}<div class="empty-state">You have not uploaded any work yet.</div>{% endif %}
+{% endblock %}
+''',
+
+"terms.html": '''{% extends "base.html" %}
+{% block content %}
+<div class="legal">
+  <h1>Terms &amp; Conditions</h1>
+  <div class="legal-date">Last updated: October 2026</div>
+  <p>Welcome to ANDY. By creating an account, logging in or using ANDY you agree to these terms. If you do not agree, please do not use the service.</p>
+
+  <h2>1. What ANDY is</h2>
+  <p>ANDY connects customers with artisans for aluminum, fabrication and related services. ANDY manages that connection. Artisans carry out the work. Larger projects may be routed to EAS, our larger-project team.</p>
+
+  <h2>2. Your account</h2>
+  <ul>
+    <li>Give accurate information and keep your password private. You are responsible for activity on your account.</li>
+    <li>You must be old enough to enter a binding agreement where you live.</li>
+    <li>We may suspend or close accounts that break these terms or put others at risk.</li>
+  </ul>
+
+  <h2>3. Requesting services</h2>
+  <ul>
+    <li>A request is not a guarantee. ANDY decides which artisan, if any, is assigned to a job.</li>
+    <li>Prices, timelines and scope are agreed with ANDY in the job chat or quote.</li>
+    <li>The Measure a Window tool gives an estimate only. Always confirm the real size with a tape measure before anything is cut or fabricated.</li>
+  </ul>
+
+  <h2>4. Payments</h2>
+  <p>Follow the payment instructions ANDY gives for your job. To keep both sides protected, keep job communication and payment inside ANDY. ANDY may hide phone numbers shared in chat.</p>
+
+  <h2>5. Content you post</h2>
+  <ul>
+    <li>You keep ownership of the photos, videos, messages and reviews you post. You give ANDY permission to store and show them as part of the service.</li>
+    <li>Reviews must be honest and respectful. Do not post personal contact details, hate, threats or anything unlawful.</li>
+    <li>Work photos and videos submitted by artisans are reviewed by ANDY and may be shown publicly as ANDY's work. ANDY may edit or remove content at any time.</li>
+  </ul>
+
+  <h2>6. Artisans</h2>
+  <p>Artisans join ANDY by invitation only. Jobs are assigned by ANDY, and work submitted for the public gallery is subject to ANDY's approval.</p>
+
+  <h2>7. Acceptable use</h2>
+  <p>Do not misuse ANDY. That includes fraud, spam, harassment, trying to bypass security, scraping, or interfering with how the service works.</p>
+
+  <h2>8. Messages and notifications</h2>
+  <p>ANDY sends service messages such as chat alerts by email and browser notifications. You can turn browser notifications off in your browser settings.</p>
+
+  <h2>9. Liability</h2>
+  <p>ANDY works hard to connect you with dependable artisans, but we cannot guarantee every outcome. To the extent the law allows, ANDY is not liable for indirect or consequential losses. Nothing here limits rights you have under the law that cannot be limited.</p>
+
+  <h2>10. Changes</h2>
+  <p>We may update these terms. If we make a significant change we will tell you in the app. Using ANDY after a change means you accept the new terms.</p>
+
+  <h2>11. Contact</h2>
+  <p>Questions about these terms? Message ANDY from your account, or read our <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
+</div>
+{% endblock %}
+''',
+
+"privacy.html": '''{% extends "base.html" %}
+{% block content %}
+<div class="legal">
+  <h1>Privacy Policy</h1>
+  <div class="legal-date">Last updated: October 2026</div>
+  <p>This policy explains what ANDY collects, why, and the choices you have.</p>
+
+  <h2>What we collect</h2>
+  <ul>
+    <li><b>Account details:</b> your name, email address and a scrambled (hashed) password. If you use Google sign-in we receive your name and email from Google.</li>
+    <li><b>Job information:</b> the requests you make, messages, photos, videos and files you send, window measurements you save, and reviews or likes you post.</li>
+    <li><b>Notification settings:</b> if you turn on browser notifications, your browser gives us a device address so we can send them.</li>
+    <li><b>Basic technical data:</b> cookies that keep you logged in and remember your light or dark mode choice.</li>
+  </ul>
+
+  <h2>How we use it</h2>
+  <ul>
+    <li>To run ANDY: match you with an artisan, show job chats and send alerts.</li>
+    <li>To keep the service safe and fix problems.</li>
+    <li>To show approved work, reviews and likes on the Our Work page. Reviews show your first name and last initial only.</li>
+  </ul>
+
+  <h2>Who can see it</h2>
+  <ul>
+    <li>ANDY's team can see accounts, jobs and chats so we can manage the service.</li>
+    <li>The artisan assigned to your job can see that job and its chat.</li>
+    <li>Service providers that help us run ANDY, for example media storage (such as Cloudinary), email delivery, browser notification services and payment providers, only receive what they need to do their part.</li>
+    <li>We do not sell your personal information.</li>
+  </ul>
+
+  <h2>Cookies</h2>
+  <p>We use a login cookie so you stay signed in and a small preference cookie for dark mode. We do not use advertising cookies.</p>
+
+  <h2>Keeping it safe</h2>
+  <p>Passwords are stored hashed, and the site is served over HTTPS. No system is perfectly secure, so please use a strong, unique password.</p>
+
+  <h2>Your choices</h2>
+  <ul>
+    <li>You can edit your profile in Settings and turn off browser notifications in your browser.</li>
+    <li>To ask for a copy of your data or to have your account deleted, message ANDY from your account.</li>
+  </ul>
+
+  <h2>Changes</h2>
+  <p>We may update this policy and will show the new date above. See also our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a>.</p>
+</div>
 {% endblock %}
 ''',
 
@@ -2542,7 +3075,8 @@ MORE_TEMPLATES_3 = {
       {% endif %}
       <input type="file" name="avatar" accept=".jpg,.jpeg,.png,.webp" style="flex:1;">
     </div>
-    <textarea name="bio" placeholder="Add a short bio (optional)" rows="3">{{ user.bio }}</textarea>
+    <input type="text" name="name" value="{{ user.name }}" placeholder="Your name" maxlength="60" required>
+    <textarea name="bio" placeholder="Add a short bio (optional)" rows="3" maxlength="500">{{ user.bio }}</textarea>
     <button class="btn btn-purple" type="submit">Save profile</button>
   </form>
 </div>
@@ -2767,7 +3301,8 @@ function shareReel(title, url) {
 {% block content %}
 
 <div class="section-title">🔔 Notifications</div>
-<p style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">Messages from Andy or your artisan that need your attention.</p>
+<p style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">Messages from Andy or your artisan that need your attention.</p>
+{% if user.role == 'customer' %}<a href="{{ url_for('my_jobs') }}" style="display:inline-block;font-size:13px;font-weight:600;color:var(--accent);margin-bottom:14px;">See all my requests and their status →</a>{% endif %}
 
 {% for c in conversations %}
   <a href="{{ url_for('job_thread', job_id=c.job_id) }}" class="chat-row-link">
@@ -2866,7 +3401,7 @@ function shareReel(title, url) {
   </div>
   <div class="settings-card">
     <div class="settings-card-title">Estimated Measurement</div>
-    <div style="font-size:28px;font-family:'Sora',sans-serif;font-weight:700;margin:10px 0;">
+    <div style="font-size:28px;font-family:'Poppins',sans-serif;font-weight:700;margin:10px 0;">
       <span id="resultWidth">0</span> cm × <span id="resultHeight">0</span> cm
     </div>
     <p id="accuracyLine" style="font-size:13px;margin-bottom:6px;"></p>
@@ -3264,6 +3799,7 @@ function checkActual() {
 {% block content %}
 
 <div class="section-title">📸 Our Work</div>
+<p class="works-intro">Tap a photo to see it full size, or press play on a video (sound on). Like a job, and logged-in customers can rate it and tell us what they think.</p>
 
 {% if is_owner_view %}
   <div class="post-composer">
@@ -3271,7 +3807,8 @@ function checkActual() {
       <input type="text" name="title" placeholder="Project title" required>
       <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
       <textarea name="description" placeholder="What was the job?" rows="2"></textarea>
-      <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp" multiple>
+      <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm,.m4v" multiple data-maxmb="95">
+      <p class="media-hint">Photos and videos. Videos keep their sound. Under 95 MB each, MP4 works best.</p>
       <button class="btn btn-purple" type="submit">Post this work</button>
     </form>
   </div>
@@ -3279,22 +3816,76 @@ function checkActual() {
 {% endif %}
 
 {% for w in work_posts %}
-  <div class="feed-post">
+  <article class="feed-post work-post" id="work-{{ w.id }}">
     <div class="job-title" style="margin-bottom:6px;">{{ w.title }}{% if w.category %} <span class="work-tag">{{ w.category }}</span>{% endif %}</div>
     {% if w.description %}<div class="feed-post-caption">{{ w.description }}</div>{% endif %}
+
     {% if w.photos %}
-      <div class="ba-grid">
+      <div class="gal {{ 'single' if w.photos|length == 1 }}">
         {% for ph in w.photos %}
-          <div class="gallery-photo" style="background-image:url('{{ ph.filename|photo_url('works') }}');"></div>
+          {% set pu = ph.filename|photo_url("works") %}
+          {% if ph.kind == 'video' %}
+            <video class="gal-video" src="{{ pu }}#t=0.1" controls playsinline preload="metadata"></video>
+          {% else %}
+            <img src="{{ pu }}" alt="{{ w.title }}" loading="lazy" data-lightbox="work{{ w.id }}" data-full="{{ pu }}" data-caption="{{ w.title }}" data-reviews="reviews-{{ w.id }}">
+          {% endif %}
         {% endfor %}
       </div>
     {% endif %}
+
+    <div class="work-reviews" id="reviews-{{ w.id }}">
+      <div class="work-actions">
+        <button type="button" class="like-btn {{ 'liked' if w.liked }}" data-url="{{ url_for('work_like', work_id=w.id) }}" aria-label="Like this job"><span class="like-icon">{{ '♥' if w.liked else '♡' }}</span> <span class="like-count">{{ w.like_count }}</span></button>
+      </div>
+      <button type="button" class="rev-toggle" onclick="toggleReviews('reviews-{{ w.id }}')">
+        {% if w.review_count %}
+          {% set full = w.avg_rating|round|int %}<span class="rev-stars">{{ '★' * full }}{{ '☆' * (5 - full) }}</span>
+          <b>{{ '%.1f'|format(w.avg_rating) }}</b> · {{ w.review_count }} review{{ '' if w.review_count == 1 else 's' }}
+        {% else %}
+          ☆☆☆☆☆ No reviews yet
+        {% endif %}
+        <span class="rev-cta">Read or add yours</span>
+      </button>
+
+      <div class="rev-panel" hidden>
+        {% for r in w.reviews %}
+          <div class="rev-item">
+            <div class="rev-head"><b>{{ r.display_name }}</b><span class="rev-stars">{{ '★' * r.rating }}{{ '☆' * (5 - r.rating) }}</span>
+              {% if is_owner_view or (user and user.id == r.user_id) %}
+                <form method="POST" action="{{ url_for('work_review_delete', review_id=r.id) }}" onsubmit="return confirm('Delete this review?');" style="margin-left:auto;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="rev-del" type="submit">Delete</button></form>
+              {% endif %}
+            </div>
+            {% if r.text %}<div class="rev-text">{{ r.text }}</div>{% endif %}
+            <button type="button" class="like-btn like-sm {{ 'liked' if r.liked }}" data-url="{{ url_for('work_review_like', review_id=r.id) }}" aria-label="Like this review"><span class="like-icon">{{ '♥' if r.liked else '♡' }}</span> <span class="like-count">{{ r.like_count }}</span></button>
+          </div>
+        {% endfor %}
+        {% if not w.reviews %}<div class="rev-empty">Be the first to say what you think.</div>{% endif %}
+
+        {% if user and user.role == 'customer' %}
+          <form method="POST" action="{{ url_for('work_review', work_id=w.id) }}" class="rev-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="rev-form-title">{{ 'Update your review' if w.my_review else 'Rate this job' }}</div>
+            <div class="stars-input">
+              {% for n in [5, 4, 3, 2, 1] %}
+                <input type="radio" id="s{{ n }}-{{ w.id }}" name="rating" value="{{ n }}" {{ 'checked' if w.my_review and w.my_review.rating == n }} required><label for="s{{ n }}-{{ w.id }}" title="{{ n }} star{{ '' if n == 1 else 's' }}">★</label>
+              {% endfor %}
+            </div>
+            <textarea name="text" rows="3" maxlength="500" placeholder="What do you think about this job? (optional)">{{ w.my_review.text if w.my_review else '' }}</textarea>
+            <button class="btn btn-purple" type="submit">{{ 'Update review' if w.my_review else 'Post review' }}</button>
+          </form>
+        {% elif user %}
+          <div class="rev-empty">Only customers can leave reviews.</div>
+        {% else %}
+          <button class="btn btn-purple" type="button" onclick="document.getElementById('authModal').classList.add('open')">Sign up or log in to review</button>
+        {% endif %}
+      </div>
+    </div>
+
     {% if is_owner_view %}
-      <form method="POST" action="{{ url_for('delete_work', work_id=w.id) }}" style="margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <form method="POST" action="{{ url_for('delete_work', work_id=w.id) }}" style="margin-top:12px;" onsubmit="return confirm('Remove this work and its photos?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="btn btn-outline" type="submit" style="font-size:11px;padding:6px 10px;">Remove</button>
       </form>
     {% endif %}
-  </div>
+  </article>
 {% endfor %}
 
 {% if not work_posts %}
@@ -3315,8 +3906,8 @@ function checkActual() {
 ''',
 
 "maintenance.html": '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ANDY — Back soon</title>
-<style>body{margin:0;background:#050705;color:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px;}.box{max-width:360px;}.logo{font-size:40px;margin-bottom:10px;}h1{font-size:22px;margin:10px 0;}p{color:#9ca3af;font-size:14px;line-height:1.6;}</style>
-</head><body><div class="box"><div class="logo">🔺</div><h1>ANDY is taking a short break</h1><p>We are doing some maintenance right now. Please check back shortly.</p></div></body></html>
+<style>body{margin:0;background:#0A1020;color:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px;}.box{max-width:360px;}.logo{font-size:40px;margin-bottom:10px;}h1{font-size:22px;margin:10px 0;}p{color:#9ca3af;font-size:14px;line-height:1.6;}</style>
+</head><body><div class="box"><div class="logo">🔺</div><h1>ANDY is taking a short break</h1><p>We are doing some maintenance right now. Please check back shortly.</p><p style="margin-top:28px"><a href="/staff-login" style="color:#4b5563;font-size:12px">Staff login</a></p></div></body></html>
 ''',
 
 }
@@ -3329,16 +3920,25 @@ STYLE_CSS = '''
 :root {
   --purple: #6C4FD6;
   --purple-dark: #5539B8;
-  --navy: #1B1F3B;
-  --bg: #F5F4FA;
-  --border: #E1DFF0;
-  --text-muted: #6B6F85;
+  --navy: #0F172A;
+  --bg: #FFFFFF;
+  --border: #E3E8EF;
+  --text-muted: #5B6B82;
   --teal: #2E9E7C;
   --gold: #D9A63D;
   --sidebar-bg: #1B1F3B;
   --accent: #6C4FD6;
   --accent-dark: #5539B8;
+  --card-bg: #FFFFFF;
+  --chrome-bg: #FFFFFF;
+  --chrome-text: #0F172A;
+  --chrome-dim: #475569;
+  --chrome-faint: #94A3B8;
+  --chrome-hover: rgba(15,23,42,.05);
+  --chrome-active: rgba(34,197,94,.12);
+  --chrome-border: #E3E8EF;
 }
+body { --chrome-active: color-mix(in srgb, var(--accent) 12%, transparent); }
 body.theme-teal {
   --accent: #1F8A70;
   --accent-dark: #17654F;
@@ -3346,51 +3946,34 @@ body.theme-teal {
   --gold: #D9A63D;
 }
 body.theme-green {
-  --bg: #050705;
-  --navy: #EAF5EC;
-  --border: #1C2B1F;
-  --text-muted: #86A18C;
-  --sidebar-bg: #000000;
+  --sidebar-bg: #0B1220;
   --accent: #22C55E;
   --accent-dark: #16A34A;
   --gold: #22C55E;
   --teal: #22C55E;
 }
-body.theme-green .card,
-body.theme-green .job-card,
-body.theme-green .feed-post,
-body.theme-green .info-card,
-body.theme-green .video-card,
-body.theme-green .post-composer,
-body.theme-green .chat-box,
-body.theme-green .referral-box,
-body.theme-green .modal-box,
-body.theme-green .video-thumb.locked {
-  background: #0B0F0C;
-  border-color: var(--border);
-  color: var(--navy);
-}
-body.theme-green .msg.them { background: #101410; }
-body.theme-green .phone-locked { background: #0B0F0C; }
-body.theme-green .auth-form input,
-body.theme-green .auth-form select,
-body.theme-green .auth-form textarea,
-body.theme-green .search-bar input {
-  background: #0B0F0C;
-  border-color: var(--border);
-  color: var(--navy);
-}
-body.theme-green .theme-option { background: #0B0F0C; }
-body.theme-green .close-btn { color: #86A18C; }
 body.theme-green .btn-purple,
 body.theme-green .btn-teal,
 body.theme-green .btn-gold { color: #04140A; }
+/* soft shadows keep white cards readable on a white page */
+body:not(.dark-mode) :where(.card, .job-card, .feed-post, .info-card, .settings-card, .lp-card, .svc-card, .lp-work-card, .step-card, .stat-tile) {
+  box-shadow: 0 1px 2px rgba(15,23,42,.05), 0 10px 30px rgba(15,23,42,.06);
+}
+/* ---------- dark mode (the toggle switch) ---------- */
 body.dark-mode {
-  --bg: #14161F;
-  --navy: #F2F2F7;
-  --border: #2B2E3D;
-  --text-muted: #9A9DB0;
-  --sidebar-bg: #0D0E15;
+  --bg: #0A1020;
+  --navy: #EAF1FB;
+  --border: #1E2D4A;
+  --text-muted: #8FA3C4;
+  --sidebar-bg: #070B16;
+  --card-bg: #111A2E;
+  --chrome-bg: var(--sidebar-bg);
+  --chrome-text: #FFFFFF;
+  --chrome-dim: rgba(255,255,255,.75);
+  --chrome-faint: rgba(255,255,255,.35);
+  --chrome-hover: rgba(255,255,255,.06);
+  --chrome-active: rgba(255,255,255,.1);
+  --chrome-border: rgba(255,255,255,.08);
 }
 body.dark-mode .card,
 body.dark-mode .job-card,
@@ -3400,26 +3983,27 @@ body.dark-mode .video-card,
 body.dark-mode .post-composer,
 body.dark-mode .chat-box,
 body.dark-mode .referral-box,
-body.dark-mode .modal-box {
-  background: #1B1E2B;
+body.dark-mode .modal-box,
+body.dark-mode .video-thumb.locked {
+  background: #111A2E;
   border-color: var(--border);
   color: var(--navy);
 }
-body.dark-mode .msg.them { background: #262A3A; }
-body.dark-mode .phone-locked { background: #1B1E2B; }
+body.dark-mode .msg.them { background: #17223A; }
+body.dark-mode .phone-locked { background: #111A2E; }
 body.dark-mode .auth-form input,
 body.dark-mode .auth-form select,
 body.dark-mode .auth-form textarea,
 body.dark-mode .search-bar input {
-  background: #1B1E2B;
+  background: #111A2E;
   border-color: var(--border);
   color: var(--navy);
 }
-body.dark-mode .theme-option { background: #1B1E2B; }
-body.dark-mode .close-btn { color: #9A9DB0; }
+body.dark-mode .theme-option { background: #111A2E; }
+body.dark-mode .close-btn { color: #8FA3C4; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  font-family: 'Inter', -apple-system, sans-serif;
+  font-family: 'DM Sans', -apple-system, sans-serif;
   background: var(--bg);
   color: var(--navy);
 }
@@ -3428,15 +4012,16 @@ a { text-decoration: none; color: inherit; }
 .app-shell { display: flex; min-height: 100vh; }
 .sidebar {
   width: 220px;
-  background: var(--sidebar-bg);
-  color: #fff;
+  background: var(--chrome-bg);
+  color: var(--chrome-text);
+  border-right: 1px solid var(--chrome-border);
   display: flex;
   flex-direction: column;
   padding: 20px 0;
   flex-shrink: 0;
 }
 .sidebar .logo {
-  font-family: 'Sora', sans-serif;
+  font-family: 'Poppins', sans-serif;
   font-weight: 700;
   font-size: 20px;
   padding: 0 22px 20px;
@@ -3456,23 +4041,24 @@ a { text-decoration: none; color: inherit; }
   position: absolute;
   left: -6px; top: 7px;
   width: 12px; height: 12px;
-  border: 2px solid var(--sidebar-bg);
+  border: 2px solid var(--chrome-bg);
   background: rgba(255,255,255,0.15);
+  background: color-mix(in srgb, var(--accent) 55%, #fff);
 }
 .sidebar nav { flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .sidebar nav a, .sidebar nav button {
   display: flex; align-items: center; gap: 12px;
-  padding: 11px 22px; color: rgba(255,255,255,0.75);
+  padding: 11px 22px; color: var(--chrome-dim);
   font-size: 14px; background: none; border: none; width: 100%; text-align: left; cursor: pointer;
 }
-.sidebar nav a:hover, .sidebar nav button:hover { background: rgba(255,255,255,0.06); color: #fff; }
-.sidebar nav a.active { background: rgba(255,255,255,0.1); color: #fff; border-left: 3px solid var(--accent); }
+.sidebar nav a:hover, .sidebar nav button:hover { background: var(--chrome-hover); color: var(--chrome-text); }
+.sidebar nav a.active { background: var(--chrome-active); color: var(--chrome-text); border-left: 3px solid var(--accent); }
 .nav-section-label {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(255,255,255,0.35);
+  color: var(--chrome-faint);
   padding: 16px 22px 6px;
 }
 .sidebar .icon { font-size: 16px; width: 18px; text-align: center; }
@@ -3481,11 +4067,11 @@ a { text-decoration: none; color: inherit; }
   border-radius: 10px; font-size: 13px; font-family: 'IBM Plex Mono', monospace;
 }
 .sidebar .bottom-links a, .sidebar .bottom-links button {
-  display: flex; align-items: center; gap: 12px; padding: 11px 22px; color: rgba(255,255,255,0.75);
+  display: flex; align-items: center; gap: 12px; padding: 11px 22px; color: var(--chrome-dim);
   font-size: 14px; background: none; border: none; width: 100%; text-align: left; cursor: pointer;
 }
-.sidebar .bottom-links a:hover, .sidebar .bottom-links button:hover { background: rgba(255,255,255,0.06); color: #fff; }
-.sidebar .bottom-links { border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 8px; }
+.sidebar .bottom-links a:hover, .sidebar .bottom-links button:hover { background: var(--chrome-hover); color: var(--chrome-text); }
+.sidebar .bottom-links { border-top: 1px solid var(--chrome-border); padding-top: 8px; margin-top: 8px; }
 
 .content-area { flex: 1; min-width: 0; }
 main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
@@ -3512,7 +4098,7 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
   background: linear-gradient(0deg, rgba(10,12,26,0.88) 0%, rgba(10,12,26,0.15) 70%, transparent 100%);
   color: #fff;
 }
-.hero-name { font-family: 'Sora', sans-serif; font-weight: 700; font-size: 30px; }
+.hero-name { font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 30px; }
 .hero-title { font-size: 15px; color: var(--gold); font-weight: 600; margin-top: 2px; letter-spacing: 0.3px; }
 .hero-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 
@@ -3527,7 +4113,7 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
 
 /* ===== Sections ===== */
 .section { margin-top: 28px; }
-.section-title { font-family: 'Sora', sans-serif; font-weight: 600; font-size: 16px; margin-bottom: 12px; }
+.section-title { font-family: 'Poppins', sans-serif; font-weight: 600; font-size: 16px; margin-bottom: 12px; }
 
 .video-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-top: 10px; }
 .video-card { background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
@@ -3553,7 +4139,7 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
 .msg-avatar { width: 26px; height: 26px; font-size: 11px; flex-shrink: 0; border-width: 1px; }
 .sidebar-profile { display: flex; align-items: center; gap: 10px; padding: 0 22px 14px; }
 .sidebar-avatar { width: 34px; height: 34px; font-size: 14px; border-width: 1px; }
-.sidebar-profile-name { color: #fff; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-profile-name { color: var(--chrome-text); font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-input { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); align-items: center; }
 .chat-input input { flex: 1; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 14px; }
 .telegram-composer { gap: 8px; }
@@ -3571,7 +4157,7 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
 
 /* ===== Wallet ===== */
 .wallet-card { background: linear-gradient(135deg, var(--accent), var(--navy)); color: #fff; border-radius: 16px; padding: 24px; }
-.wallet-balance { font-family: 'Sora', sans-serif; font-size: 32px; font-weight: 700; margin: 6px 0 16px; }
+.wallet-balance { font-family: 'Poppins', sans-serif; font-size: 32px; font-weight: 700; margin: 6px 0 16px; }
 .tx-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
 .tx-row.positive { color: var(--teal); }
 .tx-row.negative { color: #c0392b; }
@@ -3607,20 +4193,20 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
 .post-composer { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 20px; }
 .avatar {
   width: 50px; height: 50px; border-radius: 12px; background: var(--navy); color: #fff;
-  font-family: 'Sora', sans-serif; font-weight: 700; font-size: 16px;
+  font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 16px;
   display: flex; align-items: center; justify-content: center; flex-shrink: 0; position: relative;
 }
 
 /* ===== Job vacancies ===== */
 .job-card { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; margin-bottom: 12px; }
-.job-title { font-family: 'Sora', sans-serif; font-weight: 600; font-size: 15px; }
+.job-title { font-family: 'Poppins', sans-serif; font-weight: 600; font-size: 15px; }
 .job-meta { font-size: 12px; color: var(--text-muted); margin: 4px 0 8px; }
 .job-desc { font-size: 13px; margin-bottom: 10px; color: var(--navy); }
 
 /* ===== Catalog ===== */
 .cat-filter-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .cat-filter { padding: 8px 14px; border-radius: 20px; border: 1px solid var(--border); font-size: 12px; font-weight: 600; background: #fff; }
-body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; }
+body.dark-mode .cat-filter { background: #111A2E; }
 .cat-filter.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .product-card select { padding: 8px; border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
 
@@ -3648,13 +4234,14 @@ body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; 
     gap: 10px;
     position: sticky;
     top: 0;
-    background: var(--sidebar-bg);
-    color: #fff;
+    background: var(--chrome-bg);
+    color: var(--chrome-text);
+    border-bottom: 1px solid var(--chrome-border);
     padding: 14px 16px;
     z-index: 95;
   }
-  .mobile-topbar-title { font-family: 'Sora', sans-serif; font-weight: 700; flex: 1; }
-  .hamburger-btn { background: none; border: none; color: #fff; font-size: 20px; }
+  .mobile-topbar-title { font-family: 'Poppins', sans-serif; font-weight: 700; flex: 1; }
+  .hamburger-btn { background: none; border: none; color: var(--chrome-text); font-size: 20px; }
   .help-icon-btn { text-decoration: none; font-size: 18px; padding: 4px; }
   .sidebar {
     position: fixed;
@@ -3680,15 +4267,15 @@ body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; 
     display: flex;
     position: fixed;
     bottom: 0; left: 0; right: 0;
-    background: var(--sidebar-bg);
-    border-top: 1px solid rgba(255,255,255,0.08);
+    background: var(--chrome-bg);
+    border-top: 1px solid var(--chrome-border);
     z-index: 90;
   }
   .bottom-tabs a, .bottom-tabs button {
     flex: 1;
     display: flex; flex-direction: column; align-items: center; gap: 2px;
     padding: 10px 0 8px;
-    color: rgba(255,255,255,0.6);
+    color: var(--chrome-dim);
     font-size: 11px;
     background: none; border: none;
   }
@@ -3736,17 +4323,302 @@ body.dark-mode .cat-filter, body.theme-green .cat-filter { background: #0B0F0C; 
 
 
 /* --- Our Work review --- */
-.work-tag { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 600; background: rgba(128,128,128,.18); border-radius: 10px; padding: 2px 8px; margin-left: 4px; vertical-align: middle; }
-.work-status { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 2px 9px; margin-left: 6px; vertical-align: middle; }
+.work-tag { font-family: 'DM Sans', sans-serif; font-size: 11px; font-weight: 600; background: rgba(128,128,128,.18); border-radius: 10px; padding: 2px 8px; margin-left: 4px; vertical-align: middle; }
+.work-status { font-family: 'DM Sans', sans-serif; font-size: 11px; font-weight: 700; border-radius: 10px; padding: 2px 9px; margin-left: 6px; vertical-align: middle; }
 .work-status-pending { background: rgba(217,166,61,.2); color: #d9a63d; }
 .work-status-approved { background: rgba(37,211,102,.18); color: #25D366; }
 .work-status-rejected { background: rgba(239,68,68,.18); color: #ef4444; }
+
+
+/* ================= Public site (nav, hero, sections, footer, motion) ================= */
+html { scroll-behavior: smooth; }
+section[id] { scroll-margin-top: 90px; }
+body { font-family: 'DM Sans', -apple-system, sans-serif; line-height: 1.6; }
+h1, h2, h3, h4, .section-title { font-family: 'Poppins', sans-serif; }
+
+.site-nav { display: none; }
+.site-footer { margin-top: 40px; }
+@media (min-width: 721px) {
+  body.guest-site .sidebar { display: none; }
+  body.guest-site .content-area { width: 100%; }
+  body.guest-site main { max-width: 1120px; padding: 28px 32px 20px; }
+  .site-nav {
+    display: flex; position: sticky; top: 0; z-index: 90; align-items: center; gap: 32px;
+    padding: 14px 40px; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(14px);
+    border-bottom: 1px solid transparent; transition: border-color .3s, box-shadow .3s;
+  }
+  .site-nav.scrolled { border-bottom-color: var(--border); box-shadow: 0 8px 30px rgba(15,23,42,.12); }
+  .site-nav-logo { display: flex; align-items: center; gap: 10px; font-family: 'Poppins', sans-serif; font-weight: 800; font-size: 22px; color: var(--navy); text-decoration: none; letter-spacing: -.01em; }
+  .nav-word span { color: var(--accent); }
+  .site-nav-links { display: flex; gap: 6px; flex: 1; justify-content: center; }
+  .site-nav-links a { position: relative; color: var(--text-muted); text-decoration: none; font-size: 14px; font-weight: 500; padding: 8px 14px; border-radius: 8px; transition: color .2s, background .2s; }
+  .site-nav-links a::after { content: ""; position: absolute; left: 14px; right: 14px; bottom: 3px; height: 2px; background: var(--accent); transform: scaleX(0); transform-origin: left; transition: transform .25s ease; }
+  .site-nav-links a:hover, .site-nav-links a.active { color: var(--navy); }
+  .site-nav-links a:hover::after, .site-nav-links a.active::after { transform: scaleX(1); }
+  .site-nav-cta { display: flex; gap: 10px; }
+  .site-nav-cta .btn { padding: 9px 20px; border-radius: 999px; }
+  .site-nav-cta { align-items: center; }
+  .site-nav-cta .btn-outline { color: var(--navy); border-color: var(--border); }
+  .site-nav .logo-mark::after { border-color: var(--bg); }
+}
+
+/* hero */
+.hero { min-height: 480px; border-radius: 24px; margin-top: 8px; box-shadow: 0 30px 80px rgba(0,0,0,.35); }
+.hero-overlay { padding: 56px 48px; background: linear-gradient(0deg, rgba(6,10,22,.92) 0%, rgba(6,10,22,.35) 60%, transparent 100%); }
+.hero-kicker { display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.3); padding: 6px 14px; border-radius: 999px; margin-bottom: 16px; }
+.hero-name { font-size: clamp(34px, 5.6vw, 66px); font-weight: 800; letter-spacing: -.03em; line-height: 1.08; max-width: 760px; }
+.hero-title { font-size: clamp(16px, 2vw, 21px); color: rgba(255,255,255,.88); max-width: 560px; margin-top: 14px; font-weight: 500; line-height: 1.5; }
+.hero-actions { margin-top: 28px; gap: 14px; }
+.hero-actions .btn { padding: 14px 28px; font-size: 15px; border-radius: 999px; transition: transform .2s, box-shadow .2s, background .2s; }
+.hero-actions .btn:hover { transform: translateY(-3px); box-shadow: 0 12px 30px rgba(34,197,94,.35); }
+.hero-kicker, .hero-name, .hero-title, .hero-actions { animation: heroUp .9s cubic-bezier(.2,.7,.2,1) both; }
+.hero-name { animation-delay: .1s; } .hero-title { animation-delay: .25s; } .hero-actions { animation-delay: .4s; }
+.hero-default-bg svg { animation: heroDrift 22s ease-in-out infinite alternate; transform-origin: 50% 100%; }
+.hero-default-bg g[fill="#22C55E"] rect { animation: twinkle 3.6s ease-in-out infinite; }
+.hero-default-bg g[fill="#22C55E"] rect:nth-child(3n) { animation-delay: 1.2s; }
+.hero-default-bg g[fill="#22C55E"] rect:nth-child(3n+1) { animation-delay: 2.4s; }
+@keyframes heroUp { from { opacity: 0; transform: translateY(26px); } to { opacity: 1; transform: none; } }
+@keyframes heroDrift { from { transform: scale(1); } to { transform: scale(1.07); } }
+@keyframes twinkle { 0%,100% { opacity: .9; } 50% { opacity: .2; } }
+
+/* sections: roomy, consistent spacing */
+.lp-section { padding: 88px 0 8px; }
+.lp-head { max-width: 720px; margin-bottom: 34px; }
+.lp-eyebrow { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; }
+.lp-title { font-size: clamp(26px, 3.4vw, 38px); font-weight: 700; letter-spacing: -.02em; line-height: 1.2; color: var(--navy); }
+.lp-lead { font-size: 17px; line-height: 1.75; color: var(--text-muted); margin-top: 14px; }
+.lp-offer-intro { max-width: 760px; margin-bottom: 30px; }
+.lp-offer-intro h3 { font-size: 20px; margin-bottom: 8px; color: var(--navy); }
+.lp-offer-intro p { color: var(--text-muted); line-height: 1.75; }
+.lp-grid { display: grid; gap: 22px; }
+.lp-offers { grid-template-columns: repeat(3, 1fr); }
+.lp-steps { grid-template-columns: repeat(4, 1fr); }
+.lp-work { grid-template-columns: repeat(3, 1fr); }
+.lp-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 20px; padding: 28px 26px; transition: transform .3s cubic-bezier(.2,.7,.2,1), box-shadow .3s, border-color .3s; }
+.lp-card h3 { font-size: 17px; margin: 14px 0 8px; color: var(--navy); }
+.lp-card p { font-size: 14.5px; line-height: 1.7; color: var(--text-muted); }
+.lp-icon { width: 52px; height: 52px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 26px; background: rgba(34,197,94,.12); transition: transform .35s; }
+.lp-step-num { width: 44px; height: 44px; border-radius: 50%; background: var(--accent); color: #04140A; display: flex; align-items: center; justify-content: center; font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 18px; box-shadow: 0 0 0 0 rgba(34,197,94,.5); }
+.lp-note { margin-top: 28px; padding: 20px 24px; border-left: 4px solid var(--accent); background: rgba(34,197,94,.07); border-radius: 0 14px 14px 0; color: var(--text-muted); line-height: 1.7; font-size: 15px; }
+.lp-note b { color: var(--navy); }
+.lp-work-card { display: block; background: var(--card-bg); border: 1px solid var(--border); border-radius: 20px; overflow: hidden; text-decoration: none; color: inherit; transition: transform .3s cubic-bezier(.2,.7,.2,1), box-shadow .3s, border-color .3s; }
+.lp-work-img { aspect-ratio: 4/3; background-size: cover; background-position: center; background-color: rgba(128,128,128,.15); transition: transform .6s cubic-bezier(.2,.7,.2,1); }
+.lp-work-card { overflow: hidden; }
+.lp-work-img { overflow: hidden; }
+.lp-work-info { padding: 16px 18px 18px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 15px; color: var(--navy); }
+.lp-contact { text-align: center; padding: 64px 28px; border-radius: 28px; border: 1px solid var(--border); background: radial-gradient(ellipse at 50% 0%, rgba(34,197,94,.16), transparent 65%), var(--card-bg); }
+.lp-contact .lp-lead { max-width: 520px; margin: 14px auto 0; }
+.lp-cta-row { display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; margin-top: 28px; }
+.lp-cta-row .btn { padding: 14px 30px; font-size: 15px; border-radius: 999px; }
+.lp-contact-list { display: flex; justify-content: center; gap: 22px; flex-wrap: wrap; margin-top: 28px; font-size: 14.5px; }
+.lp-contact-list a, .lp-contact-list span { color: var(--navy); text-decoration: none; }
+.lp-contact-list a:hover { color: var(--accent); }
+
+/* card motion */
+html.js .reveal { opacity: 0; transform: translateY(30px); transition: opacity .8s ease, transform .8s cubic-bezier(.2,.7,.2,1), box-shadow .3s, border-color .3s; transition-delay: var(--d, 0ms); }
+html.js .reveal.in { opacity: 1; transform: none; }
+@media (hover: hover) {
+  html.js .lp-card.reveal.in:hover, .lp-card:hover, .lp-work-card.reveal.in:hover, .lp-work-card:hover {
+    transform: translateY(-8px); border-color: var(--accent);
+    box-shadow: 0 22px 50px rgba(0,0,0,.4), 0 0 0 1px rgba(34,197,94,.3); transition-delay: 0ms;
+  }
+  .lp-card:hover .lp-icon { transform: scale(1.18) rotate(-6deg); }
+  .lp-work-card:hover .lp-work-img { transform: scale(1.08); }
+  .step-card, .job-card, .feed-post, .settings-card { transition: transform .25s, box-shadow .25s, border-color .25s; }
+  .step-card:hover, .job-card:hover, .feed-post:hover { transform: translateY(-4px); box-shadow: 0 14px 34px rgba(0,0,0,.28); border-color: var(--accent); }
+}
+html.js .reveal.in .lp-step-num { animation: stepPulse 2.4s .6s ease-out 2; }
+@keyframes stepPulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,.55); } 100% { box-shadow: 0 0 0 18px rgba(34,197,94,0); } }
+.btn { transition: transform .2s, box-shadow .2s, background .2s, border-color .2s; }
+
+/* footer */
+.site-footer { border-top: 1px solid var(--border); background: var(--sidebar-bg); color: rgba(255,255,255,.72); padding: 56px 40px 26px; margin-top: 64px; }
+.footer-grid { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: 1.6fr 1fr 1fr 1.3fr; gap: 40px; }
+.footer-logo .logo-mark::after { border-color: var(--sidebar-bg); }
+.footer-logo { display: flex; align-items: center; gap: 10px; font-family: 'Poppins', sans-serif; font-weight: 800; font-size: 22px; color: #fff; margin-bottom: 12px; }
+
+.footer-motto { color: var(--accent) !important; font-family: 'Poppins', sans-serif; font-weight: 600; font-size: 16px !important; margin-bottom: 8px; }
+.footer-brand p { font-size: 14px; line-height: 1.7; max-width: 320px; }
+.site-footer h4 { color: #fff; font-size: 14px; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 14px; }
+.site-footer .footer-col a, .site-footer .footer-col span { display: block; color: rgba(255,255,255,.68); text-decoration: none; font-size: 14px; margin-bottom: 10px; transition: color .2s, transform .2s; }
+.site-footer .footer-col a:hover { color: var(--accent); transform: translateX(4px); }
+.footer-bottom { max-width: 1120px; margin: 36px auto 0; padding-top: 20px; border-top: 1px solid rgba(255,255,255,.08); font-size: 13px; color: rgba(255,255,255,.5); text-align: center; }
+
+@media (max-width: 960px) {
+  .lp-offers, .lp-work { grid-template-columns: repeat(2, 1fr); }
+  .lp-steps { grid-template-columns: repeat(2, 1fr); }
+  .footer-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 720px) {
+  .hero { min-height: 340px; border-radius: 18px; }
+  .hero-overlay { padding: 28px 20px; }
+  .hero-actions .btn { padding: 12px 22px; flex: 1; text-align: center; }
+  .lp-section { padding: 56px 0 4px; }
+  .lp-head { margin-bottom: 24px; }
+  .lp-lead { font-size: 16px; }
+  .lp-offers, .lp-steps, .lp-work { grid-template-columns: 1fr; gap: 16px; }
+  .lp-card { padding: 22px 20px; }
+  .lp-contact { padding: 44px 20px; border-radius: 22px; }
+  .site-footer { padding: 40px 22px 90px; margin-top: 44px; }
+  .footer-grid { grid-template-columns: 1fr; gap: 28px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  html.js .reveal { opacity: 1; transform: none; transition: none; }
+  .hero-kicker, .hero-name, .hero-title, .hero-actions, .hero-default-bg svg, .hero-default-bg g[fill="#22C55E"] rect { animation: none; }
+}
+
+
+/* ================= Photo gallery (full photos), lightbox, reviews ================= */
+.works-intro { font-size: 14px; color: var(--text-muted); margin: -4px 0 16px; }
+.gal { column-count: 2; column-gap: 10px; margin-top: 12px; }
+.gal.single { column-count: 1; }
+.gal img { display: block; width: 100%; height: auto; border-radius: 12px; margin-bottom: 10px; break-inside: avoid; cursor: zoom-in; background: rgba(128,128,128,.14); transition: transform .25s, box-shadow .25s; }
+@media (hover: hover) { .gal img:hover { transform: scale(1.015); box-shadow: 0 12px 30px rgba(0,0,0,.35); } }
+@media (min-width: 900px) { .gal:not(.single) { column-count: 3; } }
+@media (max-width: 720px) { .gal { column-count: 1; } }
+
+.lp-work-img { position: relative; aspect-ratio: 4/3; overflow: hidden; background-color: rgba(128,128,128,.15); }
+.lp-work-img::before { content: ""; position: absolute; inset: -20px; background-image: var(--bg); background-size: cover; background-position: center; filter: blur(22px) brightness(.55); }
+.lp-work-img img { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; }
+
+.lb { position: fixed; inset: 0; z-index: 30000; background: rgba(4,7,14,.96); display: none; flex-direction: column; touch-action: none; }
+.lb.open { display: flex; animation: lbIn .2s ease; }
+@keyframes lbIn { from { opacity: 0; } to { opacity: 1; } }
+.lb-top { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; color: #fff; font-size: 14px; }
+.lb-close { background: rgba(255,255,255,.12); border: none; color: #fff; width: 40px; height: 40px; border-radius: 50%; font-size: 18px; cursor: pointer; }
+.lb-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; touch-action: none; cursor: zoom-in; }
+.lb-stage.zoomed { cursor: grab; }
+.lb-img { max-width: 100%; max-height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; transition: transform .12s ease-out; will-change: transform; }
+.lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,.12); border: none; color: #fff; width: 44px; height: 64px; font-size: 30px; cursor: pointer; border-radius: 10px; z-index: 2; }
+.lb-prev { left: 8px; } .lb-next { right: 8px; }
+.lb-bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px calc(14px + env(safe-area-inset-bottom, 0px)); color: #fff; font-size: 14px; }
+.lb-cap { font-weight: 600; }
+.lb-rate { background: var(--accent); color: #04140A; border: none; border-radius: 999px; padding: 9px 16px; font-weight: 700; font-size: 13px; cursor: pointer; white-space: nowrap; }
+
+.work-reviews { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+.rev-toggle { width: 100%; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; text-align: left; background: none; border: none; color: inherit; font-size: 14px; cursor: pointer; padding: 6px 0; font-family: inherit; }
+.rev-stars { color: #F5B301; letter-spacing: 1px; }
+.rev-cta { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--accent); }
+.rev-panel { padding-top: 10px; }
+.rev-item { padding: 12px 0; border-top: 1px solid var(--border); }
+.rev-head { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.rev-text { font-size: 14px; line-height: 1.6; margin-top: 4px; color: var(--text-muted); white-space: pre-line; }
+.rev-del { background: none; border: none; color: #ef4444; font-size: 12px; cursor: pointer; }
+.rev-empty { font-size: 13px; color: var(--text-muted); padding: 8px 0 12px; }
+.rev-form { margin-top: 10px; display: grid; gap: 10px; }
+.rev-form textarea { padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; font-family: inherit; font-size: 14px; background: transparent; color: inherit; }
+.rev-form-title { font-weight: 600; font-size: 14px; }
+.stars-input { display: inline-flex; flex-direction: row-reverse; justify-content: flex-end; gap: 4px; }
+.stars-input input { position: absolute; opacity: 0; pointer-events: none; }
+.stars-input label { font-size: 32px; line-height: 1; color: rgba(128,128,128,.45); cursor: pointer; transition: color .15s, transform .15s; }
+.stars-input label:hover, .stars-input label:hover ~ label, .stars-input input:checked ~ label { color: #F5B301; }
+.stars-input label:hover { transform: scale(1.2); }
+
+
+/* --- likes + video --- */
+.gal-video { display: block; width: 100%; height: auto; max-height: 75vh; border-radius: 12px; margin-bottom: 10px; background: #000; break-inside: avoid; }
+.media-hint { font-size: 12px; color: var(--text-muted); margin: -2px 0 2px; }
+.work-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.like-btn { display: inline-flex; align-items: center; gap: 6px; background: rgba(128,128,128,.12); border: 1px solid var(--border); color: inherit; border-radius: 999px; padding: 7px 16px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background .2s, border-color .2s, transform .15s; }
+.like-btn .like-icon { font-size: 18px; line-height: 1; transition: color .2s; }
+.like-btn:hover { border-color: #ef4444; }
+.like-btn.liked { background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.5); }
+.like-btn.liked .like-icon { color: #ef4444; }
+.like-btn.pop .like-icon { animation: likePop .45s ease; }
+.like-sm { padding: 3px 11px; font-size: 12px; margin-top: 8px; }
+.like-sm .like-icon { font-size: 14px; }
+@keyframes likePop { 0% { transform: scale(1); } 40% { transform: scale(1.7); } 100% { transform: scale(1); } }
+.lp-work-img video { position: relative; width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+.lp-play { position: absolute; right: 12px; bottom: 12px; width: 38px; height: 38px; border-radius: 50%; background: rgba(0,0,0,.6); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+
+
+/* --- Services illustrations (3D / sketch style) --- */
+.svc-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; }
+.svc-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 24px; padding: 18px 18px 26px; text-align: center; transition: transform .3s cubic-bezier(.2,.7,.2,1), box-shadow .3s, border-color .3s; }
+.svc-card:last-child { grid-column: 1 / -1; }
+.svc-art { position: relative; border-radius: 18px; padding: 14px 10px 6px; margin-bottom: 18px; overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% 38%, rgba(34,197,94,.20), transparent 68%),
+    linear-gradient(rgba(94,233,160,.07) 1px, transparent 1px) 0 0 / 26px 26px,
+    linear-gradient(90deg, rgba(94,233,160,.07) 1px, transparent 1px) 0 0 / 26px 26px,
+    rgba(7,12,26,.55);
+  perspective: 900px; }
+.svc-art .svc-svg { max-width: 460px; margin: 0 auto; animation: svcFloat 6s ease-in-out infinite; transition: transform .5s cubic-bezier(.2,.7,.2,1); filter: drop-shadow(0 18px 22px rgba(0,0,0,.35)); }
+.svc-art-2 .svc-svg { animation-delay: -1.2s; } .svc-art-3 .svc-svg { animation-delay: -2.4s; } .svc-art-4 .svc-svg { animation-delay: -3.6s; } .svc-art-5 .svc-svg { animation-delay: -4.8s; }
+.svc-card h3 { font-size: 21px; margin-bottom: 6px; color: var(--navy); }
+.svc-card p { font-size: 15px; line-height: 1.65; color: var(--text-muted); max-width: 420px; margin: 0 auto; }
+.svc-shine { animation: svcShine 5s ease-in-out infinite; }
+.svc-twinkle { animation: svcTw 2.6s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+@keyframes svcFloat { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-9px); } }
+@keyframes svcShine { 0%,55% { transform: translateX(-90px); } 85%,100% { transform: translateX(120px); } }
+@keyframes svcTw { 0%,100% { opacity: .25; transform: scale(.7); } 50% { opacity: 1; transform: scale(1.15); } }
+@media (hover: hover) {
+  .svc-card:hover { transform: translateY(-8px); border-color: var(--accent); box-shadow: 0 24px 54px rgba(0,0,0,.4), 0 0 0 1px rgba(34,197,94,.3); }
+  .svc-card:hover .svc-svg { animation-play-state: paused; transform: rotateX(6deg) rotateY(-9deg) scale(1.05); }
+}
+@media (max-width: 720px) {
+  .svc-grid { grid-template-columns: 1fr; gap: 18px; }
+  .svc-card:last-child { grid-column: auto; }
+  .svc-card { padding: 14px 14px 22px; border-radius: 20px; }
+}
+@media (prefers-reduced-motion: reduce) { .svc-svg, .svc-shine, .svc-twinkle { animation: none !important; } }
+
+
+/* --- light/dark switch, legal pages, notices --- */
+.mode-switch { position: relative; width: 58px; height: 30px; border-radius: 999px; border: 1px solid var(--border); background: #E8EDF4; cursor: pointer; padding: 0; flex-shrink: 0; transition: background .3s, border-color .3s; }
+.mode-switch.sm { width: 48px; height: 26px; }
+.mode-switch .ms-ico { position: absolute; top: 50%; transform: translateY(-50%); font-size: 13px; line-height: 1; }
+.mode-switch.sm .ms-ico { font-size: 11px; }
+.mode-switch .ms-sun { left: 7px; } .mode-switch .ms-moon { right: 7px; }
+.mode-switch .ms-knob { position: absolute; top: 2px; left: 2px; width: 24px; height: 24px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(15,23,42,.3); transition: transform .3s cubic-bezier(.2,.8,.2,1), background .3s; }
+.mode-switch.sm .ms-knob { width: 20px; height: 20px; }
+body.dark-mode .mode-switch { background: #1E2D4A; border-color: #2C4166; }
+body.dark-mode .mode-switch .ms-knob { transform: translateX(28px); background: #0A1020; box-shadow: 0 2px 6px rgba(0,0,0,.5), inset 0 0 0 1px #2C4166; }
+body.dark-mode .mode-switch.sm .ms-knob { transform: translateX(22px); }
+.mode-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 22px 12px; font-size: 14px; color: var(--chrome-dim); }
+.terms-note { font-size: 12px; line-height: 1.5; color: var(--text-muted); text-align: center; margin-top: 12px; }
+.terms-note a { color: var(--accent); font-weight: 600; text-decoration: underline; }
+.footer-legal { display: block; margin-top: 8px; }
+.footer-legal a { display: inline; margin: 0 10px; font-size: 13px; color: rgba(255,255,255,.6); }
+.app-footer { text-align: center; font-size: 12px; color: var(--text-muted); padding: 6px 16px 26px; }
+.app-footer a { color: var(--text-muted); text-decoration: underline; }
+@media (max-width: 720px) { .app-footer { padding-bottom: 86px; } .mobile-topbar .mode-switch { margin-right: 4px; } }
+.legal { max-width: 780px; margin: 0 auto; padding: 8px 0 30px; } .legal h1 { font-size: clamp(28px,4vw,38px); letter-spacing: -.02em; margin-bottom: 6px; } .legal .legal-date { color: var(--text-muted); font-size: 14px; margin-bottom: 26px; } .legal h2 { font-size: 19px; margin: 28px 0 8px; } .legal p, .legal li { color: var(--text-muted); line-height: 1.75; font-size: 15.5px; } .legal ul { margin: 8px 0 8px 22px; } .legal a { color: var(--accent); font-weight: 600; }
+
+
+.sidebar .bottom-links .mode-row .mode-switch { display: block; width: 48px; height: 26px; padding: 0; position: relative; border: 1px solid var(--border); background: #E8EDF4; border-radius: 999px; flex-shrink: 0; }
+body.dark-mode .sidebar .bottom-links .mode-row .mode-switch { background: #1E2D4A; border-color: #2C4166; }
+.sidebar .bottom-links .mode-row .mode-switch:hover { background: #E8EDF4; }
+body.dark-mode .sidebar .bottom-links .mode-row .mode-switch:hover { background: #1E2D4A; }
+.sidebar .bottom-links .mode-row span:first-child { font-size: 14px; }
+@media (max-width: 720px) { .sidebar .bottom-links .mode-row .mode-switch { min-height: 26px; height: 26px; } }
+.sidebar .logo .nav-word { color: var(--chrome-text); }
+.sidebar .logo .nav-word span { color: var(--accent); }
+
+
+/* --- mobile menu polish (Android) --- */
+.menu-close { display: none; }
+@media (max-width: 720px) {
+  body.menu-open, html:has(body.menu-open) { overflow: hidden; }
+  .sidebar { height: 100vh; height: 100dvh; bottom: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); }
+  body.menu-open .sidebar { box-shadow: 8px 0 30px rgba(0,0,0,.25); }
+  .menu-close { display: flex; align-items: center; justify-content: center; position: absolute; top: 10px; right: 10px; width: 44px; height: 44px; border-radius: 50%; border: none; background: var(--chrome-hover); color: var(--chrome-text); font-size: 18px; z-index: 2; cursor: pointer; }
+  .sidebar .logo { padding-right: 64px; }
+  .sidebar nav a, .sidebar nav button, .sidebar .bottom-links a, .sidebar .bottom-links button { min-height: 46px; }
+  .mode-row { min-height: 48px; }
+  .mode-switch::after { content: ""; position: absolute; inset: -10px; }
+  .hamburger-btn, .help-icon-btn { min-width: 44px; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; }
+  .bottom-tabs a, .bottom-tabs button { min-height: 56px; }
+  /* fewer always-on animations on phones: smoother and kinder to the battery */
+  .svc-art .svc-svg, .svc-shine, .svc-twinkle, .hero-default-bg svg, .hero-default-bg g[fill="#22C55E"] rect { animation: none !important; }
+}
 
 /* --- Splash screen --- */
 html.no-splash #splash { display: none; }
 #splash {
   position: fixed; inset: 0; z-index: 20000; cursor: pointer;
-  background: radial-gradient(ellipse at 50% 42%, #0f1f14 0%, #050705 62%);
+  background: radial-gradient(ellipse at 50% 42%, #12264A 0%, #0A1020 62%);
   display: flex; align-items: center; justify-content: center; text-align: center;
   transition: opacity .7s ease, visibility .7s ease, transform .7s ease;
 }
@@ -3760,7 +4632,7 @@ html.no-splash #splash { display: none; }
 .splash-float { animation: splashFloat 3.2s ease-in-out infinite, splashIn 1s cubic-bezier(.2,.9,.3,1.2) both; }
 .splash-logo {
   display: flex; align-items: center; gap: .28em;
-  font-family: 'Sora', sans-serif; font-weight: 700; color: #fff;
+  font-family: 'Poppins', sans-serif; font-weight: 700; color: #fff;
   font-size: clamp(54px, 17vw, 120px); letter-spacing: -.02em;
   filter: drop-shadow(0 0 28px rgba(34,197,94,.45));
 }
@@ -3771,7 +4643,7 @@ html.no-splash #splash { display: none; }
 }
 .splash-logo .logo-mark::after {
   left: -.3em; top: .35em; width: .6em; height: .6em;
-  border: .1em solid #050705; background: rgba(255,255,255,0.15);
+  border: .1em solid #0A1020; background: rgba(255,255,255,0.15);
 }
 .splash-shadow {
   width: clamp(120px, 38vw, 260px); height: 14px; margin-top: 26px; border-radius: 50%;
@@ -3779,7 +4651,7 @@ html.no-splash #splash { display: none; }
   animation: splashShadow 3.2s ease-in-out infinite;
 }
 .splash-caption {
-  margin-top: 22px; color: rgba(255,255,255,.88); font-family: 'Sora', sans-serif; font-weight: 600;
+  margin-top: 22px; color: rgba(255,255,255,.88); font-family: 'Poppins', sans-serif; font-weight: 600;
   font-size: clamp(14px, 4vw, 20px); letter-spacing: .01em; animation: splashUp .9s .9s ease both;
 }
 .splash-smile { display: inline-block; animation: splashPop 1.6s 1.6s ease-in-out infinite; }
@@ -3808,8 +4680,8 @@ html.no-splash #splash { display: none; }
   position: fixed; z-index: 10000; background: #fff; color: #111; border-radius: 16px; padding: 16px 16px 14px;
   box-shadow: 0 12px 40px rgba(0,0,0,.45); font-size: 14px; line-height: 1.45; animation: splashUp .35s ease both;
 }
-body.dark-mode .tour-card, body.theme-green .tour-card { background: #151a16; color: #eef3ef; }
-.tour-title { font-family: 'Sora', sans-serif; font-weight: 700; font-size: 16px; margin-bottom: 4px; }
+body.dark-mode .tour-card { background: #151a16; color: #eef3ef; }
+.tour-title { font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 16px; margin-bottom: 4px; }
 .tour-text { opacity: .8; }
 .tour-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; gap: 10px; }
 .tour-dots { display: flex; gap: 4px; flex-wrap: wrap; }
@@ -3821,15 +4693,15 @@ body.dark-mode .tour-card, body.theme-green .tour-card { background: #151a16; co
 /* --- WhatsApp-style chat --- */
 .chat-box { height: 70vh; min-height: 360px; }
 .chat-messages { background: #ECE5DD; gap: 3px; }
-body.dark-mode .chat-messages, body.theme-green .chat-messages { background: #0B141A; }
+body.dark-mode .chat-messages { background: #0B141A; }
 .msg { position: relative; max-width: 78%; padding: 6px 9px 4px; border-radius: 8px; font-size: 14px; line-height: 1.35; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); word-wrap: break-word; }
 .msg.me { background: #DCF8C6; color: #111; border-top-right-radius: 0; }
 .msg.them { background: #fff; color: #111; border-top-left-radius: 0; }
-body.dark-mode .msg.me, body.theme-green .msg.me { background: #005C4B; color: #E9EDEF; }
-body.dark-mode .msg.them, body.theme-green .msg.them { background: #202C33; color: #E9EDEF; }
+body.dark-mode .msg.me { background: #005C4B; color: #E9EDEF; }
+body.dark-mode .msg.them { background: #202C33; color: #E9EDEF; }
 .msg-sender { font-size: 11px; font-weight: 600; color: #128C7E; margin-bottom: 2px; }
 .msg-meta { float: right; margin: 6px 0 0 10px; font-size: 10.5px; color: rgba(0,0,0,0.45); white-space: nowrap; }
-body.dark-mode .msg-meta, body.theme-green .msg-meta { color: rgba(255,255,255,0.55); }
+body.dark-mode .msg-meta { color: rgba(255,255,255,0.55); }
 .ticks { font-size: 12px; letter-spacing: -2px; color: #8696A0; }
 .ticks-read { color: #34B7F1; }
 .msg::after { content: ""; display: block; clear: both; }
@@ -3840,14 +4712,14 @@ body.dark-mode .msg-meta, body.theme-green .msg-meta { color: rgba(255,255,255,0
 .unread-badge-old { background: #C0392B; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 10px; margin-left: 6px; display: inline-block; }
 .steps-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-top: 10px; }
 .step-card { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
-body.dark-mode .step-card, body.theme-green .step-card { background: #0B0F0C; }
+body.dark-mode .step-card { background: #111A2E; }
 .step-num { width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; margin-bottom: 10px; }
 .step-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
 .step-desc { font-size: 12px; color: var(--text-muted); }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
 .stat-tile { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 18px; text-align: center; }
-body.dark-mode .stat-tile, body.theme-green .stat-tile { background: #0B0F0C; }
-.stat-num { font-family: 'Sora', sans-serif; font-size: 26px; font-weight: 700; color: var(--accent); }
+body.dark-mode .stat-tile { background: #111A2E; }
+.stat-num { font-family: 'Poppins', sans-serif; font-size: 26px; font-weight: 700; color: var(--accent); }
 .stat-label { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 .file-chip { display: inline-block; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 12px; margin: 4px 4px 0 0; color: var(--navy); }
 .cta-section { background: var(--sidebar-bg); color: #fff; border-radius: 16px; padding: 24px; }
@@ -3863,7 +4735,7 @@ body.dark-mode .stat-tile, body.theme-green .stat-tile { background: #0B0F0C; }
 .toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); }
 .reels-feed { display: flex; flex-direction: column; gap: 20px; max-width: 480px; margin: 0 auto; }
 .reel-card { background: #fff; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
-body.dark-mode .reel-card, body.theme-green .reel-card { background: #0B0F0C; }
+body.dark-mode .reel-card { background: #111A2E; }
 .reel-video { width: 100%; max-height: 420px; object-fit: cover; background: #000; display: block; }
 .reel-info { padding: 12px 14px; }
 .reel-actions { display: flex; gap: 14px; margin-top: 6px; }
@@ -3874,10 +4746,10 @@ body.dark-mode .reel-card, body.theme-green .reel-card { background: #0B0F0C; }
 .category-graphic { border-radius: 10px; overflow: hidden; }
 .category-graphic svg { width: 100%; height: 100%; display: block; }
 .settings-card { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
-body.dark-mode .settings-card, body.theme-green .settings-card { background: #0B0F0C; }
+body.dark-mode .settings-card { background: #111A2E; }
 .settings-card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .settings-icon { font-size: 22px; }
-.settings-card-title { font-family: 'Sora', sans-serif; font-weight: 600; font-size: 15px; }
+.settings-card-title { font-family: 'Poppins', sans-serif; font-weight: 600; font-size: 15px; }
 .settings-card-sub { font-size: 12px; color: var(--text-muted); }
 .profile-avatar {
   width: 56px; height: 56px; border-radius: 50%; background-size: cover; background-position: center;
@@ -3885,13 +4757,13 @@ body.dark-mode .settings-card, body.theme-green .settings-card { background: #0B
 }
 .profile-avatar-placeholder {
   display: flex; align-items: center; justify-content: center; color: #fff;
-  font-family: 'Sora', sans-serif; font-weight: 700; font-size: 22px; background: var(--accent);
+  font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 22px; background: var(--accent);
 }
 .modal-brand { display: flex; align-items: center; gap: 8px; justify-content: center; margin-bottom: 18px; }
-.modal-brand-name { font-family: 'Sora', sans-serif; font-weight: 700; font-size: 18px; color: var(--navy); }
-.modal-headline { font-family: 'Sora', sans-serif; font-size: 19px; font-weight: 700; }
+.modal-brand-name { font-family: 'Poppins', sans-serif; font-weight: 700; font-size: 18px; color: var(--navy); }
+.modal-headline { font-family: 'Poppins', sans-serif; font-size: 19px; font-weight: 700; }
 .chat-search-bar { display: flex; align-items: center; gap: 8px; background: #fff; border: 1px solid var(--border); border-radius: 20px; padding: 10px 16px; margin-bottom: 16px; }
-body.dark-mode .chat-search-bar, body.theme-green .chat-search-bar { background: #0B0F0C; }
+body.dark-mode .chat-search-bar { background: #111A2E; }
 .chat-search-bar input { flex: 1; border: none; outline: none; background: transparent; font-size: 14px; color: var(--navy); }
 .chat-search-icon { font-size: 14px; opacity: 0.6; }
 .chat-row-link { text-decoration: none; }
@@ -3899,7 +4771,7 @@ body.dark-mode .chat-search-bar, body.theme-green .chat-search-bar { background:
   position: relative; display: flex; align-items: center; gap: 12px;
   background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 10px;
 }
-body.dark-mode .chat-row, body.theme-green .chat-row { background: #0B0F0C; }
+body.dark-mode .chat-row { background: #111A2E; }
 .chat-row-unread { border-color: var(--accent); }
 .chat-row-avatar { width: 44px; height: 44px; font-size: 17px; flex-shrink: 0; border-width: 1px; }
 .unread-dot {
@@ -3937,7 +4809,11 @@ app.jinja_loader = DictLoader(TEMPLATES)
 @app.context_processor
 def inject_unread_count():
     user = current_user()
-    out = {"admin_unread_count": 0, "customer_unread_count": 0, "pending_work_count": 0}
+    out = {"admin_unread_count": 0, "customer_unread_count": 0, "pending_work_count": 0,
+           "default_mode": "dark" if os.environ.get("DEFAULT_MODE", "light").lower() == "dark" else "light",
+           "current_year": datetime.now().year,
+           "contact": {"phone": os.environ.get("CONTACT_PHONE", ""), "whatsapp": "".join(c for c in os.environ.get("CONTACT_WHATSAPP", "") if c.isdigit()),
+                       "email": os.environ.get("CONTACT_EMAIL", ""), "address": os.environ.get("CONTACT_ADDRESS", "")}}
     if not user:
         return out
     conn = get_db()
@@ -4039,8 +4915,15 @@ def _save_attachment(file_storage, upload_dir, allow_video=False):
 @app.route("/")
 def home():
     user = current_user()
+    conn = get_db()
+    recent_works = [dict(r) for r in conn.execute(
+        "SELECT work_posts.id, work_posts.title, work_posts.category, "
+        "(SELECT filename FROM work_photos WHERE work_id = work_posts.id AND COALESCE(kind, 'image') = 'image' ORDER BY id LIMIT 1) AS photo, "
+        "(SELECT filename FROM work_photos WHERE work_id = work_posts.id AND kind = 'video' ORDER BY id LIMIT 1) AS video "
+        "FROM work_posts WHERE COALESCE(status, 'approved') = 'approved' ORDER BY id DESC LIMIT 6").fetchall()]
+    conn.close()
     return render_template("home.html", user=user, site=get_site_content(), hero_photos=get_hero_photos(),
-                            active_page="home", auto_open_auth=False)
+                            recent_works=recent_works, active_page="home", auto_open_auth=False)
 
 
 @app.route("/about")
@@ -4228,13 +5111,17 @@ def forgot_password():
             conn.execute("UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE id = ?", (token, expires, user["id"]))
             conn.commit()
             reset_link = url_for("reset_password", token=token, _external=True)
-            # NOTE: no email service is wired up yet, so the reset link is shown directly here
-            # instead of being emailed. Once an email provider is configured, send `reset_link`
-            # to the user's email instead of flashing it.
-            flash(f"Password reset isn't emailed yet — here's your link: {reset_link}", "success")
-        else:
-            flash("If that email exists, a reset link has been generated.", "success")
+            # The link is only ever sent to the account's own email (when SMTP is set up) or shown
+            # to the owner in the admin overview. It is NEVER shown to the person making the request.
+            if email_configured():
+                send_email_async(user["email"], "Reset your ANDY password",
+                                 f"Hi {user['name']},\n\nUse this link within 1 hour to choose a new password:\n{reset_link}\n\n"
+                                 "If you didn't ask for this, you can ignore this email.\n")
+            send_push_to_users([r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()],
+                               {"title": "🔑 Password reset requested", "body": f"{user['name']} asked to reset their password.",
+                                "url": url_for("admin_dashboard"), "tag": "pw-reset"})
         conn.close()
+        flash("If that email is registered, a reset link has been sent. If it doesn't arrive, message Andy for help.", "success")
         return redirect(url_for("forgot_password"))
     return render_template("forgot_password.html", user=None, active_page="forgot_password", auto_open_auth=False)
 
@@ -4287,11 +5174,13 @@ def request_service():
         return redirect(url_for("home"))
 
     if request.method == "POST":
-        title = request.form.get("title", "").strip()
+        title = " ".join(request.form.get("title", "").split())[:120]
         category = request.form.get("category", "Other")
-        description = request.form.get("description", "").strip()
-        if not title or not description:
-            flash("Please fill in a title and description.", "error")
+        if category not in JOB_CATEGORIES:
+            category = "Other"
+        description = request.form.get("description", "").strip()[:3000]
+        if not title or len(description) < 10:
+            flash("Please add a short title and describe the job in at least a sentence.", "error")
             return redirect(url_for("request_service"))
 
         conn = get_db()
@@ -4300,7 +5189,7 @@ def request_service():
             (user["id"], title, description, category),
         )
         job_id = cur.lastrowid
-        files = request.files.getlist("attachments")
+        files = request.files.getlist("attachments")[:6]
         for f in files:
             stored, kind = _save_attachment(f, ATTACHMENTS_UPLOAD_DIR)
             if stored:
@@ -4436,6 +5325,7 @@ def job_thread(job_id):
 
     return render_template(
         "job_thread.html", user=user, job=job, customer_name=customer["name"] if customer else "",
+        payments_enabled=paystack_configured(), statuses=JOB_STATUSES,
         artisan_name=artisan_name, attachments=attachments, messages=messages, artisans=artisans,
         review=review, is_owner_view=is_owner(user), is_customer_view=is_customer(user),
         active_page="my_jobs", auto_open_auth=False,
@@ -4597,20 +5487,32 @@ def admin_update_job(job_id):
         return redirect(url_for("admin_jobs"))
 
     artisan_id = request.form.get("artisan_id") or None
+    if artisan_id:
+        ok = conn.execute("SELECT id FROM artisans WHERE id=? AND active=1", (artisan_id,)).fetchone()
+        artisan_id = ok["id"] if ok else None
     track = request.form.get("track", "standard")
+    if track not in ("standard", "eas"):
+        track = "standard"
     try:
-        amount = int(request.form.get("amount", 0))
+        amount = max(0, int(request.form.get("amount", 0)))
     except ValueError:
         amount = 0
 
-    new_status = job["status"]
-    if artisan_id and job["status"] == "submitted":
-        new_status = "assigned"
+    chosen = request.form.get("status", job["status"])
+    if chosen not in JOB_STATUSES:
+        chosen = job["status"]
+    new_status = chosen
+    if chosen == job["status"] and artisan_id and job["status"] == "submitted":
+        new_status = "assigned"          # assigning an artisan moves a new request forward
 
-    conn.execute(
-        "UPDATE jobs SET artisan_id=?, track=?, amount=?, status=? WHERE id=?",
-        (artisan_id, track, amount, new_status, job_id),
-    )
+    conn.execute("UPDATE jobs SET artisan_id=?, track=?, amount=?, status=? WHERE id=?",
+                 (artisan_id, track, amount, new_status, job_id))
+    fresh = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    if new_status != job["status"]:
+        if new_status == "cancelled":
+            _refund_escrow(conn, fresh)
+        elif new_status == "completed":
+            _release_escrow(conn, fresh)
     conn.commit()
     conn.close()
     flash("Job updated.", "success")
@@ -4624,20 +5526,24 @@ def pay_for_job(job_id):
         return redirect(url_for("home"))
     conn = get_db()
     job = conn.execute("SELECT * FROM jobs WHERE id=? AND customer_id=?", (job_id, user["id"])).fetchone()
+    if not paystack_configured():
+        conn.close()
+        flash("In-app payment isn't switched on yet. Andy will share payment details in this chat.", "error")
+        return redirect(url_for("job_thread", job_id=job_id))
     if not job or job["status"] != "assigned" or not job["amount"]:
         conn.close()
         flash("This job isn't ready for payment yet.", "error")
         return redirect(url_for("job_thread", job_id=job_id))
-    fresh = conn.execute("SELECT wallet FROM users WHERE id=?", (user["id"],)).fetchone()
-    if fresh["wallet"] < job["amount"]:
+    # Conditional updates make a double-tap or two parallel requests safe: only one can win.
+    moved = conn.execute("UPDATE jobs SET status='in_progress', escrow_held=1 WHERE id=? AND status='assigned'", (job_id,))
+    charged = conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=? AND wallet >= ?", (job["amount"], user["id"], job["amount"])) if moved.rowcount == 1 else None
+    if moved.rowcount != 1 or charged is None or charged.rowcount != 1:
+        conn.rollback()
         conn.close()
-        flash("Not enough CONNECT coins. Top up your wallet first.", "error")
+        flash("Not enough CONNECT coins (or this job was already paid). Top up your wallet first.", "error")
         return redirect(url_for("job_thread", job_id=job_id))
-
-    conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=?", (job["amount"], user["id"]))
     conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
                  (user["id"], f"Payment for job: {job['title']} (held in escrow)", -job["amount"]))
-    conn.execute("UPDATE jobs SET status='in_progress' WHERE id=?", (job_id,))
     conn.commit()
     conn.close()
     flash("Payment held in escrow. Your artisan has been notified.", "success")
@@ -4655,17 +5561,57 @@ def complete_service_job(job_id):
         conn.close()
         flash("This job isn't ready to complete yet.", "error")
         return redirect(url_for("job_thread", job_id=job_id))
-
-    tech = conn.execute("SELECT * FROM artisans WHERE id=?", (job["artisan_id"],)).fetchone()
-    conn.execute("UPDATE jobs SET status='completed' WHERE id=?", (job_id,))
-    if tech:
-        conn.execute("UPDATE artisans SET jobs_completed = jobs_completed + 1 WHERE id=?", (tech["id"],))
-        conn.execute("UPDATE users SET wallet = wallet + ? WHERE id=?", (job["amount"], tech["user_id"]))
-        conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
-                     (tech["user_id"], f"Payment released: {job['title']}", job["amount"]))
+    done = conn.execute("UPDATE jobs SET status='completed' WHERE id=? AND status='in_progress'", (job_id,))
+    if done.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        return redirect(url_for("job_thread", job_id=job_id))
+    _release_escrow(conn, dict(job))
     conn.commit()
     conn.close()
-    flash("Job marked complete — payment released to your artisan.", "success")
+    flash("Job marked complete." + (" Payment released to your artisan." if job["escrow_held"] else ""), "success")
+    return redirect(url_for("job_thread", job_id=job_id))
+
+
+def _release_escrow(conn, job):
+    """Pays the artisan from escrow ONCE, and only if the customer really paid in-app."""
+    tech = conn.execute("SELECT * FROM artisans WHERE id=?", (job["artisan_id"],)).fetchone() if job.get("artisan_id") else None
+    if tech:
+        conn.execute("UPDATE artisans SET jobs_completed = jobs_completed + 1 WHERE id=?", (tech["id"],))
+    if tech and job.get("escrow_held") and job.get("amount"):
+        took = conn.execute("UPDATE jobs SET escrow_held=0 WHERE id=? AND escrow_held=1", (job["id"],))
+        if took.rowcount == 1:
+            conn.execute("UPDATE users SET wallet = wallet + ? WHERE id=?", (job["amount"], tech["user_id"]))
+            conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
+                         (tech["user_id"], f"Payment released: {job['title']}", job["amount"]))
+
+
+def _refund_escrow(conn, job):
+    took = conn.execute("UPDATE jobs SET escrow_held=0 WHERE id=? AND escrow_held=1", (job["id"],))
+    if took.rowcount == 1 and job.get("amount"):
+        conn.execute("UPDATE users SET wallet = wallet + ? WHERE id=?", (job["amount"], job["customer_id"]))
+        conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
+                     (job["customer_id"], f"Refund: {job['title']} (cancelled)", job["amount"]))
+
+
+@app.route("/job/<int:job_id>/cancel", methods=["POST"])
+def cancel_job(job_id):
+    user = require_login()
+    if not user or not is_customer(user):
+        return redirect(url_for("home"))
+    conn = get_db()
+    job = conn.execute("SELECT * FROM jobs WHERE id=? AND customer_id=?", (job_id, user["id"])).fetchone()
+    if not job or job["status"] not in ("submitted", "assigned") or (job["category"] or "") in ("General Support", "Feedback", "Bug Report"):
+        conn.close()
+        flash("This request can't be cancelled here. Message Andy in the chat and we will help.", "error")
+        return redirect(url_for("job_thread", job_id=job_id))
+    conn.execute("UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('submitted', 'assigned')", (job_id,))
+    owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
+    conn.commit()
+    conn.close()
+    send_push_to_users(owners, {"title": "Request cancelled", "body": f"{user['name']} cancelled “{job['title']}”.",
+                                "url": url_for("job_thread", job_id=job_id), "tag": f"job-{job_id}"})
+    flash("Your request was cancelled.", "success")
     return redirect(url_for("job_thread", job_id=job_id))
 
 
@@ -4804,10 +5750,27 @@ def admin_dashboard():
         SELECT jobs.*, users.name AS customer_name FROM jobs
         JOIN users ON jobs.customer_id = users.id ORDER BY jobs.id DESC LIMIT 10
     """).fetchall()
+    resets = []
+    for r in conn.execute("SELECT name, email, reset_token, reset_token_expires FROM users WHERE reset_token IS NOT NULL AND reset_token != ''").fetchall():
+        try:
+            if __import__("datetime").datetime.fromisoformat(str(r["reset_token_expires"])) > __import__("datetime").datetime.utcnow():
+                resets.append({"name": r["name"], "email": r["email"], "link": url_for("reset_password", token=r["reset_token"], _external=True)})
+        except Exception:
+            pass
     conn.close()
+    warnings = []
+    try:
+        if check_password_hash(user["password_hash"], "changeme123"):
+            warnings.append("Your owner password is still the old default. Change it now in Settings.")
+    except Exception:
+        pass
+    if not os.environ.get("SECRET_KEY"):
+        warnings.append("SECRET_KEY is not set on the server, so everyone is logged out whenever it restarts.")
+    if not supabase_db_configured():
+        warnings.append("Data is stored in a local file. On free Render hosting it can be wiped on redeploy. Set SUPABASE_DB_URL for permanent storage.")
     stats = {"customers": customers, "artisans": artisans, "pending_jobs": pending_jobs, "eas_jobs": eas_jobs}
     return render_template("admin_dashboard.html", user=user, stats=stats, recent_jobs=[dict(r) for r in recent],
-                            active_page="admin_dashboard", auto_open_auth=False)
+                            warnings=warnings, resets=resets, active_page="admin_dashboard", auto_open_auth=False)
 
 
 @app.route("/admin/chats")
@@ -4865,6 +5828,10 @@ def add_artisan():
     password = request.form.get("password", "")
     category = request.form.get("category", "Aluminum Fabrication")
     phone = request.form.get("phone", "").strip()
+    name = " ".join(name.split())[:60]
+    if len(name) < 2 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(password) < 8:
+        flash("Please enter a name, a valid email and a password of at least 8 characters.", "error")
+        return redirect(url_for("admin_artisans"))
 
     conn = get_db()
     if conn.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
@@ -5565,10 +6532,7 @@ def works():
         conn = get_db()
         cur = conn.execute("INSERT INTO work_posts (title, description, category, status) VALUES (?, ?, ?, 'approved')", (title, description, category))
         work_id = cur.lastrowid
-        for f in request.files.getlist("photos"):
-            stored, kind = _save_attachment(f, WORKS_UPLOAD_DIR)
-            if stored and kind == "image":
-                conn.execute("INSERT INTO work_photos (work_id, filename) VALUES (?, ?)", (work_id, stored))
+        _save_work_media(conn, work_id, request.files.getlist("photos"), limit=12)
         conn.commit()
         conn.close()
         flash("Work posted.", "success")
@@ -5582,9 +6546,142 @@ def works():
         photos = conn.execute("SELECT * FROM work_photos WHERE work_id=?", (w["id"],)).fetchall()
         w["photos"] = [dict(p) for p in photos]
         posts.append(w)
+    for w in posts:
+        w["like_count"] = conn.execute("SELECT COUNT(*) AS c FROM work_likes WHERE work_id=?", (w["id"],)).fetchone()["c"]
+        w["liked"] = bool(user and conn.execute("SELECT 1 FROM work_likes WHERE work_id=? AND user_id=?", (w["id"], user["id"])).fetchone())
+        revs = conn.execute(
+            "SELECT work_reviews.id, work_reviews.user_id, work_reviews.rating, work_reviews.text, users.name AS name "
+            "FROM work_reviews JOIN users ON work_reviews.user_id = users.id WHERE work_reviews.work_id=? ORDER BY work_reviews.id DESC",
+            (w["id"],)).fetchall()
+        w["reviews"] = []
+        for r in revs:
+            d = dict(r)
+            d["display_name"] = _short_name(d.pop("name"))
+            d["like_count"] = conn.execute("SELECT COUNT(*) AS c FROM review_likes WHERE review_id=?", (d["id"],)).fetchone()["c"]
+            d["liked"] = bool(user and conn.execute("SELECT 1 FROM review_likes WHERE review_id=? AND user_id=?", (d["id"], user["id"])).fetchone())
+            w["reviews"].append(d)
+        w["review_count"] = len(w["reviews"])
+        w["avg_rating"] = (sum(r["rating"] for r in w["reviews"]) / len(w["reviews"])) if w["reviews"] else 0
+        w["my_review"] = next((r for r in w["reviews"] if user and r["user_id"] == user["id"]), None)
     conn.close()
     return render_template("works.html", user=user, work_posts=posts, is_owner_view=is_owner(user), categories=WORK_CATEGORIES,
                             active_page="works", auto_open_auth=False)
+
+
+MEDIA_ACCEPT = ".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm,.m4v"
+
+
+def _save_work_media(conn, work_id, files, limit=8):
+    """Saves photos AND videos (sound kept) for a work post. Returns how many were stored."""
+    n = 0
+    for f in [f for f in files if f and f.filename][:limit]:
+        stored, kind = _save_attachment(f, WORKS_UPLOAD_DIR, allow_video=True)
+        if stored and kind in ("image", "video"):
+            conn.execute("INSERT INTO work_photos (work_id, filename, kind) VALUES (?, ?, ?)", (work_id, stored, kind))
+            n += 1
+    return n
+
+
+def _short_name(name):
+    parts = (name or "Customer").split()
+    if len(parts) > 1:
+        return f"{parts[0]} {parts[-1][0].upper()}."
+    return parts[0] if parts else "Customer"
+
+
+@app.route("/works/<int:work_id>/review", methods=["POST"])
+def work_review(work_id):
+    user = require_login()
+    anchor = f"#reviews-{work_id}"
+    if not user:
+        return redirect(url_for("works") + anchor)
+    if not is_customer(user):
+        flash("Only customers can leave reviews.", "error")
+        return redirect(url_for("works") + anchor)
+    try:
+        rating = int(request.form.get("rating", "0"))
+    except ValueError:
+        rating = 0
+    if rating < 1 or rating > 5:
+        flash("Please pick a star rating.", "error")
+        return redirect(url_for("works") + anchor)
+    text = request.form.get("text", "").strip()[:500]
+    text = mask_phone_numbers(text) if text else text
+    conn = get_db()
+    work = conn.execute("SELECT id FROM work_posts WHERE id=? AND COALESCE(status,'approved')='approved'", (work_id,)).fetchone()
+    if not work:
+        conn.close()
+        return redirect(url_for("works"))
+    cutoff = (datetime.utcnow() - __import__("datetime").timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    recent = conn.execute("SELECT COUNT(*) AS c FROM work_reviews WHERE user_id=? AND created_at > ?", (user["id"], cutoff)).fetchone()["c"]
+    if recent >= 20:
+        conn.close()
+        flash("You're reviewing a lot. Please try again later.", "error")
+        return redirect(url_for("works") + anchor)
+    conn.execute("DELETE FROM work_reviews WHERE work_id=? AND user_id=?", (work_id, user["id"]))
+    conn.execute("INSERT INTO work_reviews (work_id, user_id, rating, text, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (work_id, user["id"], rating, text, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+    owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
+    title = conn.execute("SELECT title FROM work_posts WHERE id=?", (work_id,)).fetchone()["title"]
+    conn.commit()
+    conn.close()
+    send_push_to_users(owners, {"title": f"{'★' * rating} New review", "body": f"{_short_name(user['name'])} on “{title}”: {text}"[:140],
+                                "url": url_for("works") + anchor, "tag": f"review-{work_id}"})
+    flash("Thanks for your review!", "success")
+    return redirect(url_for("works") + anchor)
+
+
+def _toggle_like(table, key_col, key_val):
+    user = current_user()
+    if not user:
+        return jsonify({"error": "auth"}), 401
+    conn = get_db()
+    exists = conn.execute(f"SELECT 1 FROM {table} WHERE {key_col}=? AND user_id=?", (key_val, user["id"])).fetchone()
+    if exists:
+        conn.execute(f"DELETE FROM {table} WHERE {key_col}=? AND user_id=?", (key_val, user["id"]))
+    else:
+        conn.execute(f"INSERT INTO {table} ({key_col}, user_id) VALUES (?, ?)", (key_val, user["id"]))
+    conn.commit()
+    count = conn.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE {key_col}=?", (key_val,)).fetchone()["c"]
+    conn.close()
+    return jsonify({"liked": not exists, "count": count})
+
+
+@app.route("/works/<int:work_id>/like", methods=["POST"])
+def work_like(work_id):
+    conn = get_db()
+    ok = conn.execute("SELECT 1 FROM work_posts WHERE id=? AND COALESCE(status,'approved')='approved'", (work_id,)).fetchone()
+    conn.close()
+    if not ok:
+        return jsonify({"error": "missing"}), 404
+    return _toggle_like("work_likes", "work_id", work_id)
+
+
+@app.route("/works/review/<int:review_id>/like", methods=["POST"])
+def work_review_like(review_id):
+    conn = get_db()
+    ok = conn.execute("SELECT 1 FROM work_reviews WHERE id=?", (review_id,)).fetchone()
+    conn.close()
+    if not ok:
+        return jsonify({"error": "missing"}), 404
+    return _toggle_like("review_likes", "review_id", review_id)
+
+
+@app.route("/works/review/<int:review_id>/delete", methods=["POST"])
+def work_review_delete(review_id):
+    user = require_login()
+    if not user:
+        return redirect(url_for("works"))
+    conn = get_db()
+    r = conn.execute("SELECT * FROM work_reviews WHERE id=?", (review_id,)).fetchone()
+    work_id = r["work_id"] if r else None
+    if r and (is_owner(user) or r["user_id"] == user["id"]):
+        conn.execute("DELETE FROM review_likes WHERE review_id=?", (review_id,))
+        conn.execute("DELETE FROM work_reviews WHERE id=?", (review_id,))
+        conn.commit()
+        flash("Review deleted.", "success")
+    conn.close()
+    return redirect(url_for("works") + (f"#reviews-{work_id}" if work_id else ""))
 
 
 @app.route("/works/delete/<int:work_id>", methods=["POST"])
@@ -5601,7 +6698,11 @@ def delete_work(work_id):
             except OSError:
                 pass
     conn.execute("DELETE FROM work_photos WHERE work_id=?", (work_id,))
+    conn.execute("DELETE FROM work_likes WHERE work_id=?", (work_id,))
     conn.execute("DELETE FROM work_posts WHERE id=?", (work_id,))
+    conn.execute("DELETE FROM review_likes WHERE review_id IN (SELECT id FROM work_reviews WHERE work_id=?)", (work_id,))
+    conn.execute("DELETE FROM work_reviews WHERE work_id=?", (work_id,))
+    conn.execute("DELETE FROM work_likes WHERE work_id=?", (work_id,))
     conn.commit()
     conn.close()
     flash("Work post removed.", "success")
@@ -5725,26 +6826,22 @@ def artisan_work():
         description = mask_phone_numbers(description) if description else description
         category = request.form.get("category", "").strip()
         category = category if category in WORK_CATEGORIES else ""
-        files = [f for f in request.files.getlist("photos") if f and f.filename][:8]
+        files = [f for f in request.files.getlist("photos") if f and f.filename][:8]  # photos and videos
         waiting = conn.execute("SELECT COUNT(*) AS c FROM work_posts WHERE submitted_by=? AND status='pending'", (user["id"],)).fetchone()["c"]
         if not title or not files:
             flash("Add a title and at least one photo.", "error")
         elif waiting >= 10:
             flash("You have 10 items waiting for review. Please wait for Andy to review them first.", "error")
         else:
-            saved = []
-            for f in files:
-                stored, kind = _save_attachment(f, WORKS_UPLOAD_DIR)
-                if stored and kind == "image":
-                    saved.append(stored)
+            cur = conn.execute(
+                "INSERT INTO work_posts (title, description, category, status, submitted_by) VALUES (?, ?, ?, 'pending', ?)",
+                (title, description, category, user["id"]))
+            saved = _save_work_media(conn, cur.lastrowid, files)
             if not saved:
-                flash("Please upload JPG, PNG or WEBP photos.", "error")
+                conn.execute("DELETE FROM work_posts WHERE id=?", (cur.lastrowid,))
+                conn.commit()
+                flash("Please upload JPG, PNG or WEBP photos, or MP4 / MOV / WEBM videos.", "error")
             else:
-                cur = conn.execute(
-                    "INSERT INTO work_posts (title, description, category, status, submitted_by) VALUES (?, ?, ?, 'pending', ?)",
-                    (title, description, category, user["id"]))
-                for stored in saved:
-                    conn.execute("INSERT INTO work_photos (work_id, filename) VALUES (?, ?)", (cur.lastrowid, stored))
                 conn.commit()
                 _notify_work_submitted(user, title)
                 flash("Sent to Andy for review. It goes live once approved.", "success")
@@ -5798,6 +6895,12 @@ def paystack_initiate(naira_amount):
     user = require_login()
     if not user:
         return redirect(url_for("home"))
+    if not paystack_configured():
+        flash("Online top-up isn't switched on yet. Please contact Andy.", "error")
+        return redirect(url_for("wallet"))
+    if naira_amount < 100 or naira_amount > 1000000:
+        flash("Please choose an amount between ₦100 and ₦1,000,000.", "error")
+        return redirect(url_for("wallet"))
     kobo_amount = naira_amount * 100
     try:
         resp = requests.post(
@@ -5823,14 +6926,17 @@ def paystack_verify():
     user = require_login()
     if not user:
         return redirect(url_for("home"))
-    reference = request.args.get("reference") or request.args.get("trxref")
-    if not reference:
-        flash("No payment reference found.", "error")
+    reference = request.args.get("reference") or request.args.get("trxref") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{6,100}", reference):
+        flash("No valid payment reference found.", "error")
+        return redirect(url_for("wallet"))
+    if not paystack_configured():
+        flash("Online payments aren't switched on yet.", "error")
         return redirect(url_for("wallet"))
 
     conn = get_db()
-    already = conn.execute("SELECT 1 FROM transactions WHERE user_id=? AND label LIKE ?",
-                            (user["id"], f"%ref:{reference}%")).fetchone()
+    already = conn.execute("SELECT 1 FROM paystack_refs WHERE reference=?", (reference,)).fetchone() or \
+        conn.execute("SELECT 1 FROM transactions WHERE label LIKE ?", (f"%ref:{reference}%",)).fetchone()
     if already:
         conn.close()
         flash("This payment was already processed.", "success")
@@ -5845,7 +6951,18 @@ def paystack_verify():
         flash("Couldn't verify payment with Paystack.", "error")
         return redirect(url_for("wallet"))
 
-    if data.get("status") and data["data"]["status"] == "success":
+    if data.get("status") and data["data"].get("status") == "success":
+        meta = data["data"].get("metadata") or {}
+        if str(meta.get("user_id")) != str(user["id"]):
+            conn.close()
+            flash("That payment belongs to a different account.", "error")
+            return redirect(url_for("wallet"))
+        try:  # the reference is the primary key, so a payment can only ever be credited once
+            conn.execute("INSERT INTO paystack_refs (reference, user_id) VALUES (?, ?)", (reference, user["id"]))
+        except Exception:
+            conn.close()
+            flash("This payment was already processed.", "success")
+            return redirect(url_for("wallet"))
         naira_paid = data["data"]["amount"] / 100
         coins = int(naira_paid * CONNECT_COINS_PER_NAIRA)
         conn.execute("UPDATE users SET wallet = wallet + ? WHERE id=?", (coins, user["id"]))
@@ -5873,7 +6990,10 @@ def settings():
         form_type = request.form.get("form_type", "theme")
         conn = get_db()
         if form_type == "profile":
-            bio = request.form.get("bio", "").strip()
+            new_name = " ".join(request.form.get("name", "").split())[:60]
+            if len(new_name) >= 2 and new_name != user["name"]:
+                conn.execute("UPDATE users SET name=? WHERE id=?", (new_name, user["id"]))
+            bio = request.form.get("bio", "").strip()[:500]
             avatar_value = None
             file = request.files.get("avatar")
             if file and file.filename:
@@ -5920,6 +7040,10 @@ def settings():
                 conn.execute("UPDATE users SET dark_mode=? WHERE id=?", (dark, user["id"]))
                 conn.commit()
                 flash("Appearance updated.", "success")
+                conn.close()
+                resp = redirect(url_for("settings"))
+                resp.set_cookie("andy_mode", "dark" if dark else "light", max_age=31536000, samesite="Lax")
+                return resp
             conn.close()
             return redirect(url_for("settings"))
     return render_template("settings.html", user=user, active_page="settings", auto_open_auth=False)
