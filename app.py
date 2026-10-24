@@ -1290,7 +1290,7 @@ TEMPLATES = {
         <div class="footer-brand">
           <div class="footer-logo"><span class="logo-mark"></span><span class="nav-word">ANDY<span>.</span></span></div>
           <p class="footer-motto">Aluminum made simple.</p>
-          <p>Connecting you with skilled artisans for the work you need done. Artisans join Andy by invitation only.</p>
+          <p>Andy is starting with its own team of aluminum (alloy) fabricators. Every job runs through Andy, and you pay Andy.</p>
         </div>
         <div class="footer-col">
           <h4>Explore</h4>
@@ -1867,8 +1867,8 @@ MORE_TEMPLATES_1 = {
   <div class="lp-head reveal"><span class="lp-eyebrow">How it works</span><h2 class="lp-title">Four simple steps</h2></div>
   <div class="lp-grid lp-steps">
     <div class="lp-card reveal" style="--d:0ms"><div class="lp-step-num">1</div><h3>Tell Andy what you need</h3><p>Describe the job, add photos or files if it helps explain it.</p></div>
-    <div class="lp-card reveal" style="--d:120ms"><div class="lp-step-num">2</div><h3>Andy connects you</h3><p>Andy connects you with a suitable artisan for the job.</p></div>
-    <div class="lp-card reveal" style="--d:240ms"><div class="lp-step-num">3</div><h3>Get the job handled</h3><p>Your artisan does the work. Chat with Andy and follow your request's status in the app.</p></div>
+    <div class="lp-card reveal" style="--d:120ms"><div class="lp-step-num">2</div><h3>Andy connects you</h3><p>Andy assigns one of its own artisans to your job.</p></div>
+    <div class="lp-card reveal" style="--d:240ms"><div class="lp-step-num">3</div><h3>Get the job handled</h3><p>Pay Andy, and your artisan does the work. They are paid by Andy after the job is done.</p></div>
     <div class="lp-card reveal" style="--d:360ms"><div class="lp-step-num">4</div><h3>Larger projects</h3><p>Larger projects can be directed to EAS where appropriate.</p></div>
   </div>
 </section>
@@ -1925,12 +1925,12 @@ MORE_TEMPLATES_1 = {
 "_about_section.html": '''<div class="lp-head reveal">
   <span class="lp-eyebrow">About</span>
   <h2 class="lp-title">About Andy</h2>
-  <p class="lp-lead">{% if site.about_text %}{{ site.about_text }}{% else %}Andy helps customers connect with skilled artisans for their service needs. Our aim is to make finding reliable technical help easier, more organized and more convenient.{% endif %}</p>
+  <p class="lp-lead">{% if site.about_text %}{{ site.about_text }}{% else %}Andy helps customers get skilled aluminum (alloy) work done. We are starting with our own team of artisans, and every job runs through Andy. Our aim is to make getting reliable aluminum work easier, more organized and more convenient.{% endif %}</p>
 </div>
 
 <div class="lp-offer-intro reveal">
   <h3>What Andy offers</h3>
-  <p>{% if site.what_offers %}{{ site.what_offers }}{% else %}Tell Andy what you need and we will connect you with an artisan from our network. Artisans join Andy by invitation, and every job runs through Andy, so you can chat, share photos and follow its progress in one place.{% endif %}</p>
+  <p>{% if site.what_offers %}{{ site.what_offers }}{% else %}Tell Andy what you need and we will assign one of our own artisans to your job. Every job runs through Andy, so you can chat, share photos and follow its progress in one place. You pay Andy, and your artisan is paid after the job is done.{% endif %}</p>
 </div>
 
 <div class="svc-grid" id="services">
@@ -1996,7 +1996,7 @@ MORE_TEMPLATES_1 = {
   </div>
 </div>
 
-<div class="lp-note reveal"><b>How we work.</b> Andy is not the artisan. We manage the connection between customers and our staffed artisan network. Artisans join Andy by invitation only.</div>
+<div class="lp-note reveal"><b>How we work.</b> Andy is starting with its own team of aluminum (alloy) fabricators. Our artisans are Andy staff, you pay Andy for every job, and your artisan is paid after the work is done.</div>
 ''',
 
 "about.html": '''{% extends "base.html" %}
@@ -2108,7 +2108,14 @@ MORE_TEMPLATES_1 = {
     <button class="btn btn-gold" type="submit" style="width:100%;">Pay ₦{{ "{:,}".format(job.amount) }} &amp; Confirm — held in escrow</button>
   </form>
   {% else %}
-  <div class="info-card" style="margin-bottom:16px;font-size:14px;">Agreed price: <b>₦{{ "{:,}".format(job.amount) }}</b>. Andy will share payment details in this chat.</div>
+  <div class="info-card" style="margin-bottom:16px;font-size:14px;">Agreed price: <b>₦{{ "{:,}".format(job.amount) }}</b>. Pay Andy using the details Andy shares in this chat.</div>
+  {% endif %}
+{% endif %}
+{% if job.category not in ('General Support', 'Feedback', 'Bug Report') and job.status in ('submitted', 'assigned', 'in_progress') %}
+  {% if is_customer_view %}
+  <div class="info-card pay-note">💳 <b>Pay Andy only.</b> Never pay the artisan directly. Your artisan is paid by Andy after the job is done.</div>
+  {% elif user.role == 'artisan' %}
+  <div class="info-card pay-note">💳 Andy pays you after the job is complete. Do not ask for or accept payment from the customer.</div>
   {% endif %}
 {% endif %}
 {% if is_customer_view and job.status in ('submitted', 'assigned') and job.category not in ('General Support', 'Feedback', 'Bug Report') %}
@@ -2951,54 +2958,193 @@ MORE_TEMPLATES_3 = {
 "terms.html": '''{% extends "base.html" %}
 {% block content %}
 <div class="legal">
-  <h1>Terms &amp; Conditions</h1>
-  <div class="legal-date">Last updated: October 2026</div>
-  <p>Welcome to ANDY. By creating an account, logging in or using ANDY you agree to these terms. If you do not agree, please do not use the service.</p>
+  <h1>Andy Terms &amp; Conditions</h1>
+  <div class="legal-date">Effective date: 24 October 2026</div>
 
-  <h2>1. What ANDY is</h2>
-  <p>ANDY connects customers with artisans for aluminum, fabrication and related services. ANDY manages that connection. Artisans carry out the work. Larger projects may be routed to EAS, our larger-project team.</p>
+  <p>Welcome to Andy, a platform designed to connect customers with service providers for aluminum fabrication, window and door installation, repairs, and other related services.</p>
+  <p>By accessing or using Andy, you agree to these Terms and Conditions. Please read them carefully before using the platform.</p>
 
-  <h2>2. Your account</h2>
+  <h2>1. About Andy</h2>
+  <p>Andy is an aluminum service platform. Andy is starting with its own team of artisans: aluminum fabricators, also known as alloy artisans, who work as Andy's staff. When you send a service request, Andy assigns one of its artisans to your job and provides in-app chat, job coordination and related tools.</p>
+  <p>In future, Andy may also connect customers with other approved service providers. If that happens, these Terms or the relevant job details will say so.</p>
+
+  <h2>2. Eligibility and Account Registration</h2>
+  <p>To use Andy, you must be at least 18 years old and you agree to:</p>
   <ul>
-    <li>Give accurate information and keep your password private. You are responsible for activity on your account.</li>
-    <li>You must be old enough to enter a binding agreement where you live.</li>
-    <li>We may suspend or close accounts that break these terms or put others at risk.</li>
+    <li>Provide accurate and truthful information when creating an account.</li>
+    <li>Keep your login credentials secure.</li>
+    <li>Use your account only for lawful purposes.</li>
+    <li>Update your information when necessary.</li>
+    <li>Notify Andy if you suspect unauthorized access to your account.</li>
   </ul>
+  <p>You must not impersonate another person, create accounts using false identities, or use the platform to deceive other users.</p>
+  <p>Andy reserves the right to restrict or suspend accounts involved in suspected fraud, abuse, or violations of these Terms, subject to applicable law.</p>
 
-  <h2>3. Requesting services</h2>
+  <h2>3. Customer Responsibilities</h2>
+  <p>Customers using Andy agree to:</p>
   <ul>
-    <li>A request is not a guarantee. ANDY decides which artisan, if any, is assigned to a job.</li>
-    <li>Prices, timelines and scope are agreed with ANDY in the job chat or quote.</li>
-    <li>The Measure a Window tool gives an estimate only. Always confirm the real size with a tape measure before anything is cut or fabricated.</li>
+    <li>Provide accurate descriptions of the services they require.</li>
+    <li>Supply correct contact details and relevant job information.</li>
+    <li>Provide reasonable access to the work location when necessary.</li>
+    <li>Communicate respectfully with service providers.</li>
+    <li>Agree on the scope of work, materials, costs, and expected completion time before work begins.</li>
+    <li>Make agreed payments according to the terms established for the job.</li>
+    <li>Ensure that the work location is reasonably safe for the service provider.</li>
   </ul>
+  <p>Customers should inspect completed work and communicate any concerns promptly.</p>
+  <p>Customers must not use Andy to request illegal services, harass workers, or engage in fraudulent activities.</p>
 
-  <h2>4. Payments</h2>
-  <p>Follow the payment instructions ANDY gives for your job. To keep both sides protected, keep job communication and payment inside ANDY. ANDY may hide phone numbers shared in chat.</p>
-
-  <h2>5. Content you post</h2>
+  <h2>4. Service Provider Responsibilities</h2>
+  <p>Service providers (also called artisans) are Andy's staff and join Andy by invitation. Service providers using Andy agree to:</p>
   <ul>
-    <li>You keep ownership of the photos, videos, messages and reviews you post. You give ANDY permission to store and show them as part of the service.</li>
-    <li>Reviews must be honest and respectful. Do not post personal contact details, hate, threats or anything unlawful.</li>
-    <li>Work photos and videos submitted by artisans are reviewed by ANDY and may be shown publicly as ANDY's work. ANDY may edit or remove content at any time.</li>
+    <li>Provide accurate information about their identity, qualifications, experience, and services.</li>
+    <li>Accept only jobs they are reasonably capable of completing.</li>
+    <li>Communicate honestly about prices, materials, timelines, and job requirements.</li>
+    <li>Carry out agreed work with reasonable care, skill, and professionalism.</li>
+    <li>Use suitable materials and equipment for the agreed job.</li>
+    <li>Respect customers, their property, and their privacy.</li>
+    <li>Follow applicable safety requirements, building regulations, and other relevant laws.</li>
+    <li>Notify customers promptly of delays, unexpected costs, or circumstances that may affect the job.</li>
+    <li>Avoid misleading claims, fraudulent conduct, and unauthorized charges.</li>
+    <li>Never ask for or accept payment directly from a customer. All payments go to Andy.</li>
   </ul>
+  <p>Service providers must not claim qualifications, certifications, or experience they do not possess.</p>
 
-  <h2>6. Artisans</h2>
-  <p>Artisans join ANDY by invitation only. Jobs are assigned by ANDY, and work submitted for the public gallery is subject to ANDY's approval.</p>
+  <h2>5. Service Requests and Agreements</h2>
+  <p>Submitting a service request through Andy does not automatically guarantee that a service provider will accept or be assigned to the job. Andy decides which service provider, if any, is assigned to a request. So that the job can be done, Andy may share your request details, photos, files and chat messages with the assigned service provider.</p>
+  <p>Before work begins, the customer and Andy should clearly agree on:</p>
+  <ul>
+    <li>The exact work to be performed.</li>
+    <li>The total price or pricing method.</li>
+    <li>The materials and components required.</li>
+    <li>Who will supply the materials.</li>
+    <li>The expected start date and completion time.</li>
+    <li>Any additional charges that may arise from changes to the original job.</li>
+  </ul>
+  <p>Any change to the agreed scope of work should be communicated to Andy and accepted by the customer before the additional work is carried out.</p>
+  <p>Andy may introduce additional job confirmation or tracking features as the platform develops.</p>
 
-  <h2>7. Acceptable use</h2>
-  <p>Do not misuse ANDY. That includes fraud, spam, harassment, trying to bypass security, scraping, or interfering with how the service works.</p>
+  <h2>6. Pricing and Payments</h2>
+  <p>Customers and Andy must ensure that the price and payment arrangements for a job are clearly understood before work begins.</p>
+  <p><b>All payments for jobs arranged through Andy must be made to Andy.</b> Customers must not pay service providers directly, and service providers must not ask for or accept payment directly from customers.</p>
+  <p>Andy pays the service provider after the job is completed. Where payment is made in the app, the agreed amount is held by Andy and released to the service provider when the job is marked complete. Where in-app payment is not available, Andy will share payment details in the job chat.</p>
+  <p>If Andy cancels a job that has already been paid for, Andy will return the amount to the customer (to their wallet where the payment was made in the app). Phone numbers and similar contact details shared in chat may be hidden by the platform.</p>
+  <p>Customers must not knowingly withhold an agreed payment for properly completed work in violation of their agreement.</p>
+  <p>Any payment-related procedures introduced by Andy will be communicated to users through the relevant platform features or notices.</p>
 
-  <h2>8. Messages and notifications</h2>
-  <p>ANDY sends service messages such as chat alerts by email and browser notifications. You can turn browser notifications off in your browser settings.</p>
+  <h2>7. Quality of Work and Workmanship</h2>
+  <p>Service providers are expected to perform work with reasonable care and skill consistent with the agreed service.</p>
+  <p>For aluminum-related services, customers and service providers should agree in advance on relevant specifications, including measurements, materials, finishes, hardware, installation requirements, and other applicable details.</p>
+  <p><b>Measurements from the Andy tools are estimates only.</b> The Measure a Window tool and any photo-based measurement can be wrong. Always confirm the real size with a tape measure before anything is cut or fabricated.</p>
+  <p>Andy encourages both parties to document important specifications and approvals before fabrication or installation begins.</p>
+  <p>Andy may review complaints about service quality and take appropriate action against users who repeatedly engage in dishonest, unsafe, or unprofessional conduct.</p>
+  <p>Unless expressly agreed otherwise in writing, Andy does not automatically provide a separate written warranty beyond what is agreed for the job or required by law. Any warranty offered must be communicated clearly to the customer.</p>
 
-  <h2>9. Liability</h2>
-  <p>ANDY works hard to connect you with dependable artisans, but we cannot guarantee every outcome. To the extent the law allows, ANDY is not liable for indirect or consequential losses. Nothing here limits rights you have under the law that cannot be limited.</p>
+  <h2>8. Andy's Artisans</h2>
+  <p>The service providers who carry out jobs on Andy are Andy's own staff. They work on Andy's behalf, and Andy is responsible for the services they deliver as set out in these Terms and in applicable law.</p>
+  <p>Andy is starting with its own team of aluminum fabricators (alloy artisans). If Andy later works with independent service providers, it will make that clear on the platform.</p>
+  <p>Nothing in these Terms excludes any responsibility that Andy may have under applicable law.</p>
 
-  <h2>10. Changes</h2>
-  <p>We may update these terms. If we make a significant change we will tell you in the app. Using ANDY after a change means you accept the new terms.</p>
+  <h2>9. Safety and Property Protection</h2>
+  <p>Customers and service providers must take reasonable precautions to protect people and property during service delivery.</p>
+  <p>Service providers must use appropriate tools, equipment, and safety practices for their work. Customers should communicate relevant site hazards before work begins.</p>
+  <p>Neither party should request or carry out work in a manner that creates an unreasonable risk of injury or property damage.</p>
+  <p>Any incident involving injury, theft, property damage, or serious misconduct should be reported to Andy promptly where relevant.</p>
 
-  <h2>11. Contact</h2>
-  <p>Questions about these terms? Message ANDY from your account, or read our <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
+  <h2>10. Cancellations and Job Changes</h2>
+  <p>Customers and service providers should communicate cancellations, rescheduling requests, and changes to agreed job requirements as early as reasonably possible.</p>
+  <p>A customer can cancel a request from the job page before it has been paid for. After that, the customer should contact Andy through the job chat. Andy may also cancel a job where necessary.</p>
+  <p>Where a cancellation or change affects materials already purchased, work already completed, or other commitments, the parties should address those matters according to their existing agreement and applicable law.</p>
+  <p>Andy may establish additional cancellation and scheduling procedures as its services develop.</p>
+
+  <h2>11. Complaints and Dispute Resolution</h2>
+  <p>If a disagreement arises between a customer and a service provider, both parties are encouraged to communicate respectfully and attempt to resolve the issue directly.</p>
+  <p>Users may contact Andy through the in-app chat (Contact Andy), or through Feedback and Report a Bug, to report:</p>
+  <ul>
+    <li>Poor service or alleged defective workmanship.</li>
+    <li>Misrepresentation or suspected fraud.</li>
+    <li>Unprofessional conduct.</li>
+    <li>Disagreements concerning job specifications.</li>
+    <li>Payment disputes.</li>
+    <li>Safety concerns or property damage.</li>
+  </ul>
+  <p>Andy may review available information, request supporting evidence, and communicate with the parties where appropriate. Depending on the circumstances, Andy may issue warnings, restrict accounts, suspend access, or remove users who violate platform rules.</p>
+  <p>Andy does not guarantee that every dispute can be resolved through its internal process. Users retain any rights available to them under applicable law.</p>
+
+  <h2>12. Prohibited Activities</h2>
+  <p>Users must not:</p>
+  <ul>
+    <li>Use Andy for fraudulent, unlawful, or deceptive activities.</li>
+    <li>Submit false service requests.</li>
+    <li>Provide fake identities, qualifications, or business details.</li>
+    <li>Harass, threaten, discriminate against, or abuse other users.</li>
+    <li>Manipulate reviews, ratings, likes, or feedback.</li>
+    <li>Pay, or ask for or accept payment, for an Andy job outside Andy.</li>
+    <li>Damage or attempt to compromise Andy's website, systems, or data.</li>
+    <li>Use the platform to distribute malicious software or conduct unauthorized access.</li>
+    <li>Publish another person's confidential information without lawful authorization.</li>
+    <li>Circumvent platform procedures for fraudulent purposes.</li>
+  </ul>
+  <p>Andy may take appropriate action when these rules are violated.</p>
+
+  <h2>13. Reviews and Feedback</h2>
+  <p>Customers may be permitted to submit ratings, reviews, comments and likes about completed work shown on Andy. Reviews show the reviewer's first name and last initial.</p>
+  <p>All reviews must be honest, relevant, and based on genuine experience. Users must not submit fabricated reviews, threaten others with false reviews, or manipulate ratings.</p>
+  <p>Andy reserves the right to moderate or remove content that violates platform rules or applicable law.</p>
+
+  <h2>14. Privacy and Personal Information</h2>
+  <p>Andy collects and processes personal information necessary to operate the platform, manage accounts, facilitate service requests, provide support, and improve its services. This includes the details you give when you sign up and the requests, messages and photos you send.</p>
+  <p>Users agree to provide information lawfully and must not misuse personal information obtained through Andy.</p>
+  <p>Andy will handle personal information in accordance with its <a href="{{ url_for('privacy') }}">Privacy Policy</a> and applicable data protection laws. Please read the Privacy Policy to understand what is collected, where it is stored and who can see it.</p>
+
+  <h2>15. Platform Availability and Changes</h2>
+  <p>Andy aims to provide a useful and reliable service but does not guarantee uninterrupted access to its website or features.</p>
+  <p>Maintenance, technical issues, network failures, or other circumstances may temporarily affect availability.</p>
+  <p>Andy may introduce, modify, suspend, or discontinue platform features as its business develops, subject to applicable law and any relevant contractual obligations.</p>
+
+  <h2>16. Intellectual Property and Content</h2>
+  <p>The Andy name, logo, website design, original content, and other platform materials may be protected by intellectual property laws. Users may not copy, reproduce, modify, distribute, or commercially exploit protected Andy materials without authorization, except where permitted by law.</p>
+  <p>Users retain ownership of content they lawfully own and submit to Andy. By submitting content, users grant Andy permission to use, display, and process that content as reasonably necessary to operate, promote, and improve the platform, subject to applicable law and the Privacy Policy.</p>
+  <p>Photos and videos of completed work submitted by Andy's artisans are reviewed by Andy. Once approved, they may be shown publicly on Andy, including on the Our Work page and in Andy's promotion. Artisans confirm they have the right to share what they submit.</p>
+  <p>Users must not upload content that infringes another person's intellectual property rights.</p>
+
+  <h2>17. Limitation of Liability</h2>
+  <p>To the extent permitted by applicable law, Andy is not responsible for losses arising solely from circumstances outside its reasonable control, including third-party misconduct or inaccurate information supplied by users.</p>
+  <p>Andy is responsible for the services its artisans deliver as set out in these Terms and in applicable law. Andy is not responsible for losses caused by a customer's inaccurate information, a customer's failure to give access or follow agreed steps, or measurements the customer supplied.</p>
+  <p>Nothing in these Terms excludes or limits liability where such exclusion or limitation is prohibited by law, including any non-excludable consumer rights.</p>
+
+  <h2>18. Account Suspension and Termination</h2>
+  <p>Andy may restrict, suspend, or terminate a user's access where there are reasonable grounds to believe that the user:</p>
+  <ul>
+    <li>Has violated these Terms.</li>
+    <li>Has engaged in fraud, harassment, or serious misconduct.</li>
+    <li>Has compromised platform security.</li>
+    <li>Has repeatedly provided misleading information.</li>
+    <li>Has used Andy in a manner that creates a serious safety or legal concern.</li>
+  </ul>
+  <p>Where appropriate and legally permissible, Andy may notify the affected user of the reason for the action.</p>
+  <p>Users may stop using Andy at any time and may request account closure by messaging Andy through the in-app chat. Any obligations or rights that reasonably need to continue after account closure will remain effective to the extent permitted by law.</p>
+
+  <h2>19. Changes to These Terms</h2>
+  <p>Andy may update these Terms to reflect changes in its services, business operations, technology, or legal obligations.</p>
+  <p>Updated Terms will be published on this page with a revised effective date. Where required by law, Andy will provide notice of significant changes or obtain any necessary consent.</p>
+  <p>Continued use of Andy after updated Terms take effect constitutes acceptance only to the extent permitted by applicable law.</p>
+
+  <h2>20. Governing Law</h2>
+  <p>These Terms are governed by the laws of the Federal Republic of Nigeria, subject to applicable conflict-of-law rules and mandatory legal protections.</p>
+  <p>Any dispute will be handled through the courts or other dispute-resolution mechanisms with appropriate jurisdiction, subject to applicable law.</p>
+
+  <h2>21. Contact and Support</h2>
+  <p>For questions, complaints, or concerns about these Terms, contact Andy through the in-app chat (Contact Andy) after logging in{% if contact.email %}, or by email{% endif %}.</p>
+  <p>
+    <b>Platform:</b> Andy<br>
+    <b>Website:</b> {{ request.host_url.rstrip('/') }}
+    {% if contact.email %}<br><b>Support email:</b> <a href="mailto:{{ contact.email }}">{{ contact.email }}</a>{% endif %}
+    {% if contact.phone %}<br><b>Phone:</b> {{ contact.phone }}{% endif %}
+    {% if contact.address %}<br><b>Business address:</b> {{ contact.address }}{% endif %}
+  </p>
+
+  <p style="margin-top:28px;"><b>By creating an account or using Andy, you acknowledge that you have read and understood these Terms and agree to comply with them.</b></p>
 </div>
 {% endblock %}
 ''',
@@ -3010,28 +3156,37 @@ MORE_TEMPLATES_3 = {
   <div class="legal-date">Last updated: October 2026</div>
   <p>This policy explains what ANDY collects, why, and the choices you have.</p>
 
-  <h2>What we collect</h2>
+  <h2>The details we collect</h2>
   <ul>
-    <li><b>Account details:</b> your name, email address and a scrambled (hashed) password. If you use Google sign-in we receive your name and email from Google.</li>
-    <li><b>Job information:</b> the requests you make, messages, photos, videos and files you send, window measurements you save, and reviews or likes you post.</li>
-    <li><b>Notification settings:</b> if you turn on browser notifications, your browser gives us a device address so we can send them.</li>
-    <li><b>Basic technical data:</b> cookies that keep you logged in and remember your light or dark mode choice.</li>
+    <li><b>When you sign up:</b> your name, your email address and a password. Your password is stored scrambled, so nobody at ANDY can read it. If you sign in with Google, we receive your name and email from Google.</li>
+    <li><b>When you use ANDY:</b> the service requests you send (title, description, category, and any photos or files), your chat messages and attachments, window measurements and photos you save, and the reviews and likes you post.</li>
+    <li><b>Optional:</b> a profile photo and short bio, and a device address if you turn on browser notifications.</li>
+    <li><b>Artisans:</b> a phone number and work category, added by ANDY.</li>
+    <li><b>Payments:</b> if payments are switched on, the amounts and references of your wallet top-ups and jobs. We never see or store your card details. The payment provider handles those.</li>
+    <li><b>Small files in your browser:</b> a login cookie, and your light or dark mode choice.</li>
   </ul>
+  <p>We do <b>not</b> collect your card numbers, your exact location or your ID documents.</p>
 
-  <h2>How we use it</h2>
+  <h2>Where your details go</h2>
   <ul>
-    <li>To run ANDY: match you with an artisan, show job chats and send alerts.</li>
-    <li>To keep the service safe and fix problems.</li>
-    <li>To show approved work, reviews and likes on the Our Work page. Reviews show your first name and last initial only.</li>
+    <li><b>Our database:</b> your account and job details are stored in {% if db_supabase %}a database hosted by <b>Supabase</b>{% else %}our secure server database{% endif %}.</li>
+    <li><b>Website hosting:</b> the ANDY website runs on Render.</li>
+    <li><b>Photos and videos:</b> stored with Cloudinary (when switched on), otherwise on our server.</li>
+    <li><b>Emails:</b> alerts and password-reset emails are sent through an email service (Gmail).</li>
+    <li><b>Notifications:</b> if you turn them on, they travel through your browser's own push service (for example Google, Apple or Mozilla).</li>
+    <li><b>Google sign-in and payments:</b> Google, and Paystack when payments are switched on, only when you choose to use them.</li>
   </ul>
 
   <h2>Who can see it</h2>
   <ul>
-    <li>ANDY's team can see accounts, jobs and chats so we can manage the service.</li>
-    <li>The artisan assigned to your job can see that job and its chat.</li>
-    <li>Service providers that help us run ANDY, for example media storage (such as Cloudinary), email delivery, browser notification services and payment providers, only receive what they need to do their part.</li>
+    <li>The ANDY team can see accounts, requests and chats so we can run the service.</li>
+    <li>The artisan assigned to your job can see that job, its photos and its chat. Other artisans cannot.</li>
+    <li>The public only sees work photos and reviews that ANDY has approved. Reviews show only your first name and last initial.</li>
     <li>We do not sell your personal information.</li>
   </ul>
+
+  <h2>How long we keep it</h2>
+  <p>We keep your details while your account is open. To have your account and details deleted, message ANDY from your account.</p>
 
   <h2>Cookies</h2>
   <p>We use a login cookie so you stay signed in and a small preference cookie for dark mode. We do not use advertising cookies.</p>
@@ -4584,7 +4739,9 @@ body.dark-mode .mode-switch.sm .ms-knob { transform: translateX(22px); }
 .app-footer { text-align: center; font-size: 12px; color: var(--text-muted); padding: 6px 16px 26px; }
 .app-footer a { color: var(--text-muted); text-decoration: underline; }
 @media (max-width: 720px) { .app-footer { padding-bottom: 86px; } .mobile-topbar .mode-switch { margin-right: 4px; } }
-.legal { max-width: 780px; margin: 0 auto; padding: 8px 0 30px; } .legal h1 { font-size: clamp(28px,4vw,38px); letter-spacing: -.02em; margin-bottom: 6px; } .legal .legal-date { color: var(--text-muted); font-size: 14px; margin-bottom: 26px; } .legal h2 { font-size: 19px; margin: 28px 0 8px; } .legal p, .legal li { color: var(--text-muted); line-height: 1.75; font-size: 15.5px; } .legal ul { margin: 8px 0 8px 22px; } .legal a { color: var(--accent); font-weight: 600; }
+.legal { max-width: 780px; margin: 0 auto; padding: 8px 0 30px; } .legal h1 { font-size: clamp(28px,4vw,38px); letter-spacing: -.02em; margin-bottom: 6px; } .legal .legal-date { color: var(--text-muted); font-size: 14px; margin-bottom: 26px; } .legal h2 { font-size: 19px; margin: 28px 0 8px; } .legal p, .legal li { color: var(--text-muted); line-height: 1.75; font-size: 15.5px; }
+.legal p { margin-bottom: 14px; }
+.legal li { margin-bottom: 6px; } .legal ul { margin: 8px 0 8px 22px; } .legal a { color: var(--accent); font-weight: 600; }
 
 
 .sidebar .bottom-links .mode-row .mode-switch { display: block; width: 48px; height: 26px; padding: 0; position: relative; border: 1px solid var(--border); background: #E8EDF4; border-radius: 999px; flex-shrink: 0; }
@@ -4613,6 +4770,8 @@ body.dark-mode .sidebar .bottom-links .mode-row .mode-switch:hover { background:
   /* fewer always-on animations on phones: smoother and kinder to the battery */
   .svc-art .svc-svg, .svc-shine, .svc-twinkle, .hero-default-bg svg, .hero-default-bg g[fill="#22C55E"] rect { animation: none !important; }
 }
+
+.pay-note { margin-bottom: 14px; font-size: 13.5px; border-color: var(--accent); }
 
 /* --- Splash screen --- */
 html.no-splash #splash { display: none; }
@@ -4703,7 +4862,8 @@ body.dark-mode .msg.them { background: #202C33; color: #E9EDEF; }
 .msg-meta { float: right; margin: 6px 0 0 10px; font-size: 10.5px; color: rgba(0,0,0,0.45); white-space: nowrap; }
 body.dark-mode .msg-meta { color: rgba(255,255,255,0.55); }
 .ticks { font-size: 12px; letter-spacing: -2px; color: #8696A0; }
-.ticks-read { color: #34B7F1; }
+.ticks-read { color: #16A34A; font-weight: 700; }
+body.dark-mode .ticks-read { color: #4ADE80; }
 .msg::after { content: ""; display: block; clear: both; }
 .unread-badge { background: #25D366 !important; color: #fff; min-width: 20px; text-align: center; }
 .unread-dot { background: #25D366 !important; color: #fff; }
@@ -4811,7 +4971,7 @@ def inject_unread_count():
     user = current_user()
     out = {"admin_unread_count": 0, "customer_unread_count": 0, "pending_work_count": 0,
            "default_mode": "dark" if os.environ.get("DEFAULT_MODE", "light").lower() == "dark" else "light",
-           "current_year": datetime.now().year,
+           "current_year": datetime.now().year, "db_supabase": supabase_db_configured(),
            "contact": {"phone": os.environ.get("CONTACT_PHONE", ""), "whatsapp": "".join(c for c in os.environ.get("CONTACT_WHATSAPP", "") if c.isdigit()),
                        "email": os.environ.get("CONTACT_EMAIL", ""), "address": os.environ.get("CONTACT_ADDRESS", "")}}
     if not user:
