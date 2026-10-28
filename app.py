@@ -460,6 +460,20 @@ def _notify_push(sender, job, text, attachment_kind):
     })
 
 
+def _notify_owner_new_request(sender, job, text, kind="service request"):
+    """Email + push the owner when a customer opens a new request. Never raises:
+    a failed alert must not turn a saved request into an error for the customer."""
+    try:
+        name = sender.get("name") or "A customer"
+        link = url_for("job_thread", job_id=job["id"], _external=True)
+        body = (f"{name} sent a new {kind}: \"{job.get('title', '')}\"\n\n"
+                f"{(text or '').strip()[:1500]}\n\nOpen it here: {link}\n")
+        send_email_async(NOTIFY_EMAIL, f"📋 New {kind} from {name}", body)
+        _notify_push(sender, job, f"New {kind}: {job.get('title', '')}", None)
+    except Exception as exc:
+        print("[ANDY] New-request alert failed:", exc)
+
+
 VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:" + NOTIFY_EMAIL)
 PUSH_ICON_PNG = base64.b64decode("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")
 
@@ -646,14 +660,36 @@ REQUEST_CHIPS = [("Windows", "Windows"), ("Doors", "Doors"), ("Partitions", "Par
                  ("Maintenance", "Repairs & maintenance"), ("Aluminum Fabrication", "Custom aluminum work"), ("Other", "Something else")]
 # The "Explore Services" page: one section per service. Photos come from the catalogue (products table).
 SERVICES = [
-    {"slug": "windows", "name": "Windows", "cat": "Windows", "art": 0, "blurb": "Sliding and fixed aluminum windows, made to size."},
-    {"slug": "doors", "name": "Doors", "cat": "Doors", "art": 1, "blurb": "Strong, smooth-running aluminum and glass doors."},
-    {"slug": "partitioning", "name": "Partitioning", "cat": "Partitions", "art": 2, "blurb": "Glass and aluminum partitions for offices and homes."},
-    {"slug": "curtain-walls", "name": "Curtain Walls", "cat": "Curtain Walls", "art": 3, "blurb": "Sleek glass facades for modern buildings."},
-    {"slug": "maintenance", "name": "Maintenance", "cat": "Maintenance", "art": 4, "blurb": "Repairs, servicing and quick fixes."},
-    {"slug": "custom", "name": "Custom Solutions", "cat": "Custom Solutions", "art": None, "blurb": "Gates, rails and other made-to-order aluminum work."},
+    {"slug": "windows", "name": "Windows", "cat": "Windows", "art": 0, "blurb": "Sliding and fixed aluminum windows, made to size.",
+     "good_for": "Homes, shops and offices.",
+     "consider": "The room and how the window should open, ventilation, security, weather exposure, and an accurate opening size."},
+    {"slug": "doors", "name": "Doors", "cat": "Doors", "art": 1, "blurb": "Strong, smooth-running aluminum and glass doors.",
+     "good_for": "Entrances and other openings in homes and commercial buildings.",
+     "consider": "Where the door will be used, how it should open, glass choice, security, and the size and condition of the opening."},
+    {"slug": "partitioning", "name": "Partitioning", "cat": "Partitions", "art": 2, "blurb": "Glass and aluminum partitions for offices and homes.",
+     "good_for": "Dividing offices, shops and rooms at home.",
+     "consider": "The layout, how much light and privacy you want, whether you need a door, and the condition of the floor and ceiling."},
+    {"slug": "curtain-walls", "name": "Curtain Walls", "cat": "Curtain Walls", "art": 3, "blurb": "Sleek glass facades for modern buildings.",
+     "good_for": "Glazed building fronts and facades.",
+     "consider": "These depend on the building's structure and its exposure to wind and weather, so they need professional assessment and installation."},
+    {"slug": "maintenance", "name": "Maintenance", "cat": "Maintenance", "art": 4, "blurb": "Repairs, servicing and quick fixes.",
+     "good_for": "Existing aluminium windows, doors and fittings that need attention.",
+     "consider": "Describe the problem and add photos. Please don't remove heavy glass or work at height yourself."},
+    {"slug": "custom", "name": "Custom Solutions", "cat": "Custom Solutions", "art": None, "blurb": "Gates, rails and other made-to-order aluminum work.",
+     "good_for": "Gates, rails and other made-to-order aluminium work.",
+     "consider": "Tell us what it is for and where it will go. A photo or sketch helps, and the design may need on-site measurement."},
 ]
 JOB_STATUSES = ["submitted", "assigned", "in_progress", "completed", "cancelled"]
+# Consultation form on the Explore Services page (requests are saved as normal jobs, so they use the same thread, attachments and alerts)
+CONSULT_TOPICS = [
+    "Choosing a suitable product",
+    "What to measure and prepare",
+    "Repair or maintenance advice",
+    "Installation questions",
+    "Whether I need an on-site assessment",
+    "Something else",
+]
+CONSULT_DIMENSION_CATS = ("Windows", "Doors", "Partitions", "Curtain Walls")
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -3531,17 +3567,16 @@ MORE_TEMPLATES_3 = {
 ''',
 
 "services.html": '''{% extends "base.html" %}
-{% block title %}Services | ANDY{% endblock %}
+{% block title %}Explore Services | ANDY{% endblock %}
 {% block content %}
+{% macro rq_link(cat, label, cls) -%}
+{% if user and user.role == 'customer' %}<a class="{{ cls }}" href="{{ url_for('request_service', category=cat) }}">{{ label }}</a>{% elif not user %}<a class="{{ cls }}" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">{{ label }}</a>{% endif %}
+{%- endmacro %}
 <div class="svcp-head">
-  <span class="lp-eyebrow">Services</span>
-  <h1 class="lp-title">What we make and fix</h1>
-  <p class="lp-lead">Aluminum (alloy) windows, doors, partitions, curtain walls and maintenance. Tap any photo to see it full size.</p>
+  <span class="lp-eyebrow">Explore services</span>
+  <h1 class="lp-title">Aluminium doors, windows, partitions and more</h1>
+  <p class="lp-lead">Browse what we make and fix, see what each is suited to, and ask for advice if you are not sure what fits your building. Tap a photo to see it full size.</p>
 </div>
-
-<nav class="svcp-tabs" aria-label="Service categories">
-  {% for sv in sections %}<a href="#{{ sv.slug }}">{{ sv.name }}</a>{% endfor %}
-</nav>
 
 {% if user and user.role == 'owner' %}
 <details class="svcp-upload" id="add" {{ 'open' if add_cat }}>
@@ -3567,9 +3602,12 @@ MORE_TEMPLATES_3 = {
     <div class="svcp-sec-text">
       <h2>{{ sv.name }}</h2>
       <p>{{ sv.blurb }}</p>
+      <dl class="svcp-info">
+        <div><dt>Suited to</dt><dd>{{ sv.good_for }}</dd></div>
+        <div><dt>Consider</dt><dd>{{ sv.consider }}</dd></div>
+      </dl>
       <div class="svcp-actions">
-        {% if user and user.role == 'customer' %}<a class="btn btn-purple" href="{{ url_for('request_service', category=sv.cat) }}">Request {{ sv.name|lower }}</a>
-        {% elif not user %}<a class="btn btn-purple" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Request {{ sv.name|lower }}</a>{% endif %}
+        {{ rq_link(sv.job_cat, 'Request ' ~ (sv.name|lower), 'btn btn-purple') }}
         {% if sv['items']|selectattr('price', 'gt', 0)|list %}<a class="btn btn-outline" href="{{ url_for('catalog', cat=sv.cat) }}">Order from catalogue</a>{% endif %}
         {% if user and user.role == 'owner' %}<a class="btn btn-outline" href="{{ url_for('services', add=sv.cat) }}#add">＋ Add photos</a>{% endif %}
       </div>
@@ -3582,13 +3620,20 @@ MORE_TEMPLATES_3 = {
     <figure class="svcp-item">
       {% if p.image_filename %}
         {% set pu = p.image_filename|photo_url("products") %}
-        <div class="pimg" style="--bg:url('{{ pu }}');"><img src="{{ pu }}" alt="{{ p.name }}" loading="lazy" data-lightbox="svc-{{ sv.slug }}" data-full="{{ pu }}" data-caption="{{ p.name }}"></div>
+        <div class="pimg" style="--bg:url('{{ pu }}');"><img src="{{ pu }}" alt="{{ p.name }}" loading="lazy" data-lightbox="svc-{{ sv.slug }}" data-full="{{ pu }}" data-caption="{{ p.name }}" onerror="this.closest('.pimg').classList.add('pimg-broken')"></div>
       {% elif p.video_url %}
         <video class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}#t=0.1"></video>
+      {% else %}
+        <div class="pimg pimg-art">{{ category_graphic(p.category)|safe }}</div>
       {% endif %}
       <figcaption>
         <b>{{ p.name }}</b>
         <span>{% if p.price > 0 %}₦{{ "{:,}".format(p.price) }}{% else %}Ask for a quote{% endif %}</span>
+        <details class="svcp-more">
+          <summary>Details</summary>
+          <p>{{ p.description or 'Ask us for more details about this one.' }}</p>
+          {{ rq_link(sv.job_cat, 'Ask about this →', 'svcp-ask') }}
+        </details>
         {% if user and user.role == 'owner' %}
         <form method="POST" action="{{ url_for('delete_product', product_id=p.id) }}" onsubmit="return confirm('Remove this photo?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="next" value="{{ url_for('services') }}#{{ sv.slug }}"><button class="svcp-del" type="submit">Remove</button></form>
         {% endif %}
@@ -3602,10 +3647,93 @@ MORE_TEMPLATES_3 = {
 </section>
 {% endfor %}
 
+<section class="cons" id="consultation" aria-labelledby="consTitle">
+  <div class="cons-intro">
+    <span class="lp-eyebrow">Consultation</span>
+    <h2 id="consTitle">Professional Aluminium Consultation</h2>
+    <p>Not sure which door, window or partition suits your building? Tell us about your project and what you are considering. We will help you understand your options and what needs to be confirmed before anything is made or fitted.</p>
+    <p class="cons-prep-title">Helpful to have ready</p>
+    <ul class="cons-prep">
+      <li>Where the work is, and what the space is used for</li>
+      <li>Photos of the opening from inside and outside</li>
+      <li>Rough width and height, only if you can measure safely from the floor</li>
+      <li>Any concerns about security, ventilation or weather</li>
+    </ul>
+  </div>
+  <div class="cons-safety" role="note">
+    <b>Your safety comes first.</b> Our guidance helps you understand your options and make informed decisions. Some projects require professional measurements, an on-site assessment, or specialist installation. Do not attempt work that could put you or others at risk.
+    <span>Never climb, lean out of a window, or remove glass or frames just to take a measurement. Heavy glass and sharp aluminium edges can cause serious injury.</span>
+  </div>
+
+  {% if user and user.role == 'customer' %}
+  <form class="cons-form" id="consForm" method="POST" action="{{ url_for('consultation_request') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    {% if consult_error %}<div class="cons-err" role="alert">{{ consult_error }}</div>{% endif %}
+    <p class="cons-as">Sending as <b>{{ user.name }}</b> ({{ user.email }}). We use your account details to reply to you in the conversation for this request.</p>
+    <div class="cons-row">
+      <div class="cons-field">
+        <label for="consCat">Service category</label>
+        <select id="consCat" name="category" required>
+          <option value="" disabled {{ 'selected' if not cf.category }}>Choose one</option>
+          {% for c in chips %}<option value="{{ c.value }}" {{ 'selected' if cf.category == c.value }}>{{ c.label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="cons-field">
+        <label for="consTopic">Help needed</label>
+        <select id="consTopic" name="topic" required>
+          <option value="" disabled {{ 'selected' if not cf.topic }}>Choose one</option>
+          {% for t in consult_topics %}<option value="{{ t }}" {{ 'selected' if cf.topic == t }}>{{ t }}</option>{% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="cons-field">
+      <label for="consDesc">Your project</label>
+      <textarea id="consDesc" name="description" rows="4" minlength="10" maxlength="3000" required placeholder="What do you need, and what is the space used for?">{{ cf.description }}</textarea>
+    </div>
+    <div class="cons-row">
+      <div class="cons-field">
+        <label for="consLoc">Project area <small>(optional)</small></label>
+        <input id="consLoc" name="location" type="text" maxlength="120" value="{{ cf.location }}" placeholder="Town or area">
+      </div>
+      <div class="cons-field" id="consDims">
+        <label for="consDim">Approximate size <small>(optional)</small></label>
+        <input id="consDim" name="dimensions" type="text" maxlength="200" value="{{ cf.dimensions }}" placeholder="e.g. width x height">
+        <span class="cons-hint">Only measure what you can reach safely from the floor. We will confirm exact sizes before anything is made.</span>
+      </div>
+    </div>
+    <div class="cons-field">
+      <label for="consFiles">Photos <small>(optional, up to 6)</small></label>
+      <input id="consFiles" name="attachments" type="file" accept="image/*,.pdf" multiple>
+    </div>
+    <button class="btn btn-purple cons-submit" id="consSubmit" type="submit">Request a consultation</button>
+  </form>
+  <script>
+  (function() {
+    var f = document.getElementById('consForm'); if (!f) return;
+    var cat = document.getElementById('consCat'), dims = document.getElementById('consDims');
+    var withSize = {{ consult_dim_cats|tojson }};
+    function sync() { dims.hidden = !(cat.value === '' || withSize.indexOf(cat.value) > -1); }
+    cat.addEventListener('change', sync); sync();
+    f.addEventListener('submit', function() {
+      var b = document.getElementById('consSubmit'); b.disabled = true; b.textContent = 'Sending…';
+    });
+    {% if consult_error %}document.getElementById('consultation').scrollIntoView({block: 'start'});{% endif %}
+  })();
+  </script>
+  {% elif not user %}
+  <div class="cons-login">
+    <p>Log in or create an account to send a consultation request. It takes a minute, and you can follow the conversation afterwards.</p>
+    <a class="btn btn-purple" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Log in to request a consultation</a>
+  </div>
+  {% else %}
+  <p class="cons-login">Consultation requests are sent from customer accounts.</p>
+  {% endif %}
+</section>
+
 <div class="svcp-foot">
-  <p>Not sure which service you need? Tell Andy and we will help.</p>
-  {% if user and user.role == 'customer' %}<a class="btn btn-purple" href="{{ url_for('request_service') }}">Request a Service</a>
-  {% elif not user %}<a class="btn btn-purple" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Request a Service</a>{% endif %}
+  <h3>Ready to Discuss Your Project?</h3>
+  <p>Tell us what you need and we will take it from there.</p>
+  {{ rq_link('', 'Request a Service', 'btn btn-purple') }}
 </div>
 {% endblock %}
 ''',
@@ -5337,15 +5465,10 @@ body.dark-mode .sidebar .bottom-links .mode-row .mode-switch:hover { background:
 .svc-all { margin-top: 16px; text-align: center; }
 .svc-all .btn { padding: 11px 26px; border-radius: 999px; }
 .svcp-head { max-width: 640px; margin: 4px 0 14px; }
-.svcp-tabs { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; padding: 4px 2px 10px; position: sticky; top: 0; z-index: 20; background: var(--bg); }
-.svcp-tabs::-webkit-scrollbar { display: none; }
-@media (min-width: 721px) { body.guest-site .svcp-tabs { top: 58px; } }
-.svcp-tabs a { flex: 0 0 auto; padding: 9px 16px; min-height: 40px; display: inline-flex; align-items: center; border: 1px solid var(--border); border-radius: 999px; font-size: 14px; font-weight: 600; color: var(--navy); text-decoration: none; background: var(--card-bg); }
-.svcp-tabs a:hover { border-color: var(--accent); color: var(--accent); }
 .svcp-upload { margin: 8px 0 18px; border: 1px dashed var(--accent); border-radius: 14px; padding: 12px 16px; background: var(--card-bg); }
 .svcp-upload summary { cursor: pointer; font-weight: 700; color: var(--accent); min-height: 32px; display: flex; align-items: center; }
 .svcp-upload form { margin-top: 12px; }
-.svcp-sec { padding: 26px 0 8px; scroll-margin-top: 130px; border-top: 1px solid var(--border); margin-top: 14px; }
+.svcp-sec { padding: 26px 0 8px; scroll-margin-top: 80px; border-top: 1px solid var(--border); margin-top: 14px; }
 .svcp-sec:first-of-type { border-top: none; }
 .svcp-sec-head { display: flex; gap: 18px; align-items: center; margin-bottom: 14px; }
 .svcp-art { flex: 0 0 150px; border-radius: 14px; background: #EDF2F8; padding: 6px; display: flex; align-items: center; justify-content: center; min-height: 112px; }
@@ -5367,6 +5490,57 @@ body.dark-mode .svcp-art { background: rgba(7,12,26,.55); }
 .svcp-empty { padding: 22px 14px; }
 .svcp-foot { text-align: center; padding: 30px 0 6px; color: var(--text-muted); }
 .svcp-foot .btn { margin-top: 10px; padding: 12px 26px; border-radius: 999px; }
+.svcp-foot h3 { font-size: 18px; color: var(--navy); margin: 0 0 4px; }
+.svcp-foot p { margin: 0; }
+.svcp-grid { align-items: start; }
+.svcp-info { display: grid; gap: 6px; margin: 2px 0 12px; font-size: 13.5px; line-height: 1.45; }
+.svcp-info div { display: flex; gap: 8px; }
+.svcp-info dt { flex: 0 0 74px; font-weight: 700; color: var(--navy); }
+.svcp-info dd { margin: 0; color: var(--text-muted); }
+.svcp-more { margin-top: 4px; }
+.svcp-more summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--accent); min-height: 32px; display: flex; align-items: center; list-style: none; }
+.svcp-more summary::-webkit-details-marker { display: none; }
+.svcp-more summary::after { content: "▾"; margin-left: 6px; }
+.svcp-more[open] summary::after { content: "▴"; }
+.svcp-more p { margin: 2px 0 8px; font-size: 13px; line-height: 1.5; color: var(--text-muted); white-space: pre-line; overflow-wrap: anywhere; }
+.svcp-ask { font-size: 13px; font-weight: 700; color: var(--accent); text-decoration: none; display: inline-block; padding: 4px 0 6px; }
+.pimg-broken img { visibility: hidden; }
+.pimg-broken::before { display: none; }
+.pimg-broken { background: var(--card-bg); }
+.pimg-broken::after { content: "Photo unavailable"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--text-muted); }
+
+/* Professional consultation */
+.cons { margin: 36px auto 0; padding: 22px 20px; max-width: 760px; border: 1px solid var(--border); border-radius: 14px; background: var(--card-bg); scroll-margin-top: 80px; }
+.cons-intro h2 { font-size: 22px; color: var(--navy); margin: 2px 0 6px; }
+.cons-intro p { font-size: 14.5px; line-height: 1.55; color: var(--text-muted); margin: 0 0 10px; }
+.cons-intro .cons-prep-title { font-size: 13.5px; font-weight: 700; color: var(--navy); margin-bottom: 4px; }
+.cons-prep { margin: 0 0 16px; padding-left: 18px; font-size: 14px; line-height: 1.6; color: var(--text-muted); }
+.cons-safety { border-left: 4px solid var(--accent); background: var(--bg); padding: 12px 14px; border-radius: 0 10px 10px 0; font-size: 14px; line-height: 1.55; color: var(--navy); margin: 0 0 20px; }
+.cons-safety span { display: block; margin-top: 6px; font-size: 13px; color: var(--text-muted); }
+.cons-form { display: flex; flex-direction: column; gap: 14px; }
+.cons-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.cons-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.cons-field[hidden] { display: none; }
+.cons-field label { font-size: 13px; font-weight: 600; color: var(--navy); }
+.cons-field label small { font-weight: 400; color: var(--text-muted); }
+.cons-field input, .cons-field select, .cons-field textarea { width: 100%; box-sizing: border-box; min-height: 44px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 16px; font-family: inherit; background: var(--bg); color: var(--navy); }
+.cons-field textarea { min-height: 100px; resize: vertical; }
+.cons-field input[type=file] { padding: 8px; font-size: 14px; }
+.cons-hint { font-size: 12px; line-height: 1.4; color: var(--text-muted); }
+.cons-as { margin: 0; font-size: 13px; color: var(--text-muted); overflow-wrap: anywhere; }
+.cons-err { background: rgba(239,68,68,.1); border: 1px solid #ef4444; color: #b91c1c; border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+body.dark-mode .cons-err { color: #fca5a5; }
+.cons-submit { align-self: flex-start; padding: 12px 24px; border-radius: 999px; }
+.cons-submit:disabled { opacity: .6; cursor: default; }
+.cons-login { font-size: 14px; color: var(--text-muted); margin: 0; }
+.cons-login p { margin: 0 0 10px; }
+.cons-login .btn { border-radius: 999px; }
+@media (max-width: 720px) {
+  .cons { padding: 18px 14px; margin-top: 28px; }
+  .cons-row { grid-template-columns: 1fr; }
+  .cons-submit { align-self: stretch; }
+  .svcp-info dt { flex-basis: 64px; }
+}
 @media (max-width: 720px) {
   .svcp-sec-head { flex-direction: column; align-items: stretch; gap: 10px; }
   .svcp-art { flex-basis: auto; min-height: 120px; }
@@ -5982,19 +6156,105 @@ def reset_password(token):
 # SERVICE REQUESTS + JOB THREAD (chat lives here, tied to a job)
 # ---------------------------------------------------------------------------
 
-@app.route("/services")
-def services():
-    user = current_user()
+def _render_services(user, consult_form=None, consult_error="", status=200):
     conn = get_db()
     rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
     conn.close()
     by_cat = {}
     for r in rows:
         by_cat.setdefault(r["category"], []).append(_product_dict(r))
-    sections = [dict(sv, items=by_cat.get(sv["cat"], [])) for sv in SERVICES]
+    # "Custom Solutions" photos have no matching job category, so requests for them go in as custom aluminum work
+    sections = [dict(sv, items=by_cat.get(sv["cat"], []),
+                     job_cat=sv["cat"] if sv["cat"] in JOB_CATEGORIES else "Aluminum Fabrication") for sv in SERVICES]
     add_cat = request.args.get("add", "")
-    return render_template("services.html", user=user, sections=sections, product_categories=PRODUCT_CATEGORIES,
-                           add_cat=add_cat if add_cat in PRODUCT_CATEGORIES else "", active_page="services", auto_open_auth=False)
+    html = render_template("services.html", user=user, sections=sections, product_categories=PRODUCT_CATEGORIES,
+                           add_cat=add_cat if add_cat in PRODUCT_CATEGORIES else "", active_page="services", auto_open_auth=False,
+                           chips=[{"value": v, "label": l} for v, l in REQUEST_CHIPS], consult_topics=CONSULT_TOPICS,
+                           consult_dim_cats=list(CONSULT_DIMENSION_CATS),
+                           cf=consult_form or {}, consult_error=consult_error)
+    return html, status
+
+
+@app.route("/services")
+def services():
+    return _render_services(current_user())
+
+
+@app.route("/consultation", methods=["GET", "POST"])
+def consultation_request():
+    if request.method == "GET":
+        return redirect(url_for("services") + "#consultation")
+    user = require_login()
+    if not user or not is_customer(user):
+        flash("Log in as a customer to send a consultation request.", "error")
+        return redirect(url_for("services") + "#consultation")
+
+    labels = dict(REQUEST_CHIPS)
+    form = {
+        "category": request.form.get("category", ""),
+        "topic": request.form.get("topic", ""),
+        "description": request.form.get("description", "").strip()[:3000],
+        "location": " ".join(request.form.get("location", "").split())[:120],
+        "dimensions": " ".join(request.form.get("dimensions", "").split())[:200],
+    }
+    if form["category"] not in labels:
+        return _render_services(user, form, "Please choose the service category your question is about.", 400)
+    if form["topic"] not in CONSULT_TOPICS:
+        return _render_services(user, form, "Please choose the kind of help you need.", 400)
+    if len(form["description"]) < 10:
+        return _render_services(user, form, "Please describe your project in at least a sentence, so we know what to advise on.", 400)
+
+    category, label, topic = form["category"], labels[form["category"]], form["topic"]
+    title = f"Consultation: {label} - {topic}"[:120]
+    lines = ["Consultation request", f"Help needed: {topic}", f"Service category: {label}"]
+    if form["location"]:
+        lines.append(f"Project location: {form['location']}")
+    if form["dimensions"]:
+        lines.append(f"Dimensions given by customer (not verified): {form['dimensions']}")
+    description = "\n".join(lines) + "\n\n" + form["description"]
+
+    conn = None
+    try:
+        conn = get_db()
+        dup = conn.execute(
+            "SELECT id FROM jobs WHERE customer_id=? AND title=? AND description=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1",
+            (user["id"], title, description)).fetchone()
+        if dup:  # the same request was already sent (double tap or page refresh), so don't create a second one
+            job_id = dup["id"]
+            conn.close()
+            flash("You already sent this request. Here is its conversation.", "success")
+            return redirect(url_for("job_thread", job_id=job_id))
+        cur = conn.execute(
+            "INSERT INTO jobs (customer_id, title, description, category, track, status) VALUES (?, ?, ?, ?, 'standard', 'submitted')",
+            (user["id"], title, description, category))
+        job_id = cur.lastrowid
+        skipped = 0
+        files = [f for f in request.files.getlist("attachments") if f and f.filename]
+        for f in files[:6]:
+            stored, kind = _save_attachment(f, ATTACHMENTS_UPLOAD_DIR)
+            if stored:
+                conn.execute("INSERT INTO job_attachments (job_id, filename, kind) VALUES (?, ?, ?)", (job_id, stored, kind))
+            else:
+                skipped += 1
+        skipped += max(0, len(files) - 6)
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print("[ANDY] Consultation request failed:", exc)
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return _render_services(user, form, "Sorry, we could not send your request just now and nothing was submitted. Please try again.", 500)
+
+    _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category,
+                                     "customer_id": user["id"], "artisan_id": None}, description, "consultation request")
+    msg = "Your consultation request has been sent. You can follow up in this conversation."
+    if skipped:
+        msg += f" {skipped} file{'s' if skipped != 1 else ''} could not be attached (photos and PDF, Word, Excel or text files only, up to 6)."
+    flash(msg, "success")
+    return redirect(url_for("job_thread", job_id=job_id))
 
 
 @app.route("/services/add", methods=["POST"])
@@ -6059,6 +6319,8 @@ def request_service():
                 conn.execute("INSERT INTO job_attachments (job_id, filename, kind) VALUES (?, ?, ?)", (job_id, stored, kind))
         conn.commit()
         conn.close()
+        _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category,
+                                         "customer_id": user["id"], "artisan_id": None}, description)
         flash("Request submitted! Andy will review it shortly.", "success")
         return redirect(url_for("job_thread", job_id=job_id))
 
