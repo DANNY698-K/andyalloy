@@ -680,16 +680,197 @@ SERVICES = [
      "consider": "Tell us what it is for and where it will go. A photo or sketch helps, and the design may need on-site measurement."},
 ]
 JOB_STATUSES = ["submitted", "assigned", "in_progress", "completed", "cancelled"]
-# Consultation form on the Explore Services page (requests are saved as normal jobs, so they use the same thread, attachments and alerts)
-CONSULT_TOPICS = [
-    "Choosing a suitable product",
-    "What to measure and prepare",
-    "Repair or maintenance advice",
-    "Installation questions",
-    "Whether I need an on-site assessment",
-    "Something else",
-]
-CONSULT_DIMENSION_CATS = ("Windows", "Doors", "Partitions", "Curtain Walls")
+# Guided consultation (Explore Services > "Start your consultation"). Everything the customer reads comes from this
+# structure: edit the wording here. Rules show their text when every key in "when" matches the customer's answers
+# ("*" = any answer given, "__none" = question skipped). Nothing here is a price, specification or promise.
+_NOT_SURE = {"v": "unsure", "label": "Not sure yet"}
+_FLOOR = [{"v": "ground", "label": "Ground floor"}, {"v": "upper", "label": "Upper floor"}, {"v": "unsure", "label": "Not sure"}]
+_JOB = [{"v": "new", "label": "New (nothing there now)"}, {"v": "replace", "label": "Replacing an existing one"}, {"v": "repair", "label": "Repairing an existing one"}]
+_SIZE_HINT = "Only measure what you can reach safely from the floor. A rough estimate is fine, for example 120 cm wide by 100 cm high."
+_COST_TXT = "Cost mostly depends on the size, the number of panels or openings, the glass, the hardware, and how difficult the installation is."
+_PRO_NEXT = "Request professional assistance so the opening can be measured and checked on site before you decide."
+
+CONSULT_GUIDE = {
+    "cost": "A price can't be given here because it depends on the details of your project. The main factors are the size, the number of panels or openings, the glass and hardware, how complicated the installation is, and the condition of and access to the site. You can request professional assistance to ask about pricing once these details are known.",
+    "danger": "If anyone could be hurt right now, keep people and pets away from the area and don't try to fix it yourself. Get a qualified professional, and if someone is at immediate risk, contact your local emergency services.",
+    "cats": [
+        {"id": "windows", "label": "Windows", "icon": "🪟", "job_cat": "Windows", "topic": "Window selection",
+         "intro": "Let's work out what suits your window. A few short questions, then your options and what still needs checking."},
+        {"id": "doors", "label": "Doors", "icon": "🚪", "job_cat": "Doors", "topic": "Door selection",
+         "intro": "Let's work out what suits your door. A few short questions, then your options and what still needs checking."},
+        {"id": "partitions", "label": "Aluminum partitions", "icon": "🏢", "job_cat": "Partitions", "topic": "Partition planning",
+         "intro": "Let's think through your partition. A few short questions, then your options and what still needs checking."},
+        {"id": "measure", "label": "Measurements & project planning", "icon": "📏", "job_cat": "Other", "topic": "Measurements and project planning",
+         "intro": "Let's see what to prepare before a professional assessment. Nothing you enter here counts as a verified measurement."},
+        {"id": "care", "label": "Installation, maintenance & precautions", "icon": "🛠️", "job_cat": "Maintenance", "topic": "Installation, maintenance or precautions",
+         "intro": "Let's look at what you can safely do yourself and when a professional is needed."},
+        {"id": "general", "label": "Another aluminum project", "icon": "💬", "job_cat": "Aluminum Fabrication", "topic": "General aluminum project",
+         "intro": "Tell us about your project and we'll point you to the right next step."},
+    ],
+    "questions": {
+        "windows": [
+            {"id": "w_room", "kind": "choice", "text": "Where will the window go?", "short": "Room or building", "group": "detail",
+             "options": [{"v": "living", "label": "Living room or bedroom"}, {"v": "wet", "label": "Kitchen or bathroom"}, {"v": "work", "label": "Office or shop"}, {"v": "other", "label": "Somewhere else"}]},
+            {"id": "w_job", "kind": "choice", "text": "Is this a new window, a replacement, or a repair?", "short": "Type of job", "group": "req", "options": _JOB},
+            {"id": "w_prio", "kind": "choice", "text": "What matters most to you?", "short": "Main priority", "group": "req",
+             "options": [{"v": "vent", "label": "Fresh air"}, {"v": "light", "label": "Light and view"}, {"v": "sec", "label": "Security"}, {"v": "priv", "label": "Privacy"},
+                         {"v": "weather", "label": "Keeping out rain and wind"}, {"v": "maint", "label": "Low maintenance"}, {"v": "cost", "label": "Keeping cost down"}]},
+            {"id": "w_floor", "kind": "choice", "text": "Which floor is the window on?", "short": "Floor", "group": "detail", "options": _FLOOR},
+            {"id": "w_size", "kind": "text", "optional": True, "text": "Do you know the approximate size?", "hint": _SIZE_HINT, "short": "Approximate size (estimate, not verified)", "group": "detail", "dims": True},
+        ],
+        "doors": [
+            {"id": "d_where", "kind": "choice", "text": "Where will the door be used?", "short": "Where the door is", "group": "detail",
+             "options": [{"v": "main", "label": "Main entrance"}, {"v": "back", "label": "Back, patio or balcony"}, {"v": "inner", "label": "Inside a home or office"}, {"v": "shop", "label": "Shop or commercial entrance"}]},
+            {"id": "d_job", "kind": "choice", "text": "Is this a new door, a replacement, or a repair?", "short": "Type of job", "group": "req", "options": _JOB},
+            {"id": "d_prio", "kind": "choice", "text": "What matters most to you?", "short": "Main priority", "group": "req",
+             "options": [{"v": "sec", "label": "Security"}, {"v": "dur", "label": "Heavy daily use"}, {"v": "space", "label": "Saving space"}, {"v": "look", "label": "Appearance"},
+                         {"v": "maint", "label": "Low maintenance"}, {"v": "cost", "label": "Keeping cost down"}]},
+            {"id": "d_open", "kind": "choice", "text": "How would you like the door to open?", "short": "Opening style", "group": "req",
+             "options": [{"v": "swing", "label": "Swinging on hinges"}, {"v": "slide", "label": "Sliding sideways"}, _NOT_SURE]},
+            {"id": "d_size", "kind": "text", "optional": True, "text": "Do you know the approximate size of the opening?", "hint": _SIZE_HINT, "short": "Approximate size (estimate, not verified)", "group": "detail", "dims": True},
+        ],
+        "partitions": [
+            {"id": "p_where", "kind": "choice", "text": "What kind of space is it?", "short": "Type of space", "group": "detail",
+             "options": [{"v": "home", "label": "Home"}, {"v": "office", "label": "Office"}, {"v": "shop", "label": "Shop or commercial space"}, {"v": "other", "label": "Something else"}]},
+            {"id": "p_goal", "kind": "choice", "text": "What do you mainly want the partition to do?", "short": "Main goal", "group": "req",
+             "options": [{"v": "priv", "label": "More privacy"}, {"v": "light", "label": "Keep the space bright"}, {"v": "split", "label": "Divide a large space"}, {"v": "noise", "label": "Reduce noise"}, {"v": "cost", "label": "Keep cost down"}]},
+            {"id": "p_door", "kind": "choice", "text": "Will you need a door in the partition?", "short": "Door needed", "group": "req",
+             "options": [{"v": "yes", "label": "Yes"}, {"v": "no", "label": "No"}, _NOT_SURE]},
+            {"id": "p_size", "kind": "text", "optional": True, "text": "Roughly how long and how high is the area to divide?", "hint": _SIZE_HINT, "short": "Approximate size (estimate, not verified)", "group": "detail", "dims": True},
+        ],
+        "measure": [
+            {"id": "m_for", "kind": "choice", "text": "What are you measuring for?", "short": "Item", "group": "req",
+             "options": [{"v": "window", "label": "A window"}, {"v": "door", "label": "A door"}, {"v": "part", "label": "A partition"}, {"v": "other", "label": "Something else"}]},
+            {"id": "m_have", "kind": "choice", "text": "Do you already have measurements?", "short": "Measurements", "group": "detail",
+             "options": [{"v": "exact", "label": "Yes, measured carefully"}, {"v": "rough", "label": "Only a rough estimate"}, {"v": "none", "label": "No measurements yet"}]},
+            {"id": "m_floor", "kind": "choice", "text": "Is the opening on the ground floor or higher up?", "short": "Floor", "group": "detail", "options": _FLOOR},
+            {"id": "m_size", "kind": "text", "optional": True, "text": "Enter any sizes you have, and say if they are rough.", "hint": "For example: about 120 cm wide by 100 cm high, rough.", "short": "Sizes given (estimate, not verified)", "group": "detail", "dims": True},
+        ],
+        "care": [
+            {"id": "c_what", "kind": "choice", "text": "What do you need help with?", "short": "Situation", "group": "req",
+             "options": [{"v": "clean", "label": "Routine cleaning and upkeep"}, {"v": "stuck", "label": "Something is stuck or hard to move"}, {"v": "loose", "label": "Something is loose, rattling or leaking"},
+                         {"v": "glass", "label": "Cracked or broken glass", "danger": True}, {"v": "diy", "label": "I'm thinking of fitting or repairing it myself"}, {"v": "unsure", "label": "Not sure"}]},
+            {"id": "c_item", "kind": "choice", "text": "Which item is it?", "short": "Item", "group": "detail",
+             "options": [{"v": "window", "label": "A window"}, {"v": "door", "label": "A door"}, {"v": "part", "label": "A partition"}, {"v": "other", "label": "Something else"}]},
+            {"id": "c_floor", "kind": "choice", "text": "Is it on the ground floor or higher up?", "short": "Floor", "group": "detail", "options": _FLOOR},
+            {"id": "c_risk", "kind": "choice", "text": "Is anything at risk of falling, or could anyone be hurt right now?", "short": "Immediate risk", "group": "req",
+             "ask_if": {"c_what": ["stuck", "loose", "glass", "diy", "unsure"]},
+             "options": [{"v": "yes", "label": "Yes", "danger": True}, {"v": "no", "label": "No"}, {"v": "unsure", "label": "Not sure", "danger": True}]},
+        ],
+        "general": [
+            {"id": "g_what", "kind": "choice", "text": "What kind of project is it?", "short": "Project type", "group": "req",
+             "options": [{"v": "gate", "label": "Gate, railing or similar"}, {"v": "facade", "label": "Large glass front or facade"}, {"v": "repair", "label": "Repair or change to something existing"}, {"v": "other", "label": "Something else"}]},
+            {"id": "g_desc", "kind": "text", "text": "Describe what you want to build, fix or change, and where it will go.", "short": "Description", "group": "req"},
+            {"id": "g_size", "kind": "text", "optional": True, "text": "Do you know the approximate size?", "hint": _SIZE_HINT, "short": "Approximate size (estimate, not verified)", "group": "detail", "dims": True},
+        ],
+        "common": [
+            {"id": "loc", "kind": "text", "optional": True, "text": "Where is the project? An area or town is enough.", "short": "Project area", "group": "detail", "loc": True},
+            {"id": "photos", "kind": "photos"},
+        ],
+    },
+    "rules": {
+        "all": [
+            {"kind": "safety", "when": {"__danger": ["1"]}, "text": "You described a possible immediate hazard. Keep people away from it and get professional help rather than trying to fix it yourself."},
+            {"kind": "verify", "when": {"loc": ["__none"]}, "text": "Project location has not been provided yet."},
+            {"kind": "next", "when": {"__danger": ["1"]}, "text": "Get a qualified professional to look at this as soon as possible and explain the risk when you request assistance. If anyone is at immediate risk, contact your local emergency services."},
+        ],
+        "windows": [
+            {"kind": "option", "when": {}, "text": "A sliding window saves space because nothing swings into the room, but it opens only part of its frame at a time. A fixed window has no moving parts and lets in light, but it does not open."},
+            {"kind": "option", "when": {"w_prio": ["vent"]}, "text": "If fresh air matters most, a sliding window gives less airflow than a fully opening one. Ask which opening styles are available for your opening."},
+            {"kind": "option", "when": {"w_prio": ["light"]}, "text": "A fixed panel gives the most uninterrupted light and view but no ventilation. Combining a fixed panel with an opening one is a common approach."},
+            {"kind": "option", "when": {"w_prio": ["sec"]}, "text": "Security depends on the locks, the glass and how the frame is fixed into the wall, not only on the window style. Ask what locking and glass options are available, and have the fixing checked on site."},
+            {"kind": "option", "when": {"w_prio": ["priv"]}, "text": "Privacy usually comes from the type of glass, for example frosted or tinted. Ask what glass options are available."},
+            {"kind": "option", "when": {"w_prio": ["weather"]}, "text": "Resistance to rain and wind depends on sealing and correct installation as well as the window itself. Exposed or upper-floor openings need extra care."},
+            {"kind": "option", "when": {"w_prio": ["maint"]}, "text": "Keep sliding tracks clean and check seals and locks from time to time. Ask how to look after the frames in your location."},
+            {"kind": "option", "when": {"w_prio": ["cost"]}, "text": _COST_TXT},
+            {"kind": "option", "when": {"w_room": ["wet"]}, "text": "Kitchens and bathrooms usually need both ventilation and privacy, so think about both."},
+            {"kind": "option", "when": {"w_room": ["work"]}, "text": "Offices and shops often need security and easy cleaning as well as light. Mention how the space is used."},
+            {"kind": "safety", "when": {}, "text": "Glass and aluminum edges can cause serious cuts and window frames can be heavy. Leave removal, fitting and glass handling to professionals."},
+            {"kind": "safety", "when": {"w_floor": ["upper"]}, "text": "Upper-floor openings carry a risk of falling. Don't lean out, climb or stand on unstable supports to measure or work. Measuring and fitting here should be done by a professional."},
+            {"kind": "safety", "when": {"w_job": ["replace", "repair"]}, "text": "Don't remove an existing window or its glass yourself. It can be heavy, brittle and hard to hold safely."},
+            {"kind": "verify", "when": {"w_size": ["__none"]}, "text": "Approximate size has not been provided yet."},
+            {"kind": "verify", "when": {"w_size": ["*"]}, "text": "The size you gave is an estimate. Exact measurements must be confirmed on site before anything is made."},
+            {"kind": "verify", "when": {}, "text": "The condition of the wall and frame around the opening."},
+            {"kind": "verify", "when": {"w_floor": ["unsure"]}, "text": "Which floor the opening is on."},
+            {"kind": "next", "when": {"w_floor": ["upper"]}, "text": "An on-site assessment is strongly recommended. Request professional assistance so the opening can be measured and checked safely."},
+            {"kind": "next", "when": {"w_job": ["replace", "repair"]}, "text": "Request professional assistance so the existing window can be inspected before deciding between repair and replacement."},
+            {"kind": "next", "when": {}, "text": _PRO_NEXT},
+        ],
+        "doors": [
+            {"kind": "option", "when": {}, "text": "A hinged door needs clear floor space to swing. A sliding door avoids that, but relies on a track that needs cleaning and good locking."},
+            {"kind": "option", "when": {"d_prio": ["sec"]}, "text": "Door security comes from the lock, the frame fixing and the glass together. Ask what locking and glass options are available, and have the fixing checked on site."},
+            {"kind": "option", "when": {"d_prio": ["dur"]}, "text": "Doors in heavy daily use need sturdy hardware and solid fixing. Tell us roughly how many people use the door."},
+            {"kind": "option", "when": {"d_prio": ["space"]}, "text": "If space is tight, a sliding door avoids the swing area, but check there is room for it to slide."},
+            {"kind": "option", "when": {"d_prio": ["look"]}, "text": "Frame finish and glass choice affect the look. Ask what finishes and glass options are available."},
+            {"kind": "option", "when": {"d_prio": ["maint"]}, "text": "Keep tracks and hinges clean and check locks and seals from time to time."},
+            {"kind": "option", "when": {"d_prio": ["cost"]}, "text": _COST_TXT},
+            {"kind": "option", "when": {"d_where": ["main"]}, "text": "Main entrances usually need strong locking and good weather sealing."},
+            {"kind": "option", "when": {"d_where": ["shop"]}, "text": "Shop and commercial doors take heavy use and need reliable, secure locking. Mention how many people use the entrance."},
+            {"kind": "safety", "when": {}, "text": "Glass and aluminum doors are heavy and can be dangerous to lift, remove or hang. Don't try to fit or remove one yourself."},
+            {"kind": "safety", "when": {"d_job": ["replace", "repair"]}, "text": "Don't take a door off its frame or track yourself. Doors can fall and glass can break."},
+            {"kind": "verify", "when": {"d_size": ["__none"]}, "text": "Approximate size has not been provided yet."},
+            {"kind": "verify", "when": {"d_size": ["*"]}, "text": "The size you gave is an estimate. Exact measurements must be confirmed on site before anything is made."},
+            {"kind": "verify", "when": {}, "text": "Whether the floor and threshold are level, and how much clear space there is around the opening."},
+            {"kind": "verify", "when": {"d_open": ["unsure"]}, "text": "How the door should open (swinging or sliding)."},
+            {"kind": "next", "when": {"d_job": ["replace", "repair"]}, "text": "Request professional assistance so the existing door can be inspected before deciding between repair and replacement."},
+            {"kind": "next", "when": {}, "text": _PRO_NEXT},
+        ],
+        "partitions": [
+            {"kind": "option", "when": {}, "text": "Glass and aluminum partitions divide a space while letting light through. The layout, how the space is used and the privacy you need decide the details."},
+            {"kind": "option", "when": {"p_goal": ["priv"]}, "text": "Privacy usually comes from the type of glass, for example frosted or tinted. Ask what glass options are available."},
+            {"kind": "option", "when": {"p_goal": ["light"]}, "text": "Clear glass keeps a space bright and open but gives less privacy, so decide which matters more."},
+            {"kind": "option", "when": {"p_goal": ["split"]}, "text": "Plan around how people will move through the space, including any exits and clear walkways."},
+            {"kind": "option", "when": {"p_goal": ["noise"]}, "text": "Partitions are not automatically soundproof. How much noise they reduce depends on the materials and how they are built, so ask what is possible before relying on it."},
+            {"kind": "option", "when": {"p_goal": ["cost"]}, "text": _COST_TXT},
+            {"kind": "option", "when": {"p_door": ["yes"]}, "text": "A door adds a moving part, so plan where it swings or slides and make sure it can open freely."},
+            {"kind": "safety", "when": {}, "text": "Partitions are tall and heavy and depend on sound floors, walls or ceilings for fixing. Installation should be done by professionals."},
+            {"kind": "safety", "when": {"p_where": ["office", "shop"]}, "text": "In offices and shops, check building, landlord or safety rules (for example exit routes) before dividing a space."},
+            {"kind": "verify", "when": {"p_size": ["__none"]}, "text": "Approximate size has not been provided yet."},
+            {"kind": "verify", "when": {"p_size": ["*"]}, "text": "The size you gave is an estimate. Exact measurements must be confirmed on site before anything is made."},
+            {"kind": "verify", "when": {}, "text": "The condition and levelness of the floor, walls and ceiling the partition will fix to."},
+            {"kind": "verify", "when": {}, "text": "Whether any building, landlord or safety rules apply."},
+            {"kind": "next", "when": {}, "text": "Request professional assistance so the space can be measured and assessed on site before you decide."},
+        ],
+        "measure": [
+            {"kind": "option", "when": {}, "text": "Helpful to prepare: photos of the opening from inside and outside, a rough width and height, what the space is used for, and anything in the way such as furniture, pipes or steps."},
+            {"kind": "option", "when": {"m_have": ["exact"]}, "text": "Even careful customer measurements can't replace a professional measurement. Keep yours to compare."},
+            {"kind": "option", "when": {"m_have": ["rough"]}, "text": "Rough sizes are fine for a first discussion but must not be used to order or make anything."},
+            {"kind": "option", "when": {"m_have": ["none"]}, "text": "You don't need exact numbers to start. Photos and a description of the space are enough for a first conversation."},
+            {"kind": "safety", "when": {}, "text": "Only measure from the floor, on stable footing. Never climb, lean out of a window or work at height to take a measurement."},
+            {"kind": "safety", "when": {"m_floor": ["upper"]}, "text": "For upper-floor openings, don't try to measure from outside. Leave it to a professional."},
+            {"kind": "verify", "when": {}, "text": "All sizes must be confirmed by a professional measurement on site. Anything you give is an estimate, not a verified site measurement."},
+            {"kind": "verify", "when": {"m_floor": ["unsure"]}, "text": "Which floor the opening is on."},
+            {"kind": "next", "when": {}, "text": "Request professional assistance to arrange a proper on-site measurement and assessment."},
+        ],
+        "care": [
+            {"kind": "option", "when": {"c_what": ["clean"]}, "text": "Wipe frames and glass with a soft cloth and mild soapy water. Clear dust and grit from sliding tracks, and check that locks, seals and handles still work. Avoid harsh abrasives that can scratch."},
+            {"kind": "option", "when": {"c_what": ["stuck"]}, "text": "Dirt or grit in a track is a common reason for a sliding window or door sticking. Clean the track gently, but don't force it or lift it off its track."},
+            {"kind": "option", "when": {"c_what": ["loose"]}, "text": "Loose, rattling or leaking items can come from worn seals or fittings, or a frame that has shifted. A professional should look at them, especially if the frame may have moved."},
+            {"kind": "option", "when": {"c_what": ["glass"]}, "text": "Cracked glass can fail suddenly. Keep people and pets away, don't touch or press on it, and don't try to remove it yourself."},
+            {"kind": "option", "when": {"c_what": ["diy"]}, "text": "Fitting or repairing windows and doors involves heavy glass, sharp edges and often heights. We recommend leaving fitting and repairs to professionals."},
+            {"kind": "option", "when": {"c_what": ["unsure"]}, "text": "If you are not sure what is wrong, don't take anything apart. Photos and a description are the safest way to start."},
+            {"kind": "safety", "when": {}, "text": "Don't use force or makeshift tools on frames, glass or fittings."},
+            {"kind": "safety", "when": {"c_what": ["diy"]}, "text": "Do not attempt installation or structural repairs unless you are qualified. Heavy glass, sharp edges, unstable frames and heights can cause serious injury."},
+            {"kind": "safety", "when": {"c_floor": ["upper"]}, "text": "Don't lean out of upper-floor windows or climb to clean, check or repair them."},
+            {"kind": "verify", "when": {"c_what": ["unsure"]}, "text": "What exactly is wrong with the item."},
+            {"kind": "verify", "when": {"c_what": ["loose", "glass", "stuck"]}, "text": "Whether the frame or the wall around it is damaged."},
+            {"kind": "next", "when": {"c_what": ["glass"]}, "text": "Keep people away and get a qualified professional to look at it as soon as possible. Request professional assistance and explain the risk."},
+            {"kind": "next", "when": {"c_risk": ["yes", "unsure"]}, "text": "Keep people away from the area and get a qualified professional to look at it as soon as possible. Request professional assistance and explain the risk."},
+            {"kind": "next", "when": {"c_what": ["clean"]}, "text": "Routine upkeep like this is usually fine to do yourself. If you notice damage, request professional assistance."},
+            {"kind": "next", "when": {}, "text": "Request professional assistance so the problem can be inspected before anything is repaired."},
+        ],
+        "general": [
+            {"kind": "option", "when": {}, "text": "Custom aluminum projects depend on the exact space, the purpose and how it will be used. Photos and a clear description help us understand it."},
+            {"kind": "option", "when": {"g_what": ["gate"]}, "text": "Gates and railings must be strong and fixed properly. Safety around heights and children matters."},
+            {"kind": "option", "when": {"g_what": ["facade"]}, "text": "Large glass fronts depend on the building's structure and its exposure to wind and weather, so they need professional assessment."},
+            {"kind": "safety", "when": {}, "text": "Large or heavy aluminum and glass work, and anything at height, should be assessed and installed by professionals."},
+            {"kind": "verify", "when": {"g_size": ["__none"]}, "text": "Approximate size has not been provided yet."},
+            {"kind": "verify", "when": {"g_size": ["*"]}, "text": "The size you gave is an estimate. Exact measurements must be confirmed on site before anything is made."},
+            {"kind": "verify", "when": {}, "text": "Whether the work depends on the strength or condition of the existing structure."},
+            {"kind": "next", "when": {}, "text": "Request professional assistance so the project can be discussed and assessed on site if needed."},
+        ],
+    },
+}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -3566,6 +3747,336 @@ MORE_TEMPLATES_3 = {
 {% endblock %}
 ''',
 
+"consult_guide.html": '''{% extends "base.html" %}
+{% block title %}Guided Consultation | ANDY{% endblock %}
+{% block content %}
+<div class="cg">
+  <a class="cg-back" href="{{ url_for('services') }}#consultation">← Back to services</a>
+  <div class="rq-chat" id="rq">
+    <div class="rq-head">
+      <div class="rq-avatar" aria-hidden="true">A</div>
+      <div><div class="rq-name">Andy Alloy Consultation</div><div class="rq-status"><span class="rq-dot"></span>Guidance only · not an inspection or quotation</div></div>
+    </div>
+    <div class="cg-note"><b>Your safety comes first.</b> This guidance is general. Some projects need professional measurements or an on-site assessment.</div>
+    <div class="rq-body" id="rqBody" role="log" aria-live="polite" aria-label="Guided consultation"></div>
+    <div class="rq-quick" id="rqQuick"></div>
+    <form class="rq-composer" id="rqComposer" autocomplete="off">
+      <button type="button" class="rq-attach" id="rqAttach" aria-label="Attach photos" disabled>📎</button>
+      <textarea id="rqInput" rows="1" maxlength="1000" placeholder="Choose an option above…" aria-label="Your answer" disabled></textarea>
+      <button type="submit" class="rq-send" id="rqSend" aria-label="Send answer" disabled>➤</button>
+    </form>
+  </div>
+  <input type="file" id="rqFiles" accept="image/*,.pdf" multiple hidden>
+  <noscript><p class="cons-hint">This guided consultation needs JavaScript. You can still use <a href="{{ url_for('request_service') }}">Request a Service</a>.</p></noscript>
+</div>
+
+<script>
+(function() {
+  var G = {{ guide|tojson }};
+  var LOGGED = {{ 'true' if user else 'false' }};
+  var CAN = {{ 'true' if (user and user.role == 'customer') else 'false' }};
+  var UNAME = {{ (user.name if user else '')|tojson }};
+  var UMAIL = {{ (user.email if user else '')|tojson }};
+  var CSRF = {{ csrf_token()|tojson }};
+  var SUBMIT_URL = {{ url_for('consultation_request')|tojson }};
+  var KEY = 'andyConsultState';
+  var NL = String.fromCharCode(10);
+  var body = document.getElementById('rqBody'), quick = document.getElementById('rqQuick');
+  var input = document.getElementById('rqInput'), sendBtn = document.getElementById('rqSend'), attach = document.getElementById('rqAttach');
+  var composer = document.getElementById('rqComposer'), files = document.getElementById('rqFiles');
+  var st = { cat: null, qs: [], i: 0, ans: {}, danger: {}, sending: false, step: '' };
+  var lastItems = [];
+  var COST_RE = /(^|[^a-z])(price|prices|pricing|cost|costs|how much|quote|quotation|budget|cheap|expensive|naira|₦)/i;
+  var DANGER_RE = /(^|[^a-z])(falling|fall|fell|fallen|collaps|shatter|crack|broken glass|detach|spark|electric|exposed wire|injur|bleed|trapped)/i;
+
+  function esc(t) { var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+  function down() { body.scrollTop = body.scrollHeight; }
+  function bubble(who, html, cls) {
+    var d = document.createElement('div'); d.className = 'rq-msg ' + who + (cls ? ' ' + cls : '');
+    d.innerHTML = (who === 'andy' ? '<span class="rq-av" aria-hidden="true">A</span>' : '') + '<div class="rq-bub">' + html + '</div>';
+    body.appendChild(d); down(); return d;
+  }
+  function typing(cb) {
+    var d = document.createElement('div'); d.className = 'rq-msg andy';
+    d.innerHTML = '<span class="rq-av" aria-hidden="true">A</span><div class="rq-bub rq-typing"><i></i><i></i><i></i></div>';
+    body.appendChild(d); down();
+    setTimeout(function() { d.remove(); cb(); }, 350);
+  }
+  function setQuick(items) {
+    if (items.length) lastItems = items;
+    quick.innerHTML = '';
+    items.forEach(function(it) {
+      var b = document.createElement('button'); b.type = 'button'; b.className = 'rq-chip' + (it.primary ? ' primary' : '');
+      b.textContent = it.label; b.onclick = function() { if (st.sending) return; setQuick([]); it.fn(); }; quick.appendChild(b);
+    });
+    down();
+  }
+  function lock() { input.disabled = true; sendBtn.disabled = true; attach.disabled = true; input.placeholder = 'Choose an option above…'; }
+  function unlock(ph) { input.disabled = false; sendBtn.disabled = false; input.placeholder = ph || 'Type your answer…'; input.focus(); }
+  function say(html, cb, cls) { setQuick([]); lock(); typing(function() { bubble('andy', html, cls); if (cb) cb(); }); }
+  function sayAll(list, cb) {
+    if (!list.length) { if (cb) cb(); return; }
+    var first = list[0];
+    say(first.html, function() { sayAll(list.slice(1), cb); }, first.cls);
+  }
+  function again() { setQuick(lastItems); }
+
+  // ---- rules ----
+  function matches(rule, a) {
+    var w = rule.when || {};
+    for (var k in w) {
+      var list = w[k], v = a[k];
+      var ok = list.indexOf(v) > -1 || (list.indexOf('*') > -1 && v !== undefined && v !== '__none');
+      if (!ok) return false;
+    }
+    return true;
+  }
+  function collect(kind, firstOnly) {
+    var out = [], seen = {};
+    var sets = [G.rules.all || [], G.rules[st.cat] || []];
+    for (var s = 0; s < sets.length; s++) {
+      for (var r = 0; r < sets[s].length; r++) {
+        var rule = sets[s][r];
+        if (rule.kind !== kind || !matches(rule, st.ans)) continue;
+        if (seen[rule.text]) continue;
+        seen[rule.text] = 1; out.push(rule.text);
+        if (firstOnly) return out;
+      }
+    }
+    return out;
+  }
+  function recomputeDanger() { var any = false; for (var k in st.danger) { if (st.danger[k]) any = true; } if (any) st.ans.__danger = '1'; else delete st.ans.__danger; }
+
+  // ---- flow ----
+  function cat() { for (var i = 0; i < G.cats.length; i++) { if (G.cats[i].id === st.cat) return G.cats[i]; } return null; }
+  function showCats() {
+    st.step = 'cat';
+    say('What would you like help with?', function() {
+      var items = G.cats.map(function(c) { return { label: c.icon + ' ' + c.label, fn: function() { choose(c.id, c.icon + ' ' + c.label); } }; });
+      items.push({ label: 'What affects the cost?', fn: function() { bubble('user', 'What affects the cost?'); say(esc(G.cost), again); } });
+      setQuick(items);
+    });
+  }
+  function choose(id, label) {
+    st.cat = id; st.ans = {}; st.danger = {}; st.i = 0;
+    st.qs = (G.questions[id] || []).concat(G.questions.common);
+    bubble('user', esc(label));
+    say(esc(cat().intro), nextQ);
+  }
+  function skipQ(q) {
+    if (!q.ask_if) return false;
+    for (var k in q.ask_if) { if (q.ask_if[k].indexOf(st.ans[k]) === -1) return true; }
+    return false;
+  }
+  function nextQ() {
+    while (st.i < st.qs.length && skipQ(st.qs[st.i])) st.i++;
+    if (st.i >= st.qs.length) { finish(); return; }
+    ask(st.qs[st.i]);
+  }
+  function backItems() {
+    var items = [];
+    if (st.i > 0) items.push({ label: '↩ Back', fn: goBack });
+    items.push({ label: 'Start over', fn: restart });
+    return items;
+  }
+  function goBack() {
+    var j = st.i - 1;
+    while (j >= 0 && skipQ(st.qs[j])) j--;
+    if (j < 0) { restart(); return; }
+    delete st.ans[st.qs[j].id]; delete st.danger[st.qs[j].id]; recomputeDanger();
+    st.i = j; bubble('user', '↩ Back'); nextQ();
+  }
+  function restart() { bubble('user', 'Start over'); try { sessionStorage.removeItem(KEY); } catch (e) {} st.cat = null; st.ans = {}; st.danger = {}; showCats(); }
+  function ask(q) {
+    st.step = q.id;
+    if (q.kind === 'photos') { askPhotos(); return; }
+    var html = esc(q.text) + (q.hint ? '<br><small class="cg-hint">' + esc(q.hint) + '</small>' : '');
+    say(html, function() {
+      if (q.kind === 'choice') {
+        var items = q.options.map(function(o) { return { label: o.label, fn: function() { answerChoice(q, o); } }; });
+        setQuick(items.concat(backItems()));
+      } else {
+        unlock('Type your answer…');
+        var items2 = [];
+        if (q.optional) items2.push({ label: 'Skip', fn: function() { bubble('user', 'Skip'); lock(); st.ans[q.id] = '__none'; st.i++; nextQ(); } });
+        setQuick(items2.concat(backItems()));
+      }
+    });
+  }
+  function answerChoice(q, o) {
+    bubble('user', esc(o.label));
+    st.ans[q.id] = o.v;
+    if (o.danger) st.danger[q.id] = 1; else delete st.danger[q.id];
+    recomputeDanger();
+    st.i++;
+    if (o.danger) say(esc(G.danger), nextQ, 'cg-warn'); else nextQ();
+  }
+  function onSend(text) {
+    text = text.trim();
+    if (!text || st.step === '' || st.step === 'cat') return;
+    var q = st.qs[st.i];
+    if (!q || q.kind !== 'text') return;
+    bubble('user', esc(text).split(NL).join('<br>')); input.value = ''; grow();
+    if (!q.optional && text.length < 3) { say('Please add a little more detail so we can help.', function() { unlock(); setQuick(backItems()); }); return; }
+    st.ans[q.id] = text;
+    var notes = [];
+    if (DANGER_RE.test(text)) { st.danger[q.id] = 1; notes.push({ html: esc(G.danger), cls: 'cg-warn' }); } else { delete st.danger[q.id]; }
+    if (COST_RE.test(text)) notes.push({ html: esc(G.cost) });
+    recomputeDanger();
+    st.i++; lock();
+    sayAll(notes, nextQ);
+  }
+  function askPhotos() {
+    say('Do you have photos of the opening or area? They help a lot, but you can skip this.', function() {
+      lock(); attach.disabled = false;
+      setQuick([{ label: '📎 Add photos', primary: true, fn: function() { files.click(); } },
+                { label: 'Skip', fn: function() { bubble('user', 'Skip'); st.i++; nextQ(); } }].concat(backItems()));
+    });
+  }
+  files.addEventListener('change', function() {
+    if (files.files.length > 6) {
+      var dt = new DataTransfer(); [].slice.call(files.files, 0, 6).forEach(function(f) { dt.items.add(f); }); files.files = dt.files;
+      bubble('andy', 'Up to 6 files can be sent, so the first 6 were kept.');
+    }
+    var html = '', n = files.files.length;
+    [].forEach.call(files.files, function(f) {
+      html += (f.type.indexOf('image/') === 0) ? '<img class="rq-thumb" alt="" src="' + URL.createObjectURL(f) + '">' : '<span class="rq-file">📄 ' + esc(f.name.slice(0, 24)) + '</span>';
+    });
+    if (n) bubble('user', '📎 ' + n + ' file' + (n > 1 ? 's' : '') + '<div class="rq-thumbs">' + html + '</div>');
+    if (st.step === 'photos' && n) { st.i++; nextQ(); }
+  });
+  attach.addEventListener('click', function() { files.click(); });
+  composer.addEventListener('submit', function(e) { e.preventDefault(); if (!input.disabled) onSend(input.value); });
+  input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!input.disabled) onSend(input.value); } });
+  function grow() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; }
+  input.addEventListener('input', grow);
+
+  // ---- summary ----
+  function valueOf(q) {
+    var a = st.ans[q.id];
+    if (a === undefined || a === '__none') return 'Not yet provided';
+    if (q.kind === 'choice') { for (var i = 0; i < q.options.length; i++) { if (q.options[i].v === a) return q.options[i].label; } }
+    return a;
+  }
+  function buildSummary() {
+    var c = cat(), req = [], det = [], loc = '', dims = '';
+    st.qs.forEach(function(q) {
+      if (q.kind === 'photos' || st.ans[q.id] === undefined) return;
+      var line = q.short + ': ' + valueOf(q);
+      if (q.group === 'req') req.push(line); else det.push(line);
+      if (q.loc && st.ans[q.id] !== '__none') loc = st.ans[q.id];
+      if (q.dims && st.ans[q.id] !== '__none') dims = st.ans[q.id];
+    });
+    var opts = collect('option'), safe = collect('safety'), ver = collect('verify'), nxt = collect('next', true);
+    if (!opts.length) opts = ['There is not enough information yet to suggest a specific option.'];
+    var sections = [
+      ['Project type', [c.label + ' (' + c.topic + ')']],
+      ['Your requirements', req.length ? req : ['Not yet provided']],
+      ['Details you gave', det.length ? det : ['Not yet provided']],
+      ['Options to consider', opts],
+      ['Safety considerations', safe],
+      ['Still to be confirmed', ver],
+      ['Recommended next step', nxt]
+    ];
+    var html = '<div class="cg-sum">', text = [];
+    sections.forEach(function(s) {
+      html += '<h5>' + esc(s[0]) + '</h5><ul>' + s[1].map(function(x) { return '<li>' + esc(x) + '</li>'; }).join('') + '</ul>';
+      text.push(s[0].toUpperCase()); s[1].forEach(function(x) { text.push('- ' + x); }); text.push('');
+    });
+    html += '<p class="cg-fine">General guidance only. This is not a quotation, an inspection or a confirmed measurement.</p></div>';
+    text.push('General guidance only. Not a quotation, an inspection or a confirmed measurement.');
+    return { html: html, text: text.join(NL), topic: c.topic, jobCat: c.job_cat, loc: loc, dims: dims };
+  }
+  function save() { try { sessionStorage.setItem(KEY, JSON.stringify({ cat: st.cat, ans: st.ans, danger: st.danger })); } catch (e) {} }
+  function finish() {
+    st.step = 'summary'; lock(); save();
+    say('Thank you. Based only on what you have told us, here is a summary with some things to consider.', showSummary);
+  }
+  function showSummary() {
+    var sm = buildSummary();
+    say(sm.html, function() {
+      setQuick([
+        { label: 'Request Professional Assistance', primary: true, fn: requestHelp },
+        { label: 'What affects the cost?', fn: function() { bubble('user', 'What affects the cost?'); say(esc(G.cost), again); } },
+        { label: 'Change my answers', fn: function() { var id = st.cat, l = cat().icon + ' ' + cat().label; bubble('user', 'Change my answers'); choose(id, l); } },
+        { label: 'Start over', fn: restart }
+      ]);
+    }, 'wide');
+  }
+
+  // ---- request ----
+  function requestHelp() {
+    bubble('user', 'Request Professional Assistance'); save();
+    if (!CAN) {
+      if (!LOGGED) {
+        say('To send a request you need to log in or create a customer account. Your answers are kept on this device, so you can come back to this summary afterwards.', function() {
+          setQuick([{ label: 'Log in or sign up', primary: true, fn: function() { document.getElementById('authModal').classList.add('open'); again(); } },
+                    { label: 'Back to summary', fn: showSummary }]);
+        });
+      } else {
+        say('Requests can only be sent from a customer account. You are logged in with a different type of account.', function() { setQuick([{ label: 'Back to summary', fn: showSummary }]); });
+      }
+      return;
+    }
+    review();
+  }
+  function review() {
+    var sm = buildSummary(), n = files.files.length;
+    var html = 'Before anything is sent, this is exactly what will be shared with Andy Alloy:' +
+      '<div class="cg-share"><b>Your account:</b> ' + esc(UNAME) + ' (' + esc(UMAIL) + ')<br><b>Photos:</b> ' + (n ? n + ' attached' : 'none') + '</div>' +
+      sm.html +
+      '<label class="cg-consent-row"><input type="checkbox" class="cg-consent"> I agree to share this summary, and my account name and email, with Andy Alloy so they can follow up. I understand nothing is confirmed until Andy Alloy confirms it.</label>';
+    say(html, function() { setQuick([{ label: 'Send request', primary: true, fn: sendNow }, { label: 'Back to summary', fn: showSummary }]); }, 'wide');
+  }
+  function sendNow() {
+    var boxes = body.querySelectorAll('.cg-consent'), box = boxes[boxes.length - 1];
+    if (!box || !box.checked) {
+      say('Please tick the box first, so we know you are happy for this to be shared.', function() { setQuick([{ label: 'Send request', primary: true, fn: sendNow }, { label: 'Back to summary', fn: showSummary }]); });
+      return;
+    }
+    var sm = buildSummary(), fd = new FormData();
+    fd.append('csrf_token', CSRF); fd.append('category', sm.jobCat); fd.append('topic', sm.topic); fd.append('summary', sm.text);
+    fd.append('location', sm.loc); fd.append('dimensions', sm.dims); fd.append('consent', '1');
+    [].forEach.call(files.files, function(f) { fd.append('attachments', f); });
+    st.sending = true; setQuick([]); lock();
+    var wait = bubble('andy', 'Sending your request…');
+    function fail(msg) {
+      st.sending = false; wait.remove();
+      bubble('andy', esc(msg), 'cg-warn'); down();
+      setQuick([{ label: 'Try again', primary: true, fn: sendNow }, { label: 'Back to summary', fn: showSummary }]);
+    }
+    fetch(SUBMIT_URL, { method: 'POST', headers: { 'X-Requested-With': 'fetch' }, body: fd, credentials: 'same-origin' })
+      .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }, function() { return { ok: false, d: null }; }); })
+      .then(function(res) {
+        if (res.ok && res.d && res.d.ok) {
+          st.sending = false; wait.remove();
+          try { sessionStorage.removeItem(KEY); } catch (e) {}
+          bubble('andy', esc(res.d.message)); down();
+          setQuick([{ label: 'Open the conversation', primary: true, fn: function() { location.href = res.d.url; } }]);
+        } else if (res.d && res.d.message) { fail(res.d.message + (/nothing/i.test(res.d.message) ? '' : ' Nothing was sent.')); }
+        else { fail('Your session may have expired. Please refresh the page and try again. Nothing was sent.'); }
+      })
+      .catch(function() { fail('We could not reach the server. Nothing was sent. Please check your connection and try again.'); });
+  }
+
+  // ---- start ----
+  var saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch (e) { saved = null; }
+  if (saved && saved.cat && G.questions[saved.cat]) {
+    st.cat = saved.cat; st.ans = saved.ans || {}; st.danger = saved.danger || {};
+    st.qs = (G.questions[st.cat] || []).concat(G.questions.common); st.step = 'summary';
+    say('Welcome back. Your answers were kept. Here is your summary.', showSummary);
+  } else {
+    sayAll([
+      { html: 'Welcome to the Andy Alloy guided consultation. We will ask a few short questions, then give you practical guidance and what still needs checking. Nothing here is a quotation, an inspection or a confirmed measurement.' },
+      { html: '<b>Your safety comes first.</b> Our guidance helps you understand your options and make informed decisions. Some projects require professional measurements, an on-site assessment, or specialist installation. Do not attempt work that could put you or others at risk.', cls: 'cg-safe' }
+    ], showCats);
+  }
+})();
+</script>
+{% endblock %}
+''',
+
 "services.html": '''{% extends "base.html" %}
 {% block title %}Explore Services | ANDY{% endblock %}
 {% block content %}
@@ -3651,7 +4162,7 @@ MORE_TEMPLATES_3 = {
   <div class="cons-intro">
     <span class="lp-eyebrow">Consultation</span>
     <h2 id="consTitle">Professional Aluminium Consultation</h2>
-    <p>Not sure which door, window or partition suits your building? Tell us about your project and what you are considering. We will help you understand your options and what needs to be confirmed before anything is made or fitted.</p>
+    <p>Not sure which door, window or partition suits your building? Answer a few guided questions about your project and get practical guidance on your options, what still needs to be checked, and the safe next step.</p>
     <p class="cons-prep-title">Helpful to have ready</p>
     <ul class="cons-prep">
       <li>Where the work is, and what the space is used for</li>
@@ -3665,69 +4176,10 @@ MORE_TEMPLATES_3 = {
     <span>Never climb, lean out of a window, or remove glass or frames just to take a measurement. Heavy glass and sharp aluminium edges can cause serious injury.</span>
   </div>
 
-  {% if user and user.role == 'customer' %}
-  <form class="cons-form" id="consForm" method="POST" action="{{ url_for('consultation_request') }}" enctype="multipart/form-data">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    {% if consult_error %}<div class="cons-err" role="alert">{{ consult_error }}</div>{% endif %}
-    <p class="cons-as">Sending as <b>{{ user.name }}</b> ({{ user.email }}). We use your account details to reply to you in the conversation for this request.</p>
-    <div class="cons-row">
-      <div class="cons-field">
-        <label for="consCat">Service category</label>
-        <select id="consCat" name="category" required>
-          <option value="" disabled {{ 'selected' if not cf.category }}>Choose one</option>
-          {% for c in chips %}<option value="{{ c.value }}" {{ 'selected' if cf.category == c.value }}>{{ c.label }}</option>{% endfor %}
-        </select>
-      </div>
-      <div class="cons-field">
-        <label for="consTopic">Help needed</label>
-        <select id="consTopic" name="topic" required>
-          <option value="" disabled {{ 'selected' if not cf.topic }}>Choose one</option>
-          {% for t in consult_topics %}<option value="{{ t }}" {{ 'selected' if cf.topic == t }}>{{ t }}</option>{% endfor %}
-        </select>
-      </div>
-    </div>
-    <div class="cons-field">
-      <label for="consDesc">Your project</label>
-      <textarea id="consDesc" name="description" rows="4" minlength="10" maxlength="3000" required placeholder="What do you need, and what is the space used for?">{{ cf.description }}</textarea>
-    </div>
-    <div class="cons-row">
-      <div class="cons-field">
-        <label for="consLoc">Project area <small>(optional)</small></label>
-        <input id="consLoc" name="location" type="text" maxlength="120" value="{{ cf.location }}" placeholder="Town or area">
-      </div>
-      <div class="cons-field" id="consDims">
-        <label for="consDim">Approximate size <small>(optional)</small></label>
-        <input id="consDim" name="dimensions" type="text" maxlength="200" value="{{ cf.dimensions }}" placeholder="e.g. width x height">
-        <span class="cons-hint">Only measure what you can reach safely from the floor. We will confirm exact sizes before anything is made.</span>
-      </div>
-    </div>
-    <div class="cons-field">
-      <label for="consFiles">Photos <small>(optional, up to 6)</small></label>
-      <input id="consFiles" name="attachments" type="file" accept="image/*,.pdf" multiple>
-    </div>
-    <button class="btn btn-purple cons-submit" id="consSubmit" type="submit">Request a consultation</button>
-  </form>
-  <script>
-  (function() {
-    var f = document.getElementById('consForm'); if (!f) return;
-    var cat = document.getElementById('consCat'), dims = document.getElementById('consDims');
-    var withSize = {{ consult_dim_cats|tojson }};
-    function sync() { dims.hidden = !(cat.value === '' || withSize.indexOf(cat.value) > -1); }
-    cat.addEventListener('change', sync); sync();
-    f.addEventListener('submit', function() {
-      var b = document.getElementById('consSubmit'); b.disabled = true; b.textContent = 'Sending…';
-    });
-    {% if consult_error %}document.getElementById('consultation').scrollIntoView({block: 'start'});{% endif %}
-  })();
-  </script>
-  {% elif not user %}
-  <div class="cons-login">
-    <p>Log in or create an account to send a consultation request. It takes a minute, and you can follow the conversation afterwards.</p>
-    <a class="btn btn-purple" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Log in to request a consultation</a>
+  <div class="cons-start">
+    <a class="btn btn-purple cons-submit" href="{{ url_for('consult_guide') }}">Start your consultation</a>
+    <span class="cons-hint">A few guided questions, one at a time. You only need an account when you send a request.</span>
   </div>
-  {% else %}
-  <p class="cons-login">Consultation requests are sent from customer accounts.</p>
-  {% endif %}
 </section>
 
 <div class="svcp-foot">
@@ -5517,27 +5969,32 @@ body.dark-mode .svcp-art { background: rgba(7,12,26,.55); }
 .cons-prep { margin: 0 0 16px; padding-left: 18px; font-size: 14px; line-height: 1.6; color: var(--text-muted); }
 .cons-safety { border-left: 4px solid var(--accent); background: var(--bg); padding: 12px 14px; border-radius: 0 10px 10px 0; font-size: 14px; line-height: 1.55; color: var(--navy); margin: 0 0 20px; }
 .cons-safety span { display: block; margin-top: 6px; font-size: 13px; color: var(--text-muted); }
-.cons-form { display: flex; flex-direction: column; gap: 14px; }
-.cons-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.cons-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
-.cons-field[hidden] { display: none; }
-.cons-field label { font-size: 13px; font-weight: 600; color: var(--navy); }
-.cons-field label small { font-weight: 400; color: var(--text-muted); }
-.cons-field input, .cons-field select, .cons-field textarea { width: 100%; box-sizing: border-box; min-height: 44px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 16px; font-family: inherit; background: var(--bg); color: var(--navy); }
-.cons-field textarea { min-height: 100px; resize: vertical; }
-.cons-field input[type=file] { padding: 8px; font-size: 14px; }
 .cons-hint { font-size: 12px; line-height: 1.4; color: var(--text-muted); }
-.cons-as { margin: 0; font-size: 13px; color: var(--text-muted); overflow-wrap: anywhere; }
-.cons-err { background: rgba(239,68,68,.1); border: 1px solid #ef4444; color: #b91c1c; border-radius: 8px; padding: 10px 12px; font-size: 14px; }
-body.dark-mode .cons-err { color: #fca5a5; }
 .cons-submit { align-self: flex-start; padding: 12px 24px; border-radius: 999px; }
 .cons-submit:disabled { opacity: .6; cursor: default; }
-.cons-login { font-size: 14px; color: var(--text-muted); margin: 0; }
-.cons-login p { margin: 0 0 10px; }
-.cons-login .btn { border-radius: 999px; }
+.cons-start { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+
+/* Guided consultation chat: dark panel with green accents, built on the existing chat styles */
+.cg { max-width: 680px; margin: 0 auto; }
+.cg-back { display: inline-block; margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--accent); text-decoration: none; min-height: 32px; line-height: 32px; }
+.cg .rq-chat { --bg: #0A1426; --card-bg: #101C34; --border: rgba(255,255,255,.12); --navy: #F1F5F9; --text-muted: #9FB0C8; --accent: #22C55E; background: #0A1426; border-color: rgba(34,197,94,.35); }
+.cg-note { padding: 8px 14px; font-size: 12.5px; line-height: 1.4; color: var(--text-muted); background: var(--card-bg); border-bottom: 1px solid var(--border); }
+.cg-note b { color: #22C55E; }
+.cg .rq-msg.wide { max-width: 100%; }
+.cg .rq-msg.wide .rq-bub { width: 100%; box-sizing: border-box; }
+.cg .rq-msg.cg-safe .rq-bub { border-left: 3px solid #22C55E; border-top-left-radius: 4px; }
+.cg .rq-msg.cg-warn .rq-bub { border: 1px solid #F59E0B; background: rgba(245,158,11,.12); }
+.cg-hint { color: var(--text-muted); font-size: 12.5px; line-height: 1.4; }
+.cg-sum h5 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #22C55E; }
+.cg-sum h5:first-child { margin-top: 2px; }
+.cg-sum ul { margin: 0; padding-left: 18px; font-size: 14px; line-height: 1.5; }
+.cg-sum li { margin-bottom: 3px; }
+.cg-fine { margin: 12px 0 0; font-size: 12px; color: var(--text-muted); }
+.cg-share { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; font-size: 13px; overflow-wrap: anywhere; }
+.cg-consent-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; font-size: 13.5px; line-height: 1.45; cursor: pointer; }
+.cg-consent-row input { width: 22px; height: 22px; flex: 0 0 22px; margin: 1px 0 0; accent-color: #22C55E; }
 @media (max-width: 720px) {
   .cons { padding: 18px 14px; margin-top: 28px; }
-  .cons-row { grid-template-columns: 1fr; }
   .cons-submit { align-self: stretch; }
   .svcp-info dt { flex-basis: 64px; }
 }
@@ -6156,7 +6613,7 @@ def reset_password(token):
 # SERVICE REQUESTS + JOB THREAD (chat lives here, tied to a job)
 # ---------------------------------------------------------------------------
 
-def _render_services(user, consult_form=None, consult_error="", status=200):
+def _render_services(user):
     conn = get_db()
     rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
     conn.close()
@@ -6167,12 +6624,8 @@ def _render_services(user, consult_form=None, consult_error="", status=200):
     sections = [dict(sv, items=by_cat.get(sv["cat"], []),
                      job_cat=sv["cat"] if sv["cat"] in JOB_CATEGORIES else "Aluminum Fabrication") for sv in SERVICES]
     add_cat = request.args.get("add", "")
-    html = render_template("services.html", user=user, sections=sections, product_categories=PRODUCT_CATEGORIES,
-                           add_cat=add_cat if add_cat in PRODUCT_CATEGORIES else "", active_page="services", auto_open_auth=False,
-                           chips=[{"value": v, "label": l} for v, l in REQUEST_CHIPS], consult_topics=CONSULT_TOPICS,
-                           consult_dim_cats=list(CONSULT_DIMENSION_CATS),
-                           cf=consult_form or {}, consult_error=consult_error)
-    return html, status
+    return render_template("services.html", user=user, sections=sections, product_categories=PRODUCT_CATEGORIES,
+                           add_cat=add_cat if add_cat in PRODUCT_CATEGORIES else "", active_page="services", auto_open_auth=False)
 
 
 @app.route("/services")
@@ -6180,38 +6633,50 @@ def services():
     return _render_services(current_user())
 
 
+@app.route("/consultation/guide")
+def consult_guide():
+    user = current_user()
+    return render_template("consult_guide.html", user=user, guide=CONSULT_GUIDE, active_page="services", auto_open_auth=False)
+
+
+def _consult_reply(wants_json, ok, message, status=None, url=None):
+    if wants_json:
+        return jsonify(ok=ok, message=message, url=url), (status or (200 if ok else 400))
+    flash(message, "success" if ok else "error")
+    return redirect(url or url_for("consult_guide"))
+
+
 @app.route("/consultation", methods=["GET", "POST"])
 def consultation_request():
+    """Receives a finished guided consultation. It is saved as a normal job so it uses the same thread, attachments and alerts."""
     if request.method == "GET":
-        return redirect(url_for("services") + "#consultation")
+        return redirect(url_for("consult_guide"))
+    wj = request.headers.get("X-Requested-With") == "fetch"
     user = require_login()
     if not user or not is_customer(user):
-        flash("Log in as a customer to send a consultation request.", "error")
-        return redirect(url_for("services") + "#consultation")
+        return _consult_reply(wj, False, "Please log in with a customer account to send this request.", 401)
 
     labels = dict(REQUEST_CHIPS)
-    form = {
-        "category": request.form.get("category", ""),
-        "topic": request.form.get("topic", ""),
-        "description": request.form.get("description", "").strip()[:3000],
-        "location": " ".join(request.form.get("location", "").split())[:120],
-        "dimensions": " ".join(request.form.get("dimensions", "").split())[:200],
-    }
-    if form["category"] not in labels:
-        return _render_services(user, form, "Please choose the service category your question is about.", 400)
-    if form["topic"] not in CONSULT_TOPICS:
-        return _render_services(user, form, "Please choose the kind of help you need.", 400)
-    if len(form["description"]) < 10:
-        return _render_services(user, form, "Please describe your project in at least a sentence, so we know what to advise on.", 400)
+    category = request.form.get("category", "")
+    topic = " ".join(request.form.get("topic", "").split())[:80]
+    summary = request.form.get("summary", "").strip()[:4000]
+    location = " ".join(request.form.get("location", "").split())[:120]
+    dimensions = " ".join(request.form.get("dimensions", "").split())[:200]
+    if category not in labels:
+        return _consult_reply(wj, False, "Please start the consultation again and choose a category.")
+    if request.form.get("consent") != "1":
+        return _consult_reply(wj, False, "Please confirm that you agree to share this summary before sending.")
+    if not topic or len(summary) < 20:
+        return _consult_reply(wj, False, "The summary looks incomplete. Please go back and finish the questions.")
 
-    category, label, topic = form["category"], labels[form["category"]], form["topic"]
-    title = f"Consultation: {label} - {topic}"[:120]
-    lines = ["Consultation request", f"Help needed: {topic}", f"Service category: {label}"]
-    if form["location"]:
-        lines.append(f"Project location: {form['location']}")
-    if form["dimensions"]:
-        lines.append(f"Dimensions given by customer (not verified): {form['dimensions']}")
-    description = "\n".join(lines) + "\n\n" + form["description"]
+    title = f"Consultation: {topic}"[:120]
+    lines = ["Consultation request (guided consultation)", f"Service category: {labels[category]}"]
+    if location:
+        lines.append(f"Project location: {location}")
+    if dimensions:
+        lines.append(f"Dimensions given by customer (estimate, not verified): {dimensions}")
+    lines.append("The customer agreed to share this summary.")
+    description = "\n".join(lines) + "\n\n" + summary
 
     conn = None
     try:
@@ -6219,11 +6684,10 @@ def consultation_request():
         dup = conn.execute(
             "SELECT id FROM jobs WHERE customer_id=? AND title=? AND description=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1",
             (user["id"], title, description)).fetchone()
-        if dup:  # the same request was already sent (double tap or page refresh), so don't create a second one
+        if dup:  # the same request was already sent (double tap or retry), so don't create a second one
             job_id = dup["id"]
             conn.close()
-            flash("You already sent this request. Here is its conversation.", "success")
-            return redirect(url_for("job_thread", job_id=job_id))
+            return _consult_reply(wj, True, "This request was already sent. Here is its conversation.", url=url_for("job_thread", job_id=job_id))
         cur = conn.execute(
             "INSERT INTO jobs (customer_id, title, description, category, track, status) VALUES (?, ?, ?, ?, 'standard', 'submitted')",
             (user["id"], title, description, category))
@@ -6246,15 +6710,14 @@ def consultation_request():
                 conn.close()
         except Exception:
             pass
-        return _render_services(user, form, "Sorry, we could not send your request just now and nothing was submitted. Please try again.", 500)
+        return _consult_reply(wj, False, "Sorry, we could not send your request just now and nothing was submitted. Please try again.", 500)
 
     _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category,
                                      "customer_id": user["id"], "artisan_id": None}, description, "consultation request")
-    msg = "Your consultation request has been sent. You can follow up in this conversation."
+    msg = "Your consultation request has been sent. It has not been confirmed or scheduled yet. You can follow up in this conversation."
     if skipped:
         msg += f" {skipped} file{'s' if skipped != 1 else ''} could not be attached (photos and PDF, Word, Excel or text files only, up to 6)."
-    flash(msg, "success")
-    return redirect(url_for("job_thread", job_id=job_id))
+    return _consult_reply(wj, True, msg, url=url_for("job_thread", job_id=job_id))
 
 
 @app.route("/services/add", methods=["POST"])
