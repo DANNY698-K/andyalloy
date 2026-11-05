@@ -1,4 +1,5 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, send_from_directory, jsonify
+from flask import Flask, render_template, request, redirect, url_for, session, flash, Response, send_from_directory, jsonify, get_flashed_messages
+from markupsafe import escape
 from jinja2 import DictLoader
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -141,11 +142,14 @@ LOGIN_MAX_ATTEMPTS = 6
 LOGIN_LOCKOUT_SECONDS = 300
 
 
-def _login_rate_limited(key):
+LOGIN_MAX_ATTEMPTS_PER_DEVICE = 30
+
+
+def _login_rate_limited(key, limit=None):
     now = time.time()
     attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_LOCKOUT_SECONDS]
     _login_attempts[key] = attempts
-    return len(attempts) >= LOGIN_MAX_ATTEMPTS
+    return len(attempts) >= (limit or LOGIN_MAX_ATTEMPTS)
 
 
 def _record_login_attempt(key):
@@ -174,8 +178,11 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "REPLACE_ME")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "REPLACE_ME")
 
 
+GOOGLE_SIGNIN_ENABLED = os.environ.get("GOOGLE_SIGNIN_ENABLED", "0") == "1"  # off for now; the button is also removed from the login box
+
+
 def google_configured():
-    return "REPLACE_ME" not in (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+    return GOOGLE_SIGNIN_ENABLED and "REPLACE_ME" not in (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
 
 
 # ---------------------------------------------------------------------------
@@ -454,10 +461,39 @@ def _notify_push(sender, job, text, attachment_kind):
     else:
         title = f"💬 {name}"
     body = (text or "").strip()[:140] or "📎 Sent an attachment"
-    send_push_to_users(ids, {
-        "title": title, "body": body,
-        "url": url_for("job_thread", job_id=job["id"]), "tag": f"job-{job['id']}",
-    })
+    payload = {"title": title, "body": body, "url": url_for("job_thread", job_id=job["id"]), "tag": f"job-{job['id']}"}
+    if art_user and art_user in ids and job.get("status") != "in_progress":
+        send_push_to_users([i for i in ids if i != art_user], payload)
+        send_push_to_users([art_user], dict(payload, body=mask_phone_numbers(body)))
+    else:
+        send_push_to_users(ids, payload)
+
+
+_customer_email_last = {}
+
+
+def _notify_customer_of_message(sender, job, text, attachment_kind):
+    """Emails the customer about a reply (at most one email per job every 10 minutes, so a busy chat isn't spammy)."""
+    try:
+        if sender.get("role") not in ("owner", "artisan"):
+            return
+        now = time.time()
+        if now - _customer_email_last.get(job["id"], 0) < 600:
+            return
+        conn = get_db()
+        cust = conn.execute("SELECT name, email FROM users WHERE id=?", (job["customer_id"],)).fetchone()
+        conn.close()
+        if not cust or not cust["email"]:
+            return
+        _customer_email_last[job["id"]] = now
+        who = "Andy Alloy" if sender.get("role") == "owner" else "Your artisan"
+        snippet = (text or "").strip()[:300] or ("sent you a photo." if attachment_kind == "image" else "sent you a file.")
+        link = url_for("job_thread", job_id=job["id"], _external=True)
+        body = (f"Hi {cust['name']},\n\n{who} replied about \"{job['title']}\":\n\n{snippet}\n\n"
+                f"Open the conversation: {link}\n\nYou are receiving this because you have an open request with Andy Alloy.\n")
+        send_email_async(cust["email"], f"New reply about: {job['title']}"[:120], body)
+    except Exception as exc:
+        print("[ANDY] Customer alert failed:", exc)
 
 
 def _notify_owner_new_request(sender, job, text, kind="service request"):
@@ -522,17 +558,21 @@ STAFF_LOGIN_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta nam
 <style>body{margin:0;background:#0A1020;color:#fff;font-family:-apple-system,Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .box{width:100%;max-width:340px}h1{font-size:22px;margin:0 0 6px}p{color:#9ca3af;font-size:14px;margin:0 0 18px}
 input{width:100%;box-sizing:border-box;padding:14px;margin-bottom:12px;border-radius:10px;border:1px solid #1E2D4A;background:#111A2E;color:#fff;font-size:16px}
-button{width:100%;padding:14px;border:none;border-radius:10px;background:#22C55E;color:#04140A;font-weight:700;font-size:16px;cursor:pointer}a{color:#22C55E;font-size:13px}</style></head>
-<body><form class="box" method="POST" action="/login"><input type="hidden" name="csrf_token" value="__TOKEN__">
-<h1>Staff login</h1><p>For the ANDY owner and team.</p>
-<input type="email" name="email" placeholder="Email" autocomplete="username" required>
-<input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
+button{width:100%;padding:14px;border:none;border-radius:10px;background:#22C55E;color:#04140A;font-weight:700;font-size:16px;cursor:pointer}a{color:#22C55E;font-size:13px}.err{background:#3b1d1d;color:#fca5a5;border-radius:8px;padding:10px 12px;font-size:14px;margin-bottom:12px}</style></head>
+<body><form class="box" method="POST" action="/login"><input type="hidden" name="csrf_token" value="__TOKEN__"><input type="hidden" name="from" value="staff">
+<h1>Staff login</h1><p>For the ANDY owner and team.</p>__ERR__
+<input type="email" name="email" placeholder="Email" value="__EMAIL__" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+<div style="position:relative"><input type="password" id="pw" name="password" placeholder="Password" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false" style="padding-right:64px" required><button type="button" id="pwt" style="position:absolute;right:6px;top:6px;width:auto;padding:8px 10px;margin:0;background:transparent;color:#22C55E;font-size:13px" onclick="var i=document.getElementById('pw');var s=i.type==='password';i.type=s?'text':'password';this.textContent=s?'Hide':'Show'">Show</button></div>
 <button type="submit">Log in</button><p style="margin-top:14px"><a href="/forgot-password">Forgot password?</a></p></form></body></html>"""
 
 
 @app.route("/staff-login")
 def staff_login():
-    return Response(STAFF_LOGIN_HTML.replace("__TOKEN__", get_csrf_token()), mimetype="text/html")
+    errs = [m for c, m in get_flashed_messages(with_categories=True) if c == "login_error"]
+    err_html = f'<div class="err" role="alert">{escape(errs[0])}</div>' if errs else ""
+    html = (STAFF_LOGIN_HTML.replace("__TOKEN__", get_csrf_token()).replace("__ERR__", err_html)
+            .replace("__EMAIL__", escape(session.get("login_email", ""))))
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/mode", methods=["POST"])
@@ -1238,8 +1278,20 @@ def init_db():
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def mask_phone_numbers(text):
-    return PHONE_PATTERN.sub("[number hidden]", text)
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+LINK_PATTERN = re.compile(r"(?:https?://|www\.|wa\.me/|t\.me/|bit\.ly/)\S+", re.I)
+
+
+def mask_phone_numbers(text, keep_phones=False):
+    """Keeps customers and artisans on the platform: hides emails and links, and phone numbers unless keep_phones is set."""
+    text = EMAIL_PATTERN.sub("[email hidden]", text)
+    text = LINK_PATTERN.sub("[link hidden]", text)
+    return text if keep_phones else PHONE_PATTERN.sub("[number hidden]", text)
+
+
+def _hide_numbers_for(user, job_status):
+    """Artisans never see phone numbers in a chat until the job is in progress."""
+    return is_artisan(user) and job_status != "in_progress"
 
 
 def current_user():
@@ -1418,7 +1470,7 @@ TEMPLATES = {
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>{% block title %}ANDY | Aluminum made simple{% endblock %}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <script>document.documentElement.classList.add('js');try{if(sessionStorage.getItem('andySplashSeen'))document.documentElement.classList.add('no-splash')}catch(e){}</script>
 </head>
@@ -1560,7 +1612,7 @@ TEMPLATES = {
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
           {% for category, message in messages %}
-            <div class="flash flash-{{ category }}">{{ message }}</div>
+            {% if category not in ('login_error', 'signup_error') %}<div class="flash flash-{{ category }}">{{ message }}</div>{% endif %}
           {% endfor %}
         {% endif %}
       {% endwith %}
@@ -1896,6 +1948,39 @@ if (location.hash.indexOf('#reviews-') === 0) {
   {% if auto_open_auth %}
     openAuth();
   {% endif %}
+  (function() {
+    var h = location.hash;
+    if (h === '#login' || h === '#signup') {
+      openAuth(); showStep(h === '#login' ? 'loginForm' : 'signupForm');
+      if (history.replaceState) history.replaceState(null, '', location.pathname + location.search);
+    }
+    [].forEach.call(document.querySelectorAll('.js-time[data-ts]'), function(el) {
+      var d = new Date(el.dataset.ts.replace(' ', 'T').slice(0, 19) + 'Z');
+      if (isNaN(d)) return;
+      var t = new Date(), y = new Date(); y.setDate(t.getDate() - 1);
+      el.textContent = d.toDateString() === t.toDateString() ? d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+        : d.toDateString() === y.toDateString() ? 'Yesterday' : d.toLocaleDateString([], {day: 'numeric', month: 'short'});
+    });
+    function enhance() {
+      [].forEach.call(document.querySelectorAll('input[type=email]'), function(i) {
+        i.setAttribute('autocapitalize', 'none'); i.setAttribute('autocorrect', 'off'); i.setAttribute('spellcheck', 'false');
+      });
+      [].forEach.call(document.querySelectorAll('input[type=password]'), function(i) {
+        if (i.dataset.pw) return; i.dataset.pw = '1';
+        i.setAttribute('autocapitalize', 'none'); i.setAttribute('autocorrect', 'off'); i.setAttribute('spellcheck', 'false');
+        var w = document.createElement('div'); w.className = 'pw-wrap';
+        i.parentNode.insertBefore(w, i); w.appendChild(i);
+        var b = document.createElement('button'); b.type = 'button'; b.className = 'pw-toggle';
+        b.setAttribute('aria-label', 'Show password'); b.textContent = 'Show';
+        b.addEventListener('click', function() {
+          var show = i.type === 'password'; i.type = show ? 'text' : 'password';
+          b.textContent = show ? 'Hide' : 'Show'; b.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+        });
+        w.appendChild(b);
+      });
+    }
+    enhance();
+  })();
 </script>
 
 
@@ -2076,19 +2161,14 @@ window.startAndyTour = function() {
       <span class="modal-brand-name">ANDY.</span>
     </div>
 
-    <a href="{{ url_for('login_google') }}" class="btn btn-google" style="margin-bottom:14px;">
-      <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.4 0 6.4 1.2 8.8 3.5l6.6-6.6C35.3 2.5 30 0 24 0 14.6 0 6.5 5.4 2.5 13.2l7.7 6C12.1 13 17.6 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.2-.4-4.7H24v9h12.6c-.5 3-2.2 5.5-4.7 7.2l7.2 5.6c4.2-3.9 6.4-9.6 6.4-17.1z"/><path fill="#FBBC05" d="M10.2 19.2A14.6 14.6 0 0 0 9.5 24c0 1.7.3 3.3.7 4.8l-7.7 6A24 24 0 0 1 0 24c0-3.9.9-7.5 2.5-10.8l7.7 6z"/><path fill="#34A853" d="M24 48c6.5 0 12-2.1 16-5.8l-7.2-5.6c-2 1.4-4.7 2.2-8.8 2.2-6.4 0-11.9-3.5-13.8-8.7l-7.7 6C6.5 42.6 14.6 48 24 48z"/></svg>
-      Continue with Google
-    </a>
-    <div class="divider-or">or</div>
-
     <div id="signupForm">
       <h3 class="modal-headline">Let's get you set up 👋</h3>
+      {% for c, m in get_flashed_messages(with_categories=true) %}{% if c == 'signup_error' %}<div class="auth-err" role="alert">{{ m }}</div>{% endif %}{% endfor %}
       <p style="font-size:13px;color:var(--text-muted);margin-top:4px;">A free account is all it takes to request a service, chat with Andy, and start browsing.</p>
       <form class="auth-form" method="POST" action="{{ url_for('signup_customer') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <input type="text" name="name" placeholder="Full name" required>
-        <input type="email" name="email" placeholder="Email address" required>
-        <input type="password" name="password" placeholder="Create a password (min 6 chars)" required>
+        <input type="text" name="name" placeholder="Full name" autocomplete="name" required>
+        <input type="email" name="email" placeholder="Email address" autocomplete="email" required>
+        <input type="password" name="password" placeholder="Create a password (min 6 chars)" autocomplete="new-password" minlength="6" required>
         <button class="btn btn-purple" type="submit">Create my account</button>
         <p class="terms-note">Terms and conditions apply. By continuing you agree to our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> and <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
       </form>
@@ -2099,10 +2179,11 @@ window.startAndyTour = function() {
 
     <div id="loginForm" style="display:none;">
       <h3 class="modal-headline">Welcome back 🙌</h3>
+      {% for c, m in get_flashed_messages(with_categories=true) %}{% if c == 'login_error' %}<div class="auth-err" role="alert">{{ m }}</div>{% endif %}{% endfor %}
       <p style="font-size:13px;color:var(--text-muted);margin-top:4px;">Good to see you again — log in to pick up where you left off.</p>
       <form class="auth-form" method="POST" action="{{ url_for('login') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <input type="email" name="email" placeholder="Email address" required>
-        <input type="password" name="password" placeholder="Password" required>
+        <input type="email" name="email" placeholder="Email address" value="{{ session.get('login_email', '') }}" autocomplete="username" required>
+        <input type="password" name="password" placeholder="Password" autocomplete="current-password" required>
         <button class="btn btn-purple" type="submit">Log in</button>
         <p class="terms-note">Terms and conditions apply. By continuing you agree to our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> and <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
       </form>
@@ -2578,8 +2659,82 @@ MORE_TEMPLATES_1 = {
 
 "job_thread.html": '''{% extends "base.html" %}
 {% block content %}
+<div class="conv" id="conv">
+  <header class="conv-head">
+    <a class="conv-back" href="{{ back_url }}" aria-label="Back to chats">‹</a>
+    <div class="conv-av" aria-hidden="true">{{ head_title[0]|upper }}</div>
+    <div class="conv-title"><b>{{ head_title }}</b><span>{{ head_sub }}</span></div>
+    <span class="status-badge status-{{ job.status }}">{{ job.status.replace('_',' ')|title }}</span>
+    <button type="button" class="conv-info-btn" id="convInfoBtn" aria-expanded="false" aria-controls="convInfo" aria-label="Job details">ⓘ</button>
+  </header>
+  <div class="conv-main">
+    <section class="conv-chat">
+      <div class="conv-actions">
+{% if is_customer_view and job.status == 'assigned' and job.amount and job.amount > 0 %}
+  {% if payments_enabled %}
+  <form method="POST" action="{{ url_for('pay_for_job', job_id=job.id) }}" style="margin-bottom:16px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-gold" type="submit" style="width:100%;">Pay ₦{{ "{:,}".format(job.amount) }} &amp; Confirm — held in escrow</button>
+  </form>
+  {% else %}
+  <div class="info-card" style="margin-bottom:16px;font-size:14px;">Agreed price: <b>₦{{ "{:,}".format(job.amount) }}</b>. Pay Andy using the details Andy shares in this chat.</div>
+  {% endif %}
+{% endif %}
+{% if is_customer_view and job.status == 'in_progress' %}
+  <form method="POST" action="{{ url_for('complete_service_job', job_id=job.id) }}" style="margin-bottom:16px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-teal" type="submit" style="width:100%;">✓ Mark complete &amp; release payment</button>
+  </form>
+{% endif %}
 
-<div class="section-title">{{ job.title }}</div>
+{% if is_customer_view and job.status == 'completed' and job.artisan_id and not review %}<button type="button" class="btn btn-outline conv-rate" data-open-info>⭐ Rate your artisan</button>{% endif %}
+      </div>
+      <div class="chat-box">
+        <div class="chat-messages" id="chatMessages" data-job="{{ job.id }}" data-me="{{ user.id }}" data-poll="{{ url_for('job_messages_json', job_id=job.id) }}">
+          {% if not messages %}
+            <div class="empty-state" id="chatEmpty">No messages yet. Say hello, or add photos to get started.</div>
+          {% endif %}
+          {% for m in messages %}
+            {% if m.sender_role == 'system' %}
+              <div class="msg-row msg-row-sys" data-id="{{ m.id }}" data-ts="{{ (m.created_at|string)[:19] }}"><div class="msg-sys">{{ m.text }}</div></div>
+            {% else %}
+            <div class="msg-row {{ 'msg-row-me' if m.sender_id == user.id else 'msg-row-them' }}" data-id="{{ m.id }}" data-ts="{{ (m.created_at|string)[:19] }}">
+              {% if m.sender_id != user.id %}
+                {% if m.sender_avatar %}
+                  <div class="profile-avatar msg-avatar" style="background-image:url('{{ m.sender_avatar|photo_url('avatars') }}');"></div>
+                {% else %}
+                  <div class="profile-avatar profile-avatar-placeholder msg-avatar">{{ (m.sender_name or '?')[0]|upper }}</div>
+                {% endif %}
+              {% endif %}
+              <div class="msg {{ 'me' if m.sender_id == user.id else 'them' }}">
+                {% if m.sender_id != user.id %}<div class="msg-sender">{{ m.sender_name }} · {{ m.sender_role|title }}</div>{% endif %}
+                {% if m.text %}<span class="msg-text">{{ m.text }}</span>{% endif %}
+                {% if m.attachment_filename %}
+                  {% if m.attachment_kind == 'image' %}
+                    <div><img src="{{ m.attachment_filename|photo_url('attachments') }}" style="max-width:180px;border-radius:10px;margin-top:6px;" alt="Photo"></div>
+                  {% else %}
+                    <div><a href="{{ m.attachment_filename|photo_url('attachments') }}" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>
+                  {% endif %}
+                {% endif %}
+                <span class="msg-meta"><span data-time="{{ (m.created_at|string)[:19] }}">{{ (m.created_at|string)[11:16] }}</span>{% if m.sender_id == user.id %} <span class="ticks {{ 'ticks-read' if m.is_read }}" data-tick="{{ m.id }}">{{ '✓✓' if m.is_read else '✓' }}</span>{% endif %}</span>
+              </div>
+            </div>
+            {% endif %}
+          {% endfor %}
+        </div>
+        <form class="chat-input telegram-composer" id="chatForm" method="POST" action="{{ url_for('post_job_message', job_id=job.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="button" class="attach-btn" onclick="document.getElementById('chat-file-{{ job.id }}').click()" title="Attach a file or photo" aria-label="Attach a file or photo">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
+          <input type="file" id="chat-file-{{ job.id }}" name="attachment" style="display:none;" onchange="document.getElementById('chat-file-label-{{ job.id }}').textContent = this.files[0] ? this.files[0].name : '';">
+          <input type="text" name="text" placeholder="Message" class="chat-text-input" autocomplete="off" aria-label="Message">
+          <button class="send-btn" type="submit" title="Send" aria-label="Send">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M2 12l19-9-6 19-4.5-7.5L2 12z" fill="#22C55E"/></svg>
+          </button>
+        </form>
+        <div id="chat-file-label-{{ job.id }}" class="chat-file-label"></div>
+      </div>
+    </section>
+    <aside class="conv-info" id="convInfo" aria-label="Job details">
+      <div class="conv-info-head"><b>Job details</b><button type="button" id="convInfoClose" aria-label="Close details">✕</button></div>
 <div class="job-card" style="margin-bottom:16px;">
   <div class="job-meta">
     {{ job.category }} ·
@@ -2602,6 +2757,18 @@ MORE_TEMPLATES_1 = {
   <div style="font-size:12px;color:var(--text-muted);margin-top:8px;">Customer: {{ customer_name }}{% if artisan_name %} · Artisan: {{ artisan_name }}{% endif %}</div>
 </div>
 
+{% if job.category not in ('General Support', 'Feedback', 'Bug Report') and job.status in ('submitted', 'assigned', 'in_progress') %}
+  {% if is_customer_view %}
+  <div class="info-card pay-note">💳 <b>Pay Andy only.</b> Never pay the artisan directly. Your artisan is paid by Andy after the job is done.</div>
+  {% elif user.role == 'artisan' %}
+  <div class="info-card pay-note">💳 Andy pays you after the job is complete. Do not ask for or accept payment from the customer.</div>
+  {% endif %}
+{% endif %}
+{% if is_customer_view and job.status in ('submitted', 'assigned') and job.category not in ('General Support', 'Feedback', 'Bug Report') %}
+  <form method="POST" action="{{ url_for('cancel_job', job_id=job.id) }}" style="margin-bottom:16px;" onsubmit="return confirm('Cancel this request?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-outline" type="submit" style="width:100%;">Cancel this request</button>
+  </form>
+{% endif %}
 {% if is_owner_view %}
   <div class="post-composer">
     <div class="section-title" style="font-size:14px;">Admin controls</div>
@@ -2629,33 +2796,6 @@ MORE_TEMPLATES_1 = {
   </div>
 {% endif %}
 
-{% if is_customer_view and job.status == 'assigned' and job.amount and job.amount > 0 %}
-  {% if payments_enabled %}
-  <form method="POST" action="{{ url_for('pay_for_job', job_id=job.id) }}" style="margin-bottom:16px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button class="btn btn-gold" type="submit" style="width:100%;">Pay ₦{{ "{:,}".format(job.amount) }} &amp; Confirm — held in escrow</button>
-  </form>
-  {% else %}
-  <div class="info-card" style="margin-bottom:16px;font-size:14px;">Agreed price: <b>₦{{ "{:,}".format(job.amount) }}</b>. Pay Andy using the details Andy shares in this chat.</div>
-  {% endif %}
-{% endif %}
-{% if job.category not in ('General Support', 'Feedback', 'Bug Report') and job.status in ('submitted', 'assigned', 'in_progress') %}
-  {% if is_customer_view %}
-  <div class="info-card pay-note">💳 <b>Pay Andy only.</b> Never pay the artisan directly. Your artisan is paid by Andy after the job is done.</div>
-  {% elif user.role == 'artisan' %}
-  <div class="info-card pay-note">💳 Andy pays you after the job is complete. Do not ask for or accept payment from the customer.</div>
-  {% endif %}
-{% endif %}
-{% if is_customer_view and job.status in ('submitted', 'assigned') and job.category not in ('General Support', 'Feedback', 'Bug Report') %}
-  <form method="POST" action="{{ url_for('cancel_job', job_id=job.id) }}" style="margin-bottom:16px;" onsubmit="return confirm('Cancel this request?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button class="btn btn-outline" type="submit" style="width:100%;">Cancel this request</button>
-  </form>
-{% endif %}
-{% if is_customer_view and job.status == 'in_progress' %}
-  <form method="POST" action="{{ url_for('complete_service_job', job_id=job.id) }}" style="margin-bottom:16px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button class="btn btn-teal" type="submit" style="width:100%;">✓ Mark complete &amp; release payment</button>
-  </form>
-{% endif %}
-
 {% if is_customer_view and job.status == 'completed' and job.artisan_id %}
   {% if review %}
     <div class="settings-card">
@@ -2681,69 +2821,87 @@ MORE_TEMPLATES_1 = {
   {% endif %}
 {% endif %}
 
-<div class="chat-box">
-  <div class="chat-messages" id="chatMessages" data-job="{{ job.id }}" data-me="{{ user.id }}" data-poll="{{ url_for('job_messages_json', job_id=job.id) }}">
-    {% if not messages %}
-      <div class="empty-state" id="chatEmpty">No messages yet.</div>
-    {% endif %}
-    {% for m in messages %}
-      <div class="msg-row {{ 'msg-row-me' if m.sender_id == user.id else 'msg-row-them' }}" data-id="{{ m.id }}">
-        {% if m.sender_id != user.id %}
-          {% if m.sender_avatar %}
-            <div class="profile-avatar msg-avatar" style="background-image:url('{{ m.sender_avatar|photo_url('avatars') }}');"></div>
-          {% else %}
-            <div class="profile-avatar profile-avatar-placeholder msg-avatar">{{ m.sender_name[0]|upper }}</div>
-          {% endif %}
-        {% endif %}
-        <div class="msg {{ 'me' if m.sender_id == user.id else 'them' }}">
-          {% if m.sender_id != user.id %}<div class="msg-sender">{{ m.sender_name }} · {{ m.sender_role|title }}</div>{% endif %}
-          {% if m.text %}<span class="msg-text">{{ m.text }}</span>{% endif %}
-          {% if m.attachment_filename %}
-            {% if m.attachment_kind == 'image' %}
-              <div><img src="{{ m.attachment_filename|photo_url('attachments') }}" style="max-width:180px;border-radius:8px;margin-top:6px;"></div>
-            {% else %}
-              <div><a href="{{ m.attachment_filename|photo_url('attachments') }}" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>
-            {% endif %}
-          {% endif %}
-          <span class="msg-meta">{{ (m.created_at|string)[11:16] }}{% if m.sender_id == user.id %} <span class="ticks {{ 'ticks-read' if m.is_read }}" data-tick="{{ m.id }}">{{ '✓✓' if m.is_read else '✓' }}</span>{% endif %}</span>
-        </div>
-      </div>
-    {% endfor %}
+    </aside>
   </div>
-  <form class="chat-input telegram-composer" id="chatForm" method="POST" action="{{ url_for('post_job_message', job_id=job.id) }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="button" class="attach-btn" onclick="document.getElementById('chat-file-{{ job.id }}').click()" title="Attach a file or photo">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    </button>
-    <input type="file" id="chat-file-{{ job.id }}" name="attachment" style="display:none;" onchange="document.getElementById('chat-file-label-{{ job.id }}').textContent = this.files[0] ? this.files[0].name : '';">
-    <input type="text" name="text" placeholder="Type a message..." class="chat-text-input" autocomplete="off">
-    <button class="send-btn" type="submit" title="Send">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M2 12l19-9-6 19-4.5-7.5L2 12z" fill="#22C55E"/></svg>
-    </button>
-  </form>
-  <div id="chat-file-label-{{ job.id }}" style="font-size:11px;color:var(--text-muted);padding:4px 12px;"></div>
 </div>
 
 <script>
 (function() {
+  var conv = document.getElementById('conv');
   var box = document.getElementById('chatMessages');
   if (!box) return;
   var me = parseInt(box.dataset.me, 10);
   var pollUrl = box.dataset.poll;
   var form = document.getElementById('chatForm');
   var busy = false;
+  var mq = window.matchMedia('(max-width: 720px)');
 
+  function esc(t) { var d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+  function scrollDown() { box.scrollTop = box.scrollHeight; }
   function lastId() {
     var rows = box.querySelectorAll('.msg-row[data-id]');
     return rows.length ? parseInt(rows[rows.length - 1].dataset.id, 10) : 0;
   }
-  function scrollDown() { box.scrollTop = box.scrollHeight; }
-  function esc(t) { var d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+
+  // full-screen conversation on phones (the page behind it doesn't scroll)
+  function lockBody() { document.body.classList.toggle('conv-open', mq.matches); }
+  lockBody();
+  if (mq.addEventListener) mq.addEventListener('change', lockBody);
+  if (window.visualViewport) {
+    var fit = function() {
+      var vv = window.visualViewport;
+      if (mq.matches) { conv.style.top = vv.offsetTop + 'px'; conv.style.height = vv.height + 'px'; conv.style.bottom = 'auto'; scrollDown(); }
+      else { conv.style.top = ''; conv.style.height = ''; conv.style.bottom = ''; }
+    };
+    window.visualViewport.addEventListener('resize', fit);
+    window.visualViewport.addEventListener('scroll', fit);
+    fit();
+  }
+
+  // job details panel
+  var infoBtn = document.getElementById('convInfoBtn'), infoClose = document.getElementById('convInfoClose');
+  function setInfo(on) { conv.classList.toggle('open', on); if (infoBtn) infoBtn.setAttribute('aria-expanded', on ? 'true' : 'false'); }
+  if (infoBtn) infoBtn.addEventListener('click', function() { setInfo(!conv.classList.contains('open')); });
+  if (infoClose) infoClose.addEventListener('click', function() { setInfo(false); });
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') setInfo(false); });
+  [].forEach.call(document.querySelectorAll('[data-open-info]'), function(b) { b.addEventListener('click', function() { setInfo(true); }); });
+
+  // times are stored in UTC: show them in the reader's own time, with day dividers
+  function toDate(ts) { return ts ? new Date(ts.replace(' ', 'T').slice(0, 19) + 'Z') : null; }
+  function dayLabel(d) {
+    var t = new Date(), y = new Date(); y.setDate(t.getDate() - 1);
+    if (d.toDateString() === t.toDateString()) return 'Today';
+    if (d.toDateString() === y.toDateString()) return 'Yesterday';
+    return d.toLocaleDateString([], {weekday: 'short', day: 'numeric', month: 'short'});
+  }
+  function localize() {
+    [].forEach.call(box.querySelectorAll('[data-time]'), function(el) {
+      var d = toDate(el.dataset.time);
+      if (d && !isNaN(d)) el.textContent = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    });
+    [].forEach.call(box.querySelectorAll('.msg-day'), function(n) { n.remove(); });
+    var prev = '';
+    [].forEach.call(box.querySelectorAll('.msg-row[data-ts]'), function(row) {
+      var d = toDate(row.dataset.ts);
+      if (!d || isNaN(d)) return;
+      var key = d.toDateString();
+      if (key !== prev) {
+        var s = document.createElement('div'); s.className = 'msg-day'; s.innerHTML = '<span>' + esc(dayLabel(d)) + '</span>';
+        box.insertBefore(s, row); prev = key;
+      }
+    });
+  }
 
   function render(m) {
-    var mine = m.sender_id === me;
     var row = document.createElement('div');
+    row.dataset.id = m.id; row.dataset.ts = m.ts || '';
+    if (m.sender_role === 'system') {
+      row.className = 'msg-row msg-row-sys';
+      row.innerHTML = '<div class="msg-sys">' + esc(m.text) + '</div>';
+      return row;
+    }
+    var mine = m.sender_id === me;
     row.className = 'msg-row ' + (mine ? 'msg-row-me' : 'msg-row-them');
-    row.dataset.id = m.id;
     var h = '';
     if (!mine) {
       h += m.avatar_url
@@ -2755,10 +2913,10 @@ MORE_TEMPLATES_1 = {
     if (m.text) h += '<span class="msg-text">' + esc(m.text) + '</span>';
     if (m.attachment_url) {
       h += m.attachment_kind === 'image'
-        ? '<div><img src="' + esc(m.attachment_url) + '" style="max-width:180px;border-radius:8px;margin-top:6px;"></div>'
+        ? '<div><img src="' + esc(m.attachment_url) + '" style="max-width:180px;border-radius:10px;margin-top:6px;" alt="Photo"></div>'
         : '<div><a href="' + esc(m.attachment_url) + '" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>';
     }
-    h += '<span class="msg-meta">' + esc(m.time);
+    h += '<span class="msg-meta"><span data-time="' + esc(m.ts || '') + '">' + esc(m.time) + '</span>';
     if (mine) h += ' <span class="ticks ' + (m.is_read ? 'ticks-read' : '') + '" data-tick="' + m.id + '">' + (m.is_read ? '✓✓' : '✓') + '</span>';
     h += '</span></div>';
     row.innerHTML = h;
@@ -2779,7 +2937,7 @@ MORE_TEMPLATES_1 = {
       var t = box.querySelector('[data-tick="' + id + '"]');
       if (t && !t.classList.contains('ticks-read')) { t.classList.add('ticks-read'); t.textContent = '✓✓'; }
     });
-    if (added) scrollDown();
+    if (added) { localize(); scrollDown(); }
     if (window.updateUnreadBadges) window.updateUnreadBadges(data.unread);
   }
 
@@ -2794,6 +2952,7 @@ MORE_TEMPLATES_1 = {
   }
   setInterval(poll, 2500);
   document.addEventListener('visibilitychange', function() { if (!document.hidden) poll(); });
+  localize();
   scrollDown();
 
   if (form) {
@@ -2822,6 +2981,7 @@ MORE_TEMPLATES_1 = {
 </script>
 
 {% endblock %}
+
 ''',
 }
 
@@ -2887,7 +3047,7 @@ MORE_TEMPLATES_2 = {
       <div class="chat-row-body">
         <div class="chat-row-top">
           <span class="chat-row-name">{{ c.customer_name }}</span>
-          <span class="status-badge status-{{ c.status }}">{{ c.status.replace('_',' ')|title }}</span>
+          <span class="chat-row-meta"><span class="status-badge status-{{ c.status }}">{{ c.status.replace('_',' ')|title }}</span>{% if c.last_at %}<span class="chat-row-time js-time" data-ts="{{ (c.last_at|string)[:19] }}">{{ (c.last_at|string)[11:16] }}</span>{% endif %}</span>
         </div>
         <div class="chat-row-job">{{ c.title }}</div>
         {% if c.last_text %}
@@ -3715,7 +3875,7 @@ MORE_TEMPLATES_3 = {
     <li><b>Photos and videos:</b> stored with Cloudinary (when switched on), otherwise on our server.</li>
     <li><b>Emails:</b> alerts and password-reset emails are sent through an email service (Gmail).</li>
     <li><b>Notifications:</b> if you turn them on, they travel through your browser's own push service (for example Google, Apple or Mozilla).</li>
-    <li><b>Google sign-in and payments:</b> Google, and Paystack when payments are switched on, only when you choose to use them.</li>
+    <li><b>Payments:</b> Paystack, when payments are switched on, only when you choose to use it.</li>
   </ul>
 
   <h2>Who can see it</h2>
@@ -3802,13 +3962,20 @@ MORE_TEMPLATES_3 = {
     body.appendChild(d); down();
     setTimeout(function() { d.remove(); cb(); }, 350);
   }
+  function addChip(parent, it) {
+    var b = document.createElement('button'); b.type = 'button'; b.className = 'rq-chip' + (it.primary ? ' primary' : '') + (it.nav ? ' nav' : '');
+    b.textContent = it.label; b.onclick = function() { if (st.sending) return; setQuick([]); it.fn(); }; parent.appendChild(b);
+  }
   function setQuick(items) {
     if (items.length) lastItems = items;
     quick.innerHTML = '';
-    items.forEach(function(it) {
-      var b = document.createElement('button'); b.type = 'button'; b.className = 'rq-chip' + (it.primary ? ' primary' : '');
-      b.textContent = it.label; b.onclick = function() { if (st.sending) return; setQuick([]); it.fn(); }; quick.appendChild(b);
-    });
+    var main = items.filter(function(i) { return !i.nav; }), nav = items.filter(function(i) { return i.nav; });
+    if (main.length) {
+      var longest = 0; main.forEach(function(i) { longest = Math.max(longest, i.label.length); });
+      var g = document.createElement('div'); g.className = 'cg-opts' + ((longest > 30 || main.length <= 2) ? ' one' : '');
+      main.forEach(function(i) { addChip(g, i); }); quick.appendChild(g);
+    }
+    if (nav.length) { var n = document.createElement('div'); n.className = 'cg-nav'; nav.forEach(function(i) { addChip(n, i); }); quick.appendChild(n); }
     down();
   }
   function lock() { input.disabled = true; sendBtn.disabled = true; attach.disabled = true; input.placeholder = 'Choose an option above…'; }
@@ -3875,8 +4042,8 @@ MORE_TEMPLATES_3 = {
   }
   function backItems() {
     var items = [];
-    if (st.i > 0) items.push({ label: '↩ Back', fn: goBack });
-    items.push({ label: 'Start over', fn: restart });
+    if (st.i > 0) items.push({ label: '↩ Back', nav: true, fn: goBack });
+    items.push({ label: 'Start over', nav: true, fn: restart });
     return items;
   }
   function goBack() {
@@ -3998,8 +4165,8 @@ MORE_TEMPLATES_3 = {
       setQuick([
         { label: 'Request Professional Assistance', primary: true, fn: requestHelp },
         { label: 'What affects the cost?', fn: function() { bubble('user', 'What affects the cost?'); say(esc(G.cost), again); } },
-        { label: 'Change my answers', fn: function() { var id = st.cat, l = cat().icon + ' ' + cat().label; bubble('user', 'Change my answers'); choose(id, l); } },
-        { label: 'Start over', fn: restart }
+        { label: 'Change my answers', nav: true, fn: function() { var id = st.cat, l = cat().icon + ' ' + cat().label; bubble('user', 'Change my answers'); choose(id, l); } },
+        { label: 'Start over', nav: true, fn: restart }
       ]);
     }, 'wide');
   }
@@ -4451,7 +4618,7 @@ function shareReel(title, url) {
       <div class="chat-row-body">
         <div class="chat-row-top">
           <span class="chat-row-name">{{ c.title }}</span>
-          <span class="status-badge status-{{ c.status }}">{{ c.status.replace('_',' ')|title }}</span>
+          <span class="chat-row-meta"><span class="status-badge status-{{ c.status }}">{{ c.status.replace('_',' ')|title }}</span>{% if c.last_at %}<span class="chat-row-time js-time" data-ts="{{ (c.last_at|string)[:19] }}">{{ (c.last_at|string)[11:16] }}</span>{% endif %}</span>
         </div>
         {% if c.last_text %}
           <div class="chat-row-preview {{ 'chat-row-preview-unread' if c.unread }}">{{ c.last_text[:90] }}{% if c.last_text|length > 90 %}...{% endif %}</div>
@@ -5142,7 +5309,8 @@ body.dark-mode .theme-option { background: #111A2E; }
 body.dark-mode .close-btn { color: #8FA3C4; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-  font-family: 'DM Sans', -apple-system, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Inter', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility;
   background: var(--bg);
   color: var(--navy);
 }
@@ -5318,6 +5486,10 @@ main { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
 
 .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
 .flash-error { background: #fbeaea; color: #c0392b; }
+.auth-err { margin: 12px 0 8px; padding: 10px 12px; border-radius: 8px; background: #fbeaea; color: #c0392b; font-size: 13.5px; line-height: 1.4; }
+.pw-wrap { position: relative; display: flex; width: 100%; }
+.pw-wrap input { flex: 1; min-width: 0; padding-right: 64px; }
+.pw-toggle { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); border: 0; background: transparent; color: var(--accent); font-size: 13px; font-weight: 600; cursor: pointer; padding: 8px 10px; min-height: 36px; font-family: inherit; }
 .flash-success { background: #e9f7f1; color: #1f7a52; }
 .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 14px; }
 
@@ -5980,6 +6152,15 @@ body.dark-mode .svcp-art { background: rgba(7,12,26,.55); }
 .cg .rq-chat { --bg: #0A1426; --card-bg: #101C34; --border: rgba(255,255,255,.12); --navy: #F1F5F9; --text-muted: #9FB0C8; --accent: #22C55E; background: #0A1426; border-color: rgba(34,197,94,.35); }
 .cg-note { padding: 8px 14px; font-size: 12.5px; line-height: 1.4; color: var(--text-muted); background: var(--card-bg); border-bottom: 1px solid var(--border); }
 .cg-note b { color: #22C55E; }
+.cg .rq-quick { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 10px; padding: 8px 14px 10px; max-height: 46vh; overflow-y: auto; }
+.cg .cg-opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.cg .cg-opts.one { grid-template-columns: 1fr; }
+.cg .rq-chip { border-radius: 12px; padding: 10px 12px; min-height: 46px; display: flex; align-items: center; justify-content: center; text-align: center; line-height: 1.25; font-size: 14px; }
+.cg .cg-opts.one .rq-chip { justify-content: flex-start; text-align: left; }
+.cg .rq-chip.primary { grid-column: 1 / -1; justify-content: center; text-align: center; }
+.cg .cg-nav { display: flex; gap: 18px; }
+.cg .rq-chip.nav { border: 0; background: transparent; min-height: 36px; padding: 6px 2px; font-size: 13px; color: var(--text-muted); font-weight: 600; text-decoration: underline; }
+.cg .rq-chip.nav:hover { background: transparent; color: #22C55E; }
 .cg .rq-msg.wide { max-width: 100%; }
 .cg .rq-msg.wide .rq-bub { width: 100%; box-sizing: border-box; }
 .cg .rq-msg.cg-safe .rq-bub { border-left: 3px solid #22C55E; border-top-left-radius: 4px; }
@@ -6230,6 +6411,58 @@ body.dark-mode .chat-row { background: #111A2E; }
 .chat-row-job { font-size: 12px; color: var(--text-muted); margin-top: 1px; }
 .chat-row-preview { font-size: 12px; color: var(--text-muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-row-preview-unread { color: var(--navy); font-weight: 600; }
+.chat-row-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.chat-row-time { font-size: 12px; color: var(--text-muted); }
+.chat-row-name { letter-spacing: -0.01em; }
+
+/* Conversation screen: tap a chat in the list and it opens full-screen */
+.conv { display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; height: min(780px, calc(100vh - 90px)); position: relative; }
+.conv-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--card-bg, #fff); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.conv-back { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-size: 30px; line-height: 1; color: var(--accent); border-radius: 50%; padding-bottom: 4px; flex-shrink: 0; }
+.conv-av { width: 38px; height: 38px; border-radius: 50%; background: var(--accent); color: #04140A; font-weight: 700; font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.conv-title { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.25; }
+.conv-title b { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-title span { font-size: 12.5px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-info-btn { width: 36px; height: 36px; border: 0; background: transparent; font-size: 22px; color: var(--accent); cursor: pointer; border-radius: 50%; flex-shrink: 0; }
+.conv-main { position: relative; display: flex; flex: 1; min-height: 0; }
+.conv-chat { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.conv .chat-box { flex: 1; height: auto; min-height: 0; margin: 0; border: 0; border-radius: 0; }
+.conv-actions:empty { display: none; }
+.conv-actions { flex-shrink: 0; }
+.conv-actions form { margin: 0 !important; }
+.conv-actions .btn { width: 100%; border-radius: 0; padding: 12px; }
+.conv-actions .info-card { margin: 0 !important; border-radius: 0; border-left: 0; border-right: 0; font-size: 13px; }
+.conv-info { position: absolute; top: 0; left: 0; right: 0; max-height: 82%; overflow-y: auto; background: var(--bg); border-bottom: 1px solid var(--border); box-shadow: 0 14px 30px rgba(0,0,0,.2); padding: 12px 14px 4px; display: none; z-index: 5; }
+.conv.open .conv-info { display: block; }
+.conv-info-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-size: 15px; }
+.conv-info-head button { border: 0; background: transparent; font-size: 18px; color: var(--text-muted); cursor: pointer; min-width: 36px; min-height: 36px; }
+.conv-info .job-card, .conv-info .post-composer { margin-bottom: 12px; }
+.conv .chat-messages { gap: 4px; padding: 12px 12px; }
+.conv .msg { font-size: 15.5px; line-height: 1.38; border-radius: 17px; padding: 7px 12px 5px; max-width: 80%; }
+.conv .msg.me { border-radius: 17px 17px 5px 17px; }
+.conv .msg.them { border-radius: 17px 17px 17px 5px; }
+.conv .msg-sender { font-size: 11.5px; }
+.conv .msg-avatar { width: 30px; height: 30px; min-width: 30px; font-size: 13px; align-self: flex-end; margin-right: 6px; }
+.conv .chat-input input { font-size: 16px; }
+.conv .chat-input { padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); }
+.chat-file-label { font-size: 11px; color: var(--text-muted); padding: 0 14px; }
+.chat-file-label:empty { display: none; }
+.msg-row-sys { justify-content: center; margin: 4px 0; }
+.msg-sys { max-width: 88%; text-align: center; font-size: 12.5px; line-height: 1.35; color: #54656F; background: rgba(255,255,255,.78); padding: 5px 11px; border-radius: 10px; box-shadow: 0 1px 0 rgba(0,0,0,.08); }
+body.dark-mode .msg-sys { color: #A8B8C0; background: rgba(32,44,51,.9); }
+.msg-day { display: flex; justify-content: center; margin: 8px 0 4px; }
+.msg-day span { font-size: 12px; font-weight: 600; color: #54656F; background: rgba(255,255,255,.78); padding: 3px 11px; border-radius: 10px; }
+body.dark-mode .msg-day span { color: #A8B8C0; background: rgba(32,44,51,.9); }
+@media (min-width: 900px) {
+  .conv-main { display: grid; grid-template-columns: 1fr 340px; }
+  .conv-info { position: static; display: block; max-height: none; box-shadow: none; border-bottom: 0; border-left: 1px solid var(--border); }
+  .conv-info-head button, .conv-info-btn { display: none; }
+}
+@media (max-width: 720px) {
+  .conv-head .status-badge { display: none; }
+  .conv { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 95; height: auto; border: 0; border-radius: 0; padding-top: env(safe-area-inset-top, 0px); }
+  body.conv-open { overflow: hidden; }
+}
 .measure-step canvas { touch-action: none; max-width: 100%; border-radius: 12px; display: block; margin: 0 auto; cursor: crosshair; border: 1px solid var(--border); }
 .camera-wrap { position: relative; max-width: 500px; margin: 0 auto; border-radius: 14px; overflow: hidden; background: #000; }
 .camera-wrap video { width: 100%; display: block; }
@@ -6402,11 +6635,21 @@ def signup_customer():
         return redirect(url_for("home"))
     _record_login_attempt(f"signup:{request.remote_addr}")
 
+    def _signup_fail(msg):
+        flash(msg, "signup_error")
+        return redirect(url_for("home") + "#signup")
+    if len(name) < 2:
+        return _signup_fail("Please enter your full name.")
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return _signup_fail("That email address doesn't look right. Please check it.")
+    if len(password) < 6:
+        return _signup_fail("Your password needs at least 6 characters.")
     conn = get_db()
     if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
         conn.close()
-        flash("An account with that email already exists.", "error")
-        return redirect(url_for("home"))
+        session["login_email"] = email
+        flash("An account with that email already exists. Log in instead, or use \"Forgot your password?\".", "login_error")
+        return redirect(url_for("home") + "#login")
 
     cur = conn.execute(
         "INSERT INTO users (name, email, password_hash, role, wallet, referral_code) VALUES (?, ?, ?, 'customer', 500, ?)",
@@ -6422,28 +6665,39 @@ def signup_customer():
     return redirect(url_for("home"))
 
 
+def _login_fail(message, email, staff):
+    session["login_email"] = email
+    flash(message, "login_error")
+    return redirect(url_for("staff_login") if staff else url_for("home") + "#login")
+
+
 @app.route("/login", methods=["POST"])
 def login():
     email = request.form.get("email", "").strip().lower()
     password = request.form.get("password", "")
+    staff = request.form.get("from") == "staff"
 
     rate_key = f"login:{email}:{request.remote_addr}"
-    if _login_rate_limited(rate_key):
-        flash("Too many login attempts. Please wait a few minutes and try again.", "error")
-        return redirect(url_for("home"))
+    ip_key = f"loginip:{request.remote_addr}"
+    if _login_rate_limited(rate_key) or _login_rate_limited(ip_key, LOGIN_MAX_ATTEMPTS_PER_DEVICE):
+        return _login_fail(f"Too many login attempts. Please wait {LOGIN_LOCKOUT_SECONDS // 60} minutes, then try again.", email, staff)
 
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
     conn.close()
-    if not user or not check_password_hash(user["password_hash"], password):
-        _record_login_attempt(rate_key)
-        flash("Invalid email or password.", "error")
-        return redirect(url_for("home"))
+    if not user:
+        _record_login_attempt(rate_key); _record_login_attempt(ip_key)
+        return _login_fail("We couldn't find an account with that email. Check the spelling, or create an account.", email, staff)
+    # A space added by autofill or a phone keyboard shouldn't lock someone out, so the password is also tried without it
+    stored = user["password_hash"]
+    if not (check_password_hash(stored, password) or (password != password.strip() and check_password_hash(stored, password.strip()))):
+        _record_login_attempt(rate_key); _record_login_attempt(ip_key)
+        return _login_fail("That password is incorrect. Try again, or use \"Forgot your password?\" to set a new one.", email, staff)
     if user["role"] == "artisan":
         tech = get_artisan_profile(user["id"])
         if tech and not tech["active"]:
-            flash("Your artisan access has been deactivated. Contact Andy for help.", "error")
-            return redirect(url_for("home"))
+            return _login_fail("Your artisan access has been deactivated. Contact Andy for help.", email, staff)
+    session.pop("login_email", None)
     session["user_id"] = user["id"]
     flash(f"Welcome back, {user['name']}!", "success")
     return redirect(url_for("home"))
@@ -6552,6 +6806,10 @@ def forgot_password():
         _record_login_attempt(f"forgot:{request.remote_addr}")
         conn = get_db()
         user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if not user:
+            conn.close()
+            flash("We couldn't find an account with that email. Check the spelling, or create an account.", "error")
+            return redirect(url_for("forgot_password"))
         if user:
             token = pysecrets.token_urlsafe(24)
             expires = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=1)).isoformat()
@@ -6568,7 +6826,10 @@ def forgot_password():
                                {"title": "🔑 Password reset requested", "body": f"{user['name']} asked to reset their password.",
                                 "url": url_for("admin_dashboard"), "tag": "pw-reset"})
         conn.close()
-        flash("If that email is registered, a reset link has been sent. If it doesn't arrive, message Andy for help.", "success")
+        if email_configured():
+            flash("A reset link has been sent to that email. It works for 1 hour. If you don't see it, check your spam folder.", "success")
+        else:
+            flash("Email isn't set up on this site yet, so no email was sent. Andy has been told about your request and can send you a reset link.", "error")
         return redirect(url_for("forgot_password"))
     return render_template("forgot_password.html", user=None, active_page="forgot_password", auto_open_auth=False)
 
@@ -6701,6 +6962,7 @@ def consultation_request():
             else:
                 skipped += 1
         skipped += max(0, len(files) - 6)
+        _post_system_message(conn, job_id, "Consultation request submitted. You can add more details or photos here.")
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -6780,6 +7042,7 @@ def request_service():
             stored, kind = _save_attachment(f, ATTACHMENTS_UPLOAD_DIR)
             if stored:
                 conn.execute("INSERT INTO job_attachments (job_id, filename, kind) VALUES (?, ?, ?)", (job_id, stored, kind))
+        _post_system_message(conn, job_id, "Request submitted. You can add details or photos in this chat.")
         conn.commit()
         conn.close()
         _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category,
@@ -6898,13 +7161,16 @@ def job_thread(job_id):
     _mark_read(conn, user, job_id)
     messages = [dict(m) for m in conn.execute("""
         SELECT messages.*, users.name AS sender_name, users.avatar_filename AS sender_avatar
-        FROM messages JOIN users ON messages.sender_id = users.id
+        FROM messages LEFT JOIN users ON messages.sender_id = users.id
         WHERE messages.job_id=? ORDER BY messages.id
     """, (job_id,)).fetchall()]
 
     _mark_read(conn, user, job_id)
+    hide_nums = _hide_numbers_for(user, job["status"])
     for m in messages:
         m["is_read"] = _is_read_by_other(m)
+        if hide_nums and m.get("text"):
+            m["text"] = mask_phone_numbers(m["text"])
 
     artisans = []
     if is_owner(user):
@@ -6918,8 +7184,19 @@ def job_thread(job_id):
     review = dict(review) if review else None
     conn.close()
 
+    cname = customer["name"] if customer else ""
+    status_label = job["status"].replace("_", " ").title()
+    if is_owner(user):
+        head_title, head_sub = cname or "Customer", f"{job['title']} · {status_label}"
+    elif is_customer(user):
+        head_title = job["title"]
+        head_sub = "Chat with Andy Alloy" + (f" · Artisan: {artisan_name}" if artisan_name else "") + f" · {status_label}"
+    else:
+        head_title, head_sub = job["title"], f"Customer: {cname} · {status_label}"
+    back_url = url_for("admin_chats") if is_owner(user) else url_for("notifications_page")
     return render_template(
-        "job_thread.html", user=user, job=job, customer_name=customer["name"] if customer else "",
+        "job_thread.html", user=user, job=job, customer_name=cname,
+        head_title=head_title, head_sub=head_sub, back_url=back_url,
         payments_enabled=paystack_configured(), statuses=JOB_STATUSES,
         artisan_name=artisan_name, attachments=attachments, messages=messages, artisans=artisans,
         review=review, is_owner_view=is_owner(user), is_customer_view=is_customer(user),
@@ -6928,19 +7205,33 @@ def job_thread(job_id):
 
 
 
-def _message_payload(m, user):
+def _post_system_message(conn, job_id, text):
+    """An event line in the thread (assigned, paid, completed...). Marked read for everyone so it never counts as unread."""
+    conn.execute(
+        "INSERT INTO messages (job_id, sender_id, sender_role, text, read_by_owner, read_by_customer, read_by_artisan) "
+        "VALUES (?, 0, 'system', ?, 1, 1, 1)", (job_id, text))
+
+
+_STATUS_EVENT = {"submitted": "Status: submitted.", "assigned": "Status: assigned.", "in_progress": "Work is now in progress.",
+                 "completed": "This job was marked completed.", "cancelled": "This request was cancelled."}
+
+
+def _message_payload(m, user, hide_numbers=False):
     """Serialise one message row for the live-chat JSON feed."""
     d = dict(m)
+    if hide_numbers and d.get("text"):
+        d["text"] = mask_phone_numbers(d["text"])
     other_read = _is_read_by_other(d)
     avatar = d.get("sender_avatar")
     return {
-        "id": d["id"], "sender_id": d["sender_id"], "sender_name": d["sender_name"],
+        "id": d["id"], "sender_id": d["sender_id"], "sender_name": d["sender_name"] or "", "sender_role": d["sender_role"] or "",
         "sender_role_label": (d["sender_role"] or "").title(),
         "text": d.get("text") or "",
         "attachment_url": photo_url_filter(d["attachment_filename"], "attachments") if d.get("attachment_filename") else "",
         "attachment_kind": d.get("attachment_kind") or "",
         "avatar_url": photo_url_filter(avatar, "avatars") if avatar else "",
         "time": str(d.get("created_at") or "")[11:16],
+        "ts": str(d.get("created_at") or "")[:19],
         "is_read": bool(other_read),
     }
 
@@ -6983,16 +7274,18 @@ def _mark_read(conn, user, job_id):
 
 _MSG_SELECT = """
     SELECT messages.*, users.name AS sender_name, users.avatar_filename AS sender_avatar
-    FROM messages JOIN users ON messages.sender_id = users.id
+    FROM messages LEFT JOIN users ON messages.sender_id = users.id
 """
 
 
 def _feed(conn, user, job_id, after):
     _mark_read(conn, user, job_id)
+    jrow = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+    hide = bool(jrow) and _hide_numbers_for(user, jrow["status"])
     new_rows = conn.execute(_MSG_SELECT + " WHERE messages.job_id=? AND messages.id>? ORDER BY messages.id", (job_id, after)).fetchall()
     mine_rows = conn.execute(_MSG_SELECT + " WHERE messages.job_id=? AND messages.sender_id=? ORDER BY messages.id", (job_id, user["id"])).fetchall()
     return {
-        "messages": [_message_payload(r, user) for r in new_rows],
+        "messages": [_message_payload(r, user, hide) for r in new_rows],
         "read_ids": [dict(r)["id"] for r in mine_rows if _is_read_by_other(dict(r))],
         "unread": _unread_for(user, conn),
     }
@@ -7042,8 +7335,10 @@ def post_job_message(job_id):
         return redirect(url_for("home"))
 
     text = request.form.get("text", "").strip()
-    if job["status"] not in ("in_progress",):
-        text = mask_phone_numbers(text) if text else text
+    if job["status"] not in ("in_progress",) and user["role"] != "owner":
+        # For now a customer's phone number is open to the owner: it stays visible while no artisan is on the job
+        keep = user["role"] == "customer" and not job["artisan_id"]
+        text = mask_phone_numbers(text, keep_phones=keep) if text else text
 
     attachment_value, attachment_kind = _save_attachment(request.files.get("attachment"), ATTACHMENTS_UPLOAD_DIR)
 
@@ -7058,6 +7353,10 @@ def post_job_message(job_id):
         conn.commit()
         if user["role"] != "owner":
             _notify_owner_of_message(user, dict(job), text, attachment_kind)
+        else:
+            _notify_customer_of_message(user, dict(job), text, attachment_kind)
+        if user["role"] == "artisan":
+            _notify_customer_of_message(user, dict(job), text, attachment_kind)
         _notify_push(user, dict(job), text, attachment_kind)
     if request.headers.get("X-Requested-With") == "fetch":
         # return everything newer than what the sender's page has
@@ -7103,6 +7402,14 @@ def admin_update_job(job_id):
     conn.execute("UPDATE jobs SET artisan_id=?, track=?, amount=?, status=? WHERE id=?",
                  (artisan_id, track, amount, new_status, job_id))
     fresh = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
+    if artisan_id and artisan_id != job["artisan_id"]:
+        _post_system_message(conn, job_id, "An artisan has been assigned to this job.")
+    elif not artisan_id and job["artisan_id"]:
+        _post_system_message(conn, job_id, "The artisan was removed from this job.")
+    if amount and amount != (job["amount"] or 0):
+        _post_system_message(conn, job_id, f"Agreed price set: ₦{amount:,}.")
+    if new_status != job["status"]:
+        _post_system_message(conn, job_id, _STATUS_EVENT.get(new_status, f"Status: {new_status}."))
     if new_status != job["status"]:
         if new_status == "cancelled":
             _refund_escrow(conn, fresh)
@@ -7139,6 +7446,7 @@ def pay_for_job(job_id):
         return redirect(url_for("job_thread", job_id=job_id))
     conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
                  (user["id"], f"Payment for job: {job['title']} (held in escrow)", -job["amount"]))
+    _post_system_message(conn, job_id, "Payment received. It is held until the job is marked complete.")
     conn.commit()
     conn.close()
     flash("Payment held in escrow. Your artisan has been notified.", "success")
@@ -7162,6 +7470,7 @@ def complete_service_job(job_id):
         conn.close()
         return redirect(url_for("job_thread", job_id=job_id))
     _release_escrow(conn, dict(job))
+    _post_system_message(conn, job_id, "The customer marked this job complete.")
     conn.commit()
     conn.close()
     flash("Job marked complete." + (" Payment released to your artisan." if job["escrow_held"] else ""), "success")
@@ -7202,6 +7511,7 @@ def cancel_job(job_id):
         return redirect(url_for("job_thread", job_id=job_id))
     conn.execute("UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('submitted', 'assigned')", (job_id,))
     owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
+    _post_system_message(conn, job_id, "The customer cancelled this request.")
     conn.commit()
     conn.close()
     send_push_to_users(owners, {"title": "Request cancelled", "body": f"{user['name']} cancelled “{job['title']}”.",
@@ -7377,12 +7687,12 @@ def admin_chats():
     rows = conn.execute("""
         SELECT jobs.id AS job_id, jobs.title, jobs.category, jobs.status, users.name AS customer_name,
                users.avatar_filename AS customer_avatar,
-               (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
-               (SELECT sender_role FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_sender_role,
-               (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
+               (SELECT text FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_text,
+               (SELECT sender_role FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_sender_role,
+               (SELECT created_at FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_at,
                (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'owner' AND read_by_owner = 0) AS unread
         FROM jobs JOIN users ON jobs.customer_id = users.id
-        WHERE EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id)
+        WHERE EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'system')
         ORDER BY last_at DESC
     """).fetchall()
     conn.close()
@@ -8027,25 +8337,30 @@ def notifications_page():
         tech = get_artisan_profile(user["id"])
         rows = conn.execute("""
             SELECT jobs.id AS job_id, jobs.title, jobs.status,
-                   (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
-                   (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
+                   (SELECT text FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_text,
+                   (SELECT created_at FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_at,
                    (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'artisan' AND read_by_artisan = 0) AS unread
             FROM jobs WHERE jobs.artisan_id = ?
-            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'artisan')
+            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role NOT IN ('artisan', 'system'))
             ORDER BY last_at DESC
         """, (tech["id"] if tech else -1,)).fetchall()
     else:
         rows = conn.execute("""
             SELECT jobs.id AS job_id, jobs.title, jobs.status,
-                   (SELECT text FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_text,
-                   (SELECT created_at FROM messages WHERE job_id = jobs.id ORDER BY id DESC LIMIT 1) AS last_at,
+                   (SELECT text FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_text,
+                   (SELECT created_at FROM messages WHERE job_id = jobs.id AND sender_role != 'system' ORDER BY id DESC LIMIT 1) AS last_at,
                    (SELECT COUNT(*) FROM messages WHERE job_id = jobs.id AND sender_role != 'customer' AND read_by_customer = 0) AS unread
             FROM jobs WHERE jobs.customer_id = ?
-            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role != 'customer')
+            AND EXISTS (SELECT 1 FROM messages WHERE messages.job_id = jobs.id AND messages.sender_role NOT IN ('customer', 'system'))
             ORDER BY last_at DESC
         """, (user["id"],)).fetchall()
     conn.close()
-    return render_template("notifications.html", user=user, conversations=[dict(r) for r in rows],
+    convs = [dict(r) for r in rows]
+    if is_artisan(user):  # chat previews follow the same rule as the chat itself
+        for c in convs:
+            if c.get("last_text") and c.get("status") != "in_progress":
+                c["last_text"] = mask_phone_numbers(c["last_text"])
+    return render_template("notifications.html", user=user, conversations=convs,
                             active_page="notifications", auto_open_auth=False)
 
 
