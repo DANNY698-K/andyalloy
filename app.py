@@ -22,6 +22,10 @@ except ImportError:
     psycopg2 = None
 
 app = Flask(__name__)
+if os.environ.get("RENDER") or os.environ.get("TRUST_PROXY") == "1":
+    # Behind Render's proxy every request would look like it comes from one address (and over http). Trust one proxy hop.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 _SECRET_KEY_ENV = os.environ.get("SECRET_KEY")
 if _SECRET_KEY_ENV:
     app.secret_key = _SECRET_KEY_ENV
@@ -60,7 +64,8 @@ def set_security_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"] = "camera=(self), microphone=(self), geolocation=()"
+    response.headers["Content-Security-Policy"] = "base-uri 'self'; object-src 'none'; frame-ancestors 'none'"
     if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
         response.headers["Strict-Transport-Security"] = "max-age=15552000"
     return response
@@ -71,14 +76,67 @@ def set_security_headers(response):
 # see inject_csrf_token below). This check runs before any POST route and
 # rejects the request if the token is missing or doesn't match the one
 # tied to the visitor's session, blocking cross-site request forgery.
+_ERROR_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ | ANDY</title><style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0A1426;color:#F1F5F9;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Inter','Segoe UI',Roboto,Arial,sans-serif;padding:20px;box-sizing:border-box}
+.c{max-width:380px;text-align:center}h1{font-size:22px;margin:10px 0 8px}p{color:#9FB0C8;line-height:1.55;margin:0 0 18px;font-size:15px}
+a{display:inline-block;background:#22C55E;color:#04140A;font-weight:700;text-decoration:none;padding:12px 22px;border-radius:12px}.e{font-size:44px}
+</style></head><body><div class="c"><div class="e">__ICON__</div><h1>__TITLE__</h1><p>__TEXT__</p><a href="/">Go to the home page</a></div></body></html>"""
+
+
+def _error_response(code, title, text, icon="⚠️"):
+    if request.headers.get("X-Requested-With") == "fetch" or request.path.endswith(".json"):
+        return jsonify(ok=False, message=text), code
+    html = _ERROR_PAGE.replace("__TITLE__", title).replace("__TEXT__", text).replace("__ICON__", icon)
+    return Response(html, status=code, mimetype="text/html")
+
+
+@app.errorhandler(404)
+def _err_404(e):
+    return _error_response(404, "Page not found", "We couldn't find that page. It may have moved, or the link may be wrong.", "🔎")
+
+
+@app.errorhandler(403)
+def _err_403(e):
+    return _error_response(403, "Not allowed", "You don't have access to this page.", "🔒")
+
+
+@app.errorhandler(405)
+def _err_405(e):
+    return _error_response(405, "Page not available", "That page can't be opened this way. Please go back and try again.", "↩️")
+
+
+@app.errorhandler(413)
+def _err_413(e):
+    return _error_response(413, "File too large", "That file is too big to upload. Please choose a smaller photo or video.", "📦")
+
+
+@app.errorhandler(500)
+def _err_500(e):
+    print("[ANDY] Unhandled error:", repr(getattr(e, "original_exception", e)))
+    return _error_response(500, "Something went wrong", "Sorry, something went wrong on our side. Please try again in a moment. If it keeps happening, let Andy know.", "🛠️")
+
+
+def _same_site_referrer(default):
+    """Go back to the page the visitor came from, but never to another website."""
+    ref = request.referrer or ""
+    try:
+        from urllib.parse import urlparse
+        return ref if ref and urlparse(ref).netloc == request.host else default
+    except Exception:
+        return default
+
+
 @app.before_request
 def check_csrf():
     if request.method == "POST":
         session_token = session.get("_csrf_token")
         form_token = request.form.get("csrf_token")
         if not session_token or not form_token or not pysecrets.compare_digest(session_token, form_token):
+            if request.headers.get("X-Requested-With") == "fetch":
+                return jsonify(ok=False, message="Your session expired. Please refresh the page and try again."), 400
             flash("Your session expired — please try that again.", "error")
-            return redirect(request.referrer or url_for("home"))
+            return redirect(_same_site_referrer(url_for("home")))
 
 
 _SITE_CONTROL_EXEMPT_ENDPOINTS = {
@@ -264,6 +322,11 @@ def upload_video_media(file_storage):
 # "App Password"). Set these as environment variables:
 #   SMTP_USER=yourgmail@gmail.com   SMTP_PASSWORD=<16-char app password>
 # Optional: NOTIFY_EMAIL (who receives alerts), SMTP_HOST, SMTP_PORT.
+#
+# Resend (https://resend.com) is also supported and is the better choice on hosts that block SMTP:
+#   RESEND_API_KEY=re_xxx   MAIL_FROM="Andy Alloy <alerts@yourdomain.com>"
+# When RESEND_API_KEY is set it is used instead of SMTP. To email customers, the domain in MAIL_FROM
+# must be verified in Resend (without one, Resend only delivers to your own Resend account email).
 # ---------------------------------------------------------------------------
 import smtplib
 import threading
@@ -274,15 +337,30 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+MAIL_FROM = os.environ.get("MAIL_FROM", "").strip() or ("Andy Alloy <onboarding@resend.dev>" if RESEND_API_KEY else SMTP_USER)
+# A customer is emailed about every new reply. Raise this (in seconds) only if rapid chats feel too noisy.
+CUSTOMER_EMAIL_MIN_GAP_SECONDS = int(os.environ.get("CUSTOMER_EMAIL_MIN_GAP_SECONDS", "0"))
 
 
 def email_configured():
-    return bool(SMTP_USER and SMTP_PASSWORD and NOTIFY_EMAIL)
+    return bool(NOTIFY_EMAIL and (RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)))
 
 
 def _send_email_blocking(to, subject, body):
+    subject = " ".join(str(subject).split())[:200]
+    if RESEND_API_KEY:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": MAIL_FROM, "to": [to], "subject": subject, "text": body},
+            timeout=15,
+        )
+        if r.status_code >= 300:
+            raise RuntimeError(f"Resend refused the email ({r.status_code}): {r.text[:300]}")
+        return
     msg = EmailMessage()
-    msg["Subject"] = " ".join(str(subject).split())[:200]
+    msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = to
     msg.set_content(body)
@@ -295,7 +373,7 @@ def _send_email_blocking(to, subject, body):
 def send_email_async(to, subject, body):
     """Fire-and-forget so chatting never waits on the mail server."""
     if not email_configured():
-        print("[ANDY] Email alert skipped (set SMTP_USER and SMTP_PASSWORD):", subject)
+        print("[ANDY] Email alert skipped (set RESEND_API_KEY, or SMTP_USER and SMTP_PASSWORD):", subject)
         return None
 
     def _run():
@@ -320,7 +398,7 @@ def _notify_owner_of_message(sender, job, text, attachment_kind):
         subject = f"💬 New message from {name}"
     link = url_for("job_thread", job_id=job["id"], _external=True)
     body = (
-        f"{name} ({sender.get('role', 'user')}) wrote in \"{job.get('title', 'a chat')}\":\n\n"
+        f"{name} ({role_label(sender.get('role', 'user')).lower()}) wrote in \"{job.get('title', 'a chat')}\":\n\n"
         f"{text or '(sent an attachment)'}\n"
         + (f"\n[attachment: {attachment_kind}]\n" if attachment_kind else "")
         + f"\nReply here: {link}\n"
@@ -337,7 +415,9 @@ def _rewind(file_storage):
 
 
 print("[ANDY] Cloudinary:", "ON" if cloudinary_configured() else "OFF — set CLOUDINARY_CLOUD_NAME / _API_KEY / _API_SECRET (uploads use local disk)")
-print("[ANDY] Email alerts:", f"ON -> {NOTIFY_EMAIL}" if email_configured() else "OFF — set SMTP_USER and SMTP_PASSWORD")
+print("[ANDY] Email alerts:", (f"ON via {'Resend' if RESEND_API_KEY else 'SMTP'} -> {NOTIFY_EMAIL}" if email_configured() else "OFF — set RESEND_API_KEY, or SMTP_USER and SMTP_PASSWORD"))
+if RESEND_API_KEY and "resend.dev" in MAIL_FROM:
+    print("[ANDY] NOTE: MAIL_FROM is Resend's test address, so only your own Resend account email will receive mail. Verify a domain in Resend and set MAIL_FROM to email clients.")
 
 # ---------------------------------------------------------------------------
 # WEB PUSH — browser notifications (like Temu on the web). They appear even
@@ -473,12 +553,12 @@ _customer_email_last = {}
 
 
 def _notify_customer_of_message(sender, job, text, attachment_kind):
-    """Emails the customer about a reply (at most one email per job every 10 minutes, so a busy chat isn't spammy)."""
+    """Emails the client about every reply from Andy or the artisan."""
     try:
         if sender.get("role") not in ("owner", "artisan"):
             return
         now = time.time()
-        if now - _customer_email_last.get(job["id"], 0) < 600:
+        if CUSTOMER_EMAIL_MIN_GAP_SECONDS and now - _customer_email_last.get(job["id"], 0) < CUSTOMER_EMAIL_MIN_GAP_SECONDS:
             return
         conn = get_db()
         cust = conn.execute("SELECT name, email FROM users WHERE id=?", (job["customer_id"],)).fetchone()
@@ -493,14 +573,14 @@ def _notify_customer_of_message(sender, job, text, attachment_kind):
                 f"Open the conversation: {link}\n\nYou are receiving this because you have an open request with Andy Alloy.\n")
         send_email_async(cust["email"], f"New reply about: {job['title']}"[:120], body)
     except Exception as exc:
-        print("[ANDY] Customer alert failed:", exc)
+        print("[ANDY] Client alert failed:", exc)
 
 
 def _notify_owner_new_request(sender, job, text, kind="service request"):
-    """Email + push the owner when a customer opens a new request. Never raises:
-    a failed alert must not turn a saved request into an error for the customer."""
+    """Email + push the owner when a client opens a new request. Never raises:
+    a failed alert must not turn a saved request into an error for the client."""
     try:
-        name = sender.get("name") or "A customer"
+        name = sender.get("name") or "A client"
         link = url_for("job_thread", job_id=job["id"], _external=True)
         body = (f"{name} sent a new {kind}: \"{job.get('title', '')}\"\n\n"
                 f"{(text or '').strip()[:1500]}\n\nOpen it here: {link}\n")
@@ -873,7 +953,7 @@ CONSULT_GUIDE = {
         ],
         "measure": [
             {"kind": "option", "when": {}, "text": "Helpful to prepare: photos of the opening from inside and outside, a rough width and height, what the space is used for, and anything in the way such as furniture, pipes or steps."},
-            {"kind": "option", "when": {"m_have": ["exact"]}, "text": "Even careful customer measurements can't replace a professional measurement. Keep yours to compare."},
+            {"kind": "option", "when": {"m_have": ["exact"]}, "text": "Even careful client measurements can't replace a professional measurement. Keep yours to compare."},
             {"kind": "option", "when": {"m_have": ["rough"]}, "text": "Rough sizes are fine for a first discussion but must not be used to order or make anything."},
             {"kind": "option", "when": {"m_have": ["none"]}, "text": "You don't need exact numbers to start. Photos and a description of the space are enough for a first conversation."},
             {"kind": "safety", "when": {}, "text": "Only measure from the floor, on stable footing. Never climb, lean out of a window or work at height to take a measurement."},
@@ -929,19 +1009,39 @@ class _PGCursorWrapper:
         return self._cursor.fetchall()
 
 
+# Tables that have no "id" column (a plain "RETURNING id" on them is an error on Postgres)
+_PG_NO_ID_TABLES = {"video_purchases", "feed_likes", "app_kv", "paystack_refs", "work_likes", "review_likes", "video_likes", "video_saves"}
+_pg_has_id = {}
+
+
 class _PGConnWrapper:
     def __init__(self, pg_conn):
         self._conn = pg_conn
 
+    def _table_has_id(self, table):
+        if table in _PG_NO_ID_TABLES:
+            return False
+        if table not in _pg_has_id:
+            try:
+                cur = self._conn.cursor()
+                cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() "
+                            "AND table_name = %s AND column_name = 'id'", (table,))
+                _pg_has_id[table] = cur.fetchone() is not None
+            except Exception:
+                return True
+        return _pg_has_id[table]
+
     def execute(self, query, params=()):
         q = query.replace("?", "%s")
         is_insert = q.strip().lower().startswith("insert into")
-        if is_insert and "returning" not in q.lower():
+        m = re.match(r"\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)", q, re.I) if is_insert else None
+        wants_id = bool(m) and self._table_has_id(m.group(1).lower())
+        if is_insert and wants_id and "returning" not in q.lower():
             q = q.rstrip().rstrip(";") + " RETURNING id"
         cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(q, params)
         wrapped = _PGCursorWrapper(cur)
-        if is_insert:
+        if is_insert and wants_id:
             try:
                 row = cur.fetchone()
                 wrapped.lastrowid = row["id"] if row else None
@@ -1283,7 +1383,7 @@ LINK_PATTERN = re.compile(r"(?:https?://|www\.|wa\.me/|t\.me/|bit\.ly/)\S+", re.
 
 
 def mask_phone_numbers(text, keep_phones=False):
-    """Keeps customers and artisans on the platform: hides emails and links, and phone numbers unless keep_phones is set."""
+    """Keeps clients and artisans on the platform: hides emails and links, and phone numbers unless keep_phones is set."""
     text = EMAIL_PATTERN.sub("[email hidden]", text)
     text = LINK_PATTERN.sub("[link hidden]", text)
     return text if keep_phones else PHONE_PATTERN.sub("[number hidden]", text)
@@ -1496,7 +1596,7 @@ TEMPLATES = {
   <span class="logo-mark"></span>
   <span class="mobile-topbar-title">ANDY.</span>
   {% set sm = true %}<button type="button" class="mode-switch{{ ' sm' if sm }}" role="switch" aria-checked="{{ 'true' if dark else 'false' }}" aria-label="Dark mode" onclick="toggleMode()"><span class="ms-ico ms-sun">☀️</span><span class="ms-ico ms-moon">🌙</span><span class="ms-knob"></span></button>
-  <a href="{{ url_for('contact_support') if (user and user.role in ('customer', 'artisan')) else url_for('help_page') }}" class="help-icon-btn" title="Help / Customer Care" aria-label="Help and customer care">💬</a>
+  <a href="{{ url_for('contact_support') if (user and user.role in ('customer', 'artisan')) else url_for('help_page') }}" class="help-icon-btn" title="Help / Client Care" aria-label="Help and client care">💬</a>
   <button onclick="toggleMenu()" class="hamburger-btn{% if user %} dup-tab{% endif %}" aria-label="Open menu" aria-expanded="false">☰</button>
 </div>
 
@@ -1603,9 +1703,17 @@ TEMPLATES = {
     </header>
     {% endif %}
     {% if user %}
-    <div id="pushBar" class="push-bar" style="display:none;">
-      <span>🔔 Get notified when someone sends you a message</span>
-      <span class="push-actions"><button type="button" id="pushOn">Turn on</button><button type="button" id="pushLater" class="push-later">Not now</button></span>
+    <div id="pushGate" class="push-gate" role="dialog" aria-modal="true" aria-labelledby="pushGateTitle" style="display:none;">
+      <div class="push-gate-card">
+        <div class="push-gate-icon" aria-hidden="true">🔔</div>
+        <h2 id="pushGateTitle">Turn on notifications</h2>
+        <p id="pushGateText">{% if user.role == 'owner' %}You need notifications on so you are alerted the moment a client sends a request or a message.{% else %}You need notifications on so you never miss a reply about your request. It takes one tap.{% endif %}</p>
+        <p class="push-gate-err" id="pushGateErr" role="alert" hidden></p>
+        <ol class="push-gate-steps" id="pushGateSteps" hidden></ol>
+        <button type="button" class="btn btn-purple push-gate-btn" id="pushOn">Turn on notifications</button>
+        <button type="button" class="push-gate-skip" id="pushSkip" hidden>Continue without notifications</button>
+        <a class="push-gate-logout" href="{{ url_for('logout') }}">Log out</a>
+      </div>
     </div>
     {% endif %}
     <main>
@@ -2086,9 +2194,26 @@ window.startAndyTour = function() {
 
 <script>
 (function() {
-  var bar = document.getElementById('pushBar');
-  if (!bar || !('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window) || !window.isSecureContext) return;
+  var gate = document.getElementById('pushGate');
+  if (!gate) return;
   var csrf = '{{ csrf_token() }}';
+  var btn = document.getElementById('pushOn'), skip = document.getElementById('pushSkip');
+  var errEl = document.getElementById('pushGateErr'), stepsEl = document.getElementById('pushGateSteps');
+  var textEl = document.getElementById('pushGateText'), titleEl = document.getElementById('pushGateTitle');
+  var ua = navigator.userAgent || '';
+  var isIOS = /iphone|ipad|ipod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  var standalone = window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  var supported = ('serviceWorker' in navigator) && ('PushManager' in window) && ('Notification' in window) && window.isSecureContext;
+  var pushKey = '';
+
+  function skippedThisSession() { try { return sessionStorage.getItem('andyPushSkip') === '1'; } catch (e) { return false; } }
+  function openGate() { gate.style.display = 'flex'; document.body.classList.add('push-gate-open'); try { btn.focus(); } catch (e) {} }
+  function closeGate() { gate.style.display = 'none'; document.body.classList.remove('push-gate-open'); }
+  function setSteps(list) { stepsEl.innerHTML = list.map(function(t) { return '<li>' + t + '</li>'; }).join(''); stepsEl.hidden = !list.length; }
+  function setError(msg) { errEl.textContent = msg || ''; errEl.hidden = !msg; }
+  function allowSkip() { skip.hidden = false; }
+  skip.addEventListener('click', function() { try { sessionStorage.setItem('andyPushSkip', '1'); } catch (e) {} closeGate(); });
+
   function toKey(b) {
     var pad = '='.repeat((4 - b.length % 4) % 4);
     var raw = atob((b + pad).replace(/-/g, '+').replace(/_/g, '/'));
@@ -2100,7 +2225,7 @@ window.startAndyTour = function() {
     var fd = new FormData();
     fd.append('csrf_token', csrf);
     fd.append('subscription', JSON.stringify(sub));
-    return fetch('/push/subscribe', { method: 'POST', body: fd, credentials: 'same-origin' });
+    return fetch('/push/subscribe', { method: 'POST', body: fd, credentials: 'same-origin' }).then(function(r) { if (!r.ok) throw new Error('save failed'); });
   }
   function subscribe(key) {
     return navigator.serviceWorker.register('/sw.js').then(function() { return navigator.serviceWorker.ready; })
@@ -2110,27 +2235,56 @@ window.startAndyTour = function() {
         });
       }).then(save);
   }
-  function dismissedRecently() {
-    try { var t = parseInt(localStorage.getItem('andyPushDismissed') || '0', 10); return t && Date.now() - t < 7 * 86400000; } catch (e) { return false; }
+  function done() {
+    titleEl.textContent = 'Notifications are on'; textEl.textContent = 'You are all set.';
+    setSteps([]); setError(''); btn.style.display = 'none'; skip.hidden = true;
+    setTimeout(closeGate, 900);
+  }
+  function showDenied() {
+    titleEl.textContent = 'Notifications are blocked';
+    textEl.textContent = 'Your browser is blocking notifications for this site. Allow them, then tap Check again.';
+    setSteps(['Tap the lock or settings icon next to the web address.', 'Open Site settings, then Notifications, and choose Allow.', 'Come back here and tap Check again.']);
+    btn.textContent = 'Check again'; btn.dataset.mode = 'recheck'; btn.disabled = false; allowSkip(); openGate();
+  }
+  function showIOS() {
+    titleEl.textContent = 'Add Andy to your Home Screen';
+    textEl.textContent = 'On iPhone, notifications only work once Andy is added to your Home Screen.';
+    setSteps(['Tap the Share button in Safari.', 'Choose Add to Home Screen.', 'Open Andy from your Home Screen and log in again.']);
+    btn.style.display = 'none'; allowSkip(); openGate();
+  }
+  function turnOn() {
+    setError(''); btn.disabled = true;
+    Notification.requestPermission().then(function(p) {
+      if (p === 'granted') { return subscribe(pushKey).then(done); }
+      btn.disabled = false;
+      if (p === 'denied') { showDenied(); return; }
+      setError('Please tap Allow when your browser asks.');
+    }).catch(function() {
+      btn.disabled = false;
+      setError('We could not turn notifications on for this device. Please try again.');
+      allowSkip();
+    });
+  }
+  function recheck() {
+    setError('');
+    if (Notification.permission === 'granted') {
+      btn.disabled = true;
+      subscribe(pushKey).then(done).catch(function() { btn.disabled = false; setError('We could not turn notifications on for this device. Please try again.'); });
+    } else { setError('Still blocked. Please change it in your browser settings, then tap Check again.'); }
+  }
+  btn.addEventListener('click', function() { if (btn.dataset.mode === 'recheck') recheck(); else turnOn(); });
+
+  if (!supported) {
+    if (isIOS && !standalone && !skippedThisSession()) showIOS();
+    return;
   }
   fetch('/push/key', { credentials: 'same-origin' }).then(function(r) { return r.json(); }).then(function(cfg) {
     if (!cfg.enabled) return;
-    if (Notification.permission === 'granted') { subscribe(cfg.key).catch(function() {}); return; }
-    if (Notification.permission === 'denied' || dismissedRecently()) return;
-    bar.style.display = 'flex';
-    document.getElementById('pushOn').onclick = function() {
-      Notification.requestPermission().then(function(p) {
-        if (p !== 'granted') { bar.style.display = 'none'; return; }
-        subscribe(cfg.key).then(function() {
-          bar.innerHTML = '<span>✅ Notifications are on</span>';
-          setTimeout(function() { bar.style.display = 'none'; }, 2500);
-        }).catch(function() { bar.style.display = 'none'; });
-      });
-    };
-    document.getElementById('pushLater').onclick = function() {
-      try { localStorage.setItem('andyPushDismissed', String(Date.now())); } catch (e) {}
-      bar.style.display = 'none';
-    };
+    pushKey = cfg.key;
+    if (Notification.permission === 'granted') { subscribe(pushKey).catch(function() {}); return; }
+    if (skippedThisSession()) return;
+    if (Notification.permission === 'denied') { showDenied(); return; }
+    openGate();
   }).catch(function() {});
 
   // On logout, stop sending this device the previous user's notifications.
@@ -2168,7 +2322,7 @@ window.startAndyTour = function() {
       <form class="auth-form" method="POST" action="{{ url_for('signup_customer') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="text" name="name" placeholder="Full name" autocomplete="name" required>
         <input type="email" name="email" placeholder="Email address" autocomplete="email" required>
-        <input type="password" name="password" placeholder="Create a password (min 6 chars)" autocomplete="new-password" minlength="6" required>
+        <input type="password" name="password" placeholder="Create a password (min 8 chars)" autocomplete="new-password" minlength="8" required>
         <button class="btn btn-purple" type="submit">Create my account</button>
         <p class="terms-note">Terms and conditions apply. By continuing you agree to our <a href="{{ url_for('terms') }}">Terms &amp; Conditions</a> and <a href="{{ url_for('privacy') }}">Privacy Policy</a>.</p>
       </form>
@@ -2704,11 +2858,13 @@ MORE_TEMPLATES_1 = {
                   <div class="profile-avatar profile-avatar-placeholder msg-avatar">{{ (m.sender_name or '?')[0]|upper }}</div>
                 {% endif %}
               {% endif %}
-              <div class="msg {{ 'me' if m.sender_id == user.id else 'them' }}">
-                {% if m.sender_id != user.id %}<div class="msg-sender">{{ m.sender_name }} · {{ m.sender_role|title }}</div>{% endif %}
-                {% if m.text %}<span class="msg-text">{{ m.text }}</span>{% endif %}
+              <div class="msg {{ 'me' if m.sender_id == user.id else 'them' }} role-{{ m.sender_role }}">
+                {% if m.sender_id != user.id %}<div class="msg-sender">{{ m.sender_name }} · {{ m.sender_role|role_label }}</div>{% endif %}
+                {% if m.text and m.attachment_kind != 'audio' %}<span class="msg-text">{{ m.text }}</span>{% endif %}
                 {% if m.attachment_filename %}
-                  {% if m.attachment_kind == 'image' %}
+                  {% if m.attachment_kind == 'audio' %}
+                    <div class="voice-note"><span class="voice-label">🎤 Voice message</span><audio controls preload="metadata" src="{{ m.attachment_filename|photo_url('attachments') }}"></audio></div>
+                  {% elif m.attachment_kind == 'image' %}
                     <div><img src="{{ m.attachment_filename|photo_url('attachments') }}" style="max-width:180px;border-radius:10px;margin-top:6px;" alt="Photo"></div>
                   {% else %}
                     <div><a href="{{ m.attachment_filename|photo_url('attachments') }}" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>
@@ -2725,12 +2881,20 @@ MORE_TEMPLATES_1 = {
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 01-7.78-7.78l9.19-9.19a3.5 3.5 0 014.95 4.95l-9.2 9.19a1.5 1.5 0 01-2.12-2.12l8.49-8.48" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
           </button>
           <input type="file" id="chat-file-{{ job.id }}" name="attachment" style="display:none;" onchange="document.getElementById('chat-file-label-{{ job.id }}').textContent = this.files[0] ? this.files[0].name : '';">
+          <button type="button" class="attach-btn mic-btn" id="micBtn" aria-label="Record a voice message" title="Voice message" hidden>
+            <svg width="19" height="19" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.8"/><path d="M5 11a7 7 0 0014 0M12 18v3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          </button>
           <input type="text" name="text" placeholder="Message" class="chat-text-input" autocomplete="off" aria-label="Message">
+          <div class="rec-bar" id="recBar" hidden>
+            <button type="button" class="rec-cancel" id="recCancel" aria-label="Cancel recording" title="Cancel">🗑</button>
+            <span class="rec-dot" aria-hidden="true"></span><span class="rec-time" id="recTime">0:00</span><span class="rec-hint">Recording… tap send when done</span>
+          </div>
           <button class="send-btn" type="submit" title="Send" aria-label="Send">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M2 12l19-9-6 19-4.5-7.5L2 12z" fill="#22C55E"/></svg>
           </button>
         </form>
         <div id="chat-file-label-{{ job.id }}" class="chat-file-label"></div>
+        <div id="recErr" class="rec-err" role="alert" hidden></div>
       </div>
     </section>
     <aside class="conv-info" id="convInfo" aria-label="Job details">
@@ -2754,14 +2918,14 @@ MORE_TEMPLATES_1 = {
       {% endfor %}
     </div>
   {% endif %}
-  <div style="font-size:12px;color:var(--text-muted);margin-top:8px;">Customer: {{ customer_name }}{% if artisan_name %} · Artisan: {{ artisan_name }}{% endif %}</div>
+  <div style="font-size:12px;color:var(--text-muted);margin-top:8px;">Client: {{ customer_name }}{% if artisan_name %} · Artisan: {{ artisan_name }}{% endif %}</div>
 </div>
 
 {% if job.category not in ('General Support', 'Feedback', 'Bug Report') and job.status in ('submitted', 'assigned', 'in_progress') %}
   {% if is_customer_view %}
   <div class="info-card pay-note">💳 <b>Pay Andy only.</b> Never pay the artisan directly. Your artisan is paid by Andy after the job is done.</div>
   {% elif user.role == 'artisan' %}
-  <div class="info-card pay-note">💳 Andy pays you after the job is complete. Do not ask for or accept payment from the customer.</div>
+  <div class="info-card pay-note">💳 Andy pays you after the job is complete. Do not ask for or accept payment from the client.</div>
   {% endif %}
 {% endif %}
 {% if is_customer_view and job.status in ('submitted', 'assigned') and job.category not in ('General Support', 'Feedback', 'Bug Report') %}
@@ -2908,11 +3072,12 @@ MORE_TEMPLATES_1 = {
         ? '<div class="profile-avatar msg-avatar" style="background-image:url(&quot;' + esc(m.avatar_url) + '&quot;);"></div>'
         : '<div class="profile-avatar profile-avatar-placeholder msg-avatar">' + esc((m.sender_name || '?')[0].toUpperCase()) + '</div>';
     }
-    h += '<div class="msg ' + (mine ? 'me' : 'them') + '">';
+    h += '<div class="msg ' + (mine ? 'me' : 'them') + ' ' + esc(m.role_class || '') + '">';
     if (!mine) h += '<div class="msg-sender">' + esc(m.sender_name) + ' · ' + esc(m.sender_role_label) + '</div>';
-    if (m.text) h += '<span class="msg-text">' + esc(m.text) + '</span>';
+    if (m.text && m.attachment_kind !== 'audio') h += '<span class="msg-text">' + esc(m.text) + '</span>';
     if (m.attachment_url) {
-      h += m.attachment_kind === 'image'
+      if (m.attachment_kind === 'audio') h += '<div class="voice-note"><span class="voice-label">🎤 Voice message</span><audio controls preload="metadata" src="' + esc(m.attachment_url) + '"></audio></div>';
+      else h += m.attachment_kind === 'image'
         ? '<div><img src="' + esc(m.attachment_url) + '" style="max-width:180px;border-radius:10px;margin-top:6px;" alt="Photo"></div>'
         : '<div><a href="' + esc(m.attachment_url) + '" target="_blank" style="color:inherit;text-decoration:underline;">📎 attachment</a></div>';
     }
@@ -2955,26 +3120,87 @@ MORE_TEMPLATES_1 = {
   localize();
   scrollDown();
 
+  function sendFD(fd) {
+    var ids = box.querySelectorAll('.msg-row[data-id]');
+    fd.append('after', ids.length ? ids[ids.length - 1].dataset.id : 0);
+    var btn = form.querySelector('.send-btn');
+    btn.disabled = true;
+    return fetch(form.action, {method: 'POST', body: fd, credentials: 'same-origin', headers: {'X-Requested-With': 'fetch'}})
+      .then(function(r) { if (!r.ok) throw new Error('send failed'); return r.json(); })
+      .then(function(d) { apply(d); return true; })
+      .catch(function() { return false; })
+      .then(function(ok) { btn.disabled = false; return ok; });
+  }
+
+  // ---- voice messages ----
+  var micBtn = document.getElementById('micBtn'), recBar = document.getElementById('recBar'), recTime = document.getElementById('recTime');
+  var recErr = document.getElementById('recErr'), recCancel = document.getElementById('recCancel');
+  var canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+  if (micBtn && canRecord) micBtn.hidden = false;
+  var rec = null, MAX_SEC = 120, errTimer = null;
+  function showRecErr(msg) {
+    recErr.textContent = msg; recErr.hidden = false;
+    clearTimeout(errTimer); errTimer = setTimeout(function() { recErr.hidden = true; }, 7000);
+  }
+  function pickMime() {
+    var list = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+    for (var i = 0; i < list.length; i++) { if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(list[i])) return list[i]; }
+    return '';
+  }
+  function extFor(mime) { return mime.indexOf('mp4') > -1 ? 'm4a' : (mime.indexOf('ogg') > -1 ? 'ogg' : 'webm'); }
+  function fmt(s) { return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+  function setRecUI(on) { form.classList.toggle('recording', on); recBar.hidden = !on; }
+  function stopStream(r) { if (r && r.stream) r.stream.getTracks().forEach(function(t) { t.stop(); }); }
+  function finishRec(send) {
+    if (!rec) return;
+    rec.send = send;
+    try { rec.mr.stop(); } catch (e) { stopStream(rec); clearInterval(rec.timer); setRecUI(false); rec = null; }
+  }
+  function startRec() {
+    recErr.hidden = true;
+    navigator.mediaDevices.getUserMedia({audio: true}).then(function(stream) {
+      var mime = pickMime(), mr;
+      try { mr = mime ? new MediaRecorder(stream, {mimeType: mime}) : new MediaRecorder(stream); }
+      catch (e) { stream.getTracks().forEach(function(t) { t.stop(); }); showRecErr("This browser can't record voice messages."); return; }
+      var r = {mr: mr, stream: stream, chunks: [], t0: Date.now(), mime: mr.mimeType || mime || 'audio/webm', send: false, timer: null};
+      rec = r;
+      mr.ondataavailable = function(e) { if (e.data && e.data.size) r.chunks.push(e.data); };
+      mr.onstop = function() {
+        clearInterval(r.timer); stopStream(r); setRecUI(false); if (rec === r) rec = null;
+        if (!r.send) return;
+        if ((Date.now() - r.t0) < 1000 || !r.chunks.length) { showRecErr('That was too short. Please hold on a little longer and try again.'); return; }
+        var blob = new Blob(r.chunks, {type: r.mime});
+        var fd = new FormData(form);
+        fd.set('text', ''); fd.delete('attachment'); fd.append('attachment', blob, 'voice.' + extFor(r.mime));
+        sendFD(fd).then(function(ok) { if (!ok) showRecErr('Your voice message could not be sent. Please try again.'); });
+      };
+      mr.start(250); setRecUI(true); recTime.textContent = '0:00';
+      r.timer = setInterval(function() {
+        var secs = Math.round((Date.now() - r.t0) / 1000); recTime.textContent = fmt(secs);
+        if (secs >= MAX_SEC) finishRec(true);
+      }, 250);
+    }).catch(function(err) {
+      showRecErr(err && err.name === 'NotAllowedError' ? 'Microphone access is blocked. Allow it in your browser settings to send voice messages.' : 'We could not use the microphone on this device.');
+    });
+  }
+  if (micBtn) micBtn.addEventListener('click', function() { if (!rec) startRec(); });
+  if (recCancel) recCancel.addEventListener('click', function() { finishRec(false); });
+  window.addEventListener('pagehide', function() { if (rec) finishRec(false); });
+
   if (form) {
     form.addEventListener('submit', function(e) {
       e.preventDefault();
+      if (rec) { finishRec(true); return; }
       var input = form.querySelector('.chat-text-input');
       var fileIn = form.querySelector('input[type=file]');
       if (!input.value.trim() && !(fileIn.files && fileIn.files.length)) return;
       var fd = new FormData(form);
-      var ids = box.querySelectorAll('.msg-row[data-id]');
-      fd.append('after', ids.length ? ids[ids.length - 1].dataset.id : 0);
-      var btn = form.querySelector('.send-btn');
-      btn.disabled = true;
-      fetch(form.action, {method: 'POST', body: fd, credentials: 'same-origin', headers: {'X-Requested-With': 'fetch'}})
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          input.value = ''; fileIn.value = '';
-          var lbl = document.querySelector('[id^="chat-file-label-"]'); if (lbl) lbl.textContent = '';
-          apply(d);
-        })
-        .catch(function() { form.submit(); })
-        .then(function() { btn.disabled = false; input.focus(); });
+      sendFD(fd).then(function(ok) {
+        if (!ok) { form.submit(); return; }
+        input.value = ''; fileIn.value = '';
+        var lbl = document.querySelector('[id^="chat-file-label-"]'); if (lbl) lbl.textContent = '';
+        input.focus();
+      });
     });
   }
 })();
@@ -2995,12 +3221,12 @@ MORE_TEMPLATES_2 = {
 {% if resets %}
 <div class="info-card" style="margin-bottom:14px;">
   <b>🔑 Password reset requests</b>
-  <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Only you can see these links. Send one to the customer (for example in chat). Each works for 1 hour.</p>
+  <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Only you can see these links. Send one to the client (for example in chat). Each works for 1 hour.</p>
   {% for r in resets %}<div style="font-size:13px;margin-bottom:8px;word-break:break-all;"><b>{{ r.name }}</b> ({{ r.email }})<br><a href="{{ r.link }}" style="color:var(--accent);">{{ r.link }}</a></div>{% endfor %}
 </div>
 {% endif %}
 <div class="stats-grid">
-  <div class="stat-tile"><div class="stat-num">{{ stats.customers }}</div><div class="stat-label">Customers</div></div>
+  <div class="stat-tile"><div class="stat-num">{{ stats.customers }}</div><div class="stat-label">Clients</div></div>
   <div class="stat-tile"><div class="stat-num">{{ stats.artisans }}</div><div class="stat-label">Active Artisans</div></div>
   <div class="stat-tile"><div class="stat-num">{{ stats.pending_jobs }}</div><div class="stat-label">Pending Requests</div></div>
   <div class="stat-tile"><div class="stat-num">{{ stats.eas_jobs }}</div><div class="stat-label">EAS Projects</div></div>
@@ -3087,7 +3313,7 @@ function filterChats() {
   <form method="POST" action="{{ url_for('add_artisan') }}" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="text" name="name" placeholder="Full name" required>
     <input type="email" name="email" placeholder="Email (their login)" required>
-    <input type="password" name="password" placeholder="Temporary password (min 6 chars)" required>
+    <input type="password" name="password" placeholder="Temporary password (min 8 chars)" required>
     <select name="category" required>
       {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
     </select>
@@ -3141,7 +3367,7 @@ function filterChats() {
 
 <div class="section">
   <div class="section-title" style="font-size:14px;">Upload a paid tips video</div>
-  <p style="font-size:13px;color:var(--text-muted);">Shows as "Coming Soon" to customers until you're ready to sell it.</p>
+  <p style="font-size:13px;color:var(--text-muted);">Shows as "Coming Soon" to clients until you're ready to sell it.</p>
   <form method="POST" action="{{ url_for('upload_paid_clip') }}" enctype="multipart/form-data" class="auth-form" style="max-width:340px;margin-top:8px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="text" name="title" placeholder="Video title" required>
     <textarea name="description" placeholder="Short description (optional)" rows="2"></textarea>
@@ -3157,7 +3383,7 @@ function filterChats() {
     {% for v in videos %}
       <div class="video-card">
         {% if v.video_url %}
-          <video class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
+          <video playsinline class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
         {% else %}
           <div class="video-thumb">{{ '⏳' if v.is_paid else '▶' }}</div>
         {% endif %}
@@ -3256,7 +3482,7 @@ function filterChats() {
 <form method="POST" action="{{ url_for('admin_controls') }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   {% set toggles = [('maintenance_mode','🚧 Maintenance Mode','Take the whole site offline except for you'),
-                     ('signups_enabled','✍️ New Sign-ups','Let new customers create accounts'),
+                     ('signups_enabled','✍️ New Sign-ups','Let new clients create accounts'),
                      ('catalog_enabled','🛒 Catalog','Browsing, cart, and checkout'),
                      ('reels_enabled','🎬 Reels','Free how-to video feed'),
                      ('tipped_videos_enabled','⭐ Tipped Videos','The Coming Soon paid videos page'),
@@ -3322,7 +3548,7 @@ function filterChats() {
 
 <div class="section">
   <div class="section-title">Upload a paid tips video</div>
-  <p style="font-size:13px;color:var(--text-muted);">Shows as "Coming Soon" to customers until this feature goes live.</p>
+  <p style="font-size:13px;color:var(--text-muted);">Shows as "Coming Soon" to clients until this feature goes live.</p>
   <form method="POST" action="{{ url_for('upload_paid_clip') }}" enctype="multipart/form-data" class="auth-form" style="max-width:340px;margin-top:8px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="text" name="title" placeholder="Video title" required>
     <textarea name="description" placeholder="Short description (optional)" rows="2"></textarea>
@@ -3338,7 +3564,7 @@ function filterChats() {
     {% for v in videos %}
       <div class="video-card">
         {% if v.video_url %}
-          <video class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
+          <video playsinline class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
         {% else %}
           <div class="video-thumb">{{ '⏳' if v.is_paid else '▶' }}</div>
         {% endif %}
@@ -3392,7 +3618,7 @@ MORE_TEMPLATES_3 = {
         <div class="pimg pimg-art">{{ category_graphic(p.category)|safe }}</div>
       {% endif %}
       {% if p.video_url %}
-        <video class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}"></video>
+        <video playsinline class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}"></video>
       {% endif %}
       <div class="pbody">
         <div class="pcat">{{ p.category }}</div>
@@ -3545,8 +3771,8 @@ MORE_TEMPLATES_3 = {
 <div class="wallet-card">
   <div style="font-size:13px;opacity:0.8;">CONNECT balance</div>
   <div class="wallet-balance">🪙 {{ user.wallet }}</div>
-  <form method="POST" action="{{ url_for('wallet') }}" style="display:flex;gap:8px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="number" name="amount" placeholder="Amount in ₦ to add" required style="flex:1;padding:10px;border-radius:8px;border:none;">
+  <form method="POST" action="{{ url_for('wallet') }}" style="display:flex;gap:8px;flex-wrap:wrap;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="number" name="amount" placeholder="Amount in ₦ to add" required style="flex:1 1 150px;min-width:0;padding:10px;border-radius:8px;border:none;">
     <button class="btn btn-gold" type="submit">Top up via Paystack</button>
   </form>
 </div>
@@ -3571,7 +3797,7 @@ MORE_TEMPLATES_3 = {
 "admin_works.html": '''{% extends "base.html" %}
 {% block content %}
 <div class="section-title">📸 Upload Our Work</div>
-<p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">Show customers the windows and doors you have finished. Everything here appears on the public <b>Our Work</b> page as ANDY's work.</p>
+<p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">Show clients the windows and doors you have finished. Everything here appears on the public <b>Our Work</b> page as ANDY's work.</p>
 
 <div class="settings-card">
   <div class="settings-card-title">Upload a finished job</div>
@@ -3632,7 +3858,7 @@ MORE_TEMPLATES_3 = {
     <select name="category"><option value="">Category (optional)</option>{% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
     <textarea name="description" placeholder="Materials, size, anything worth noting" rows="3"></textarea>
     <input type="file" name="photos" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.webm,.m4v" multiple required data-maxmb="95">
-    <p style="font-size:12px;color:var(--text-muted);">Up to 8 photos or videos (videos keep their sound, under 95 MB each). Do not show customer names or phone numbers.</p>
+    <p style="font-size:12px;color:var(--text-muted);">Up to 8 photos or videos (videos keep their sound, under 95 MB each). Do not show client names or phone numbers.</p>
     <button class="btn btn-purple" type="submit">Send to Andy for review</button>
   </form>
 </div>
@@ -3662,12 +3888,12 @@ MORE_TEMPLATES_3 = {
   <h1>Andy Terms &amp; Conditions</h1>
   <div class="legal-date">Effective date: 24 October 2026</div>
 
-  <p>Welcome to Andy, a platform designed to connect customers with service providers for aluminum fabrication, window and door installation, repairs, and other related services.</p>
+  <p>Welcome to Andy, a platform designed to connect clients with service providers for aluminum fabrication, window and door installation, repairs, and other related services.</p>
   <p>By accessing or using Andy, you agree to these Terms and Conditions. Please read them carefully before using the platform.</p>
 
   <h2>1. About Andy</h2>
   <p>Andy is an aluminum service platform. Andy is starting with its own team of artisans: aluminum fabricators, also known as alloy artisans, who work as Andy's staff. When you send a service request, Andy assigns one of its artisans to your job and provides in-app chat, job coordination and related tools.</p>
-  <p>In future, Andy may also connect customers with other approved service providers. If that happens, these Terms or the relevant job details will say so.</p>
+  <p>In future, Andy may also connect clients with other approved service providers. If that happens, these Terms or the relevant job details will say so.</p>
 
   <h2>2. Eligibility and Account Registration</h2>
   <p>To use Andy, you must be at least 18 years old and you agree to:</p>
@@ -3681,8 +3907,8 @@ MORE_TEMPLATES_3 = {
   <p>You must not impersonate another person, create accounts using false identities, or use the platform to deceive other users.</p>
   <p>Andy reserves the right to restrict or suspend accounts involved in suspected fraud, abuse, or violations of these Terms, subject to applicable law.</p>
 
-  <h2>3. Customer Responsibilities</h2>
-  <p>Customers using Andy agree to:</p>
+  <h2>3. Client Responsibilities</h2>
+  <p>Clients using Andy agree to:</p>
   <ul>
     <li>Provide accurate descriptions of the services they require.</li>
     <li>Supply correct contact details and relevant job information.</li>
@@ -3692,8 +3918,8 @@ MORE_TEMPLATES_3 = {
     <li>Make agreed payments according to the terms established for the job.</li>
     <li>Ensure that the work location is reasonably safe for the service provider.</li>
   </ul>
-  <p>Customers should inspect completed work and communicate any concerns promptly.</p>
-  <p>Customers must not use Andy to request illegal services, harass workers, or engage in fraudulent activities.</p>
+  <p>Clients should inspect completed work and communicate any concerns promptly.</p>
+  <p>Clients must not use Andy to request illegal services, harass workers, or engage in fraudulent activities.</p>
 
   <h2>4. Service Provider Responsibilities</h2>
   <p>Service providers (also called artisans) are Andy's staff and join Andy by invitation. Service providers using Andy agree to:</p>
@@ -3703,17 +3929,17 @@ MORE_TEMPLATES_3 = {
     <li>Communicate honestly about prices, materials, timelines, and job requirements.</li>
     <li>Carry out agreed work with reasonable care, skill, and professionalism.</li>
     <li>Use suitable materials and equipment for the agreed job.</li>
-    <li>Respect customers, their property, and their privacy.</li>
+    <li>Respect clients, their property, and their privacy.</li>
     <li>Follow applicable safety requirements, building regulations, and other relevant laws.</li>
-    <li>Notify customers promptly of delays, unexpected costs, or circumstances that may affect the job.</li>
+    <li>Notify clients promptly of delays, unexpected costs, or circumstances that may affect the job.</li>
     <li>Avoid misleading claims, fraudulent conduct, and unauthorized charges.</li>
-    <li>Never ask for or accept payment directly from a customer. All payments go to Andy.</li>
+    <li>Never ask for or accept payment directly from a client. All payments go to Andy.</li>
   </ul>
   <p>Service providers must not claim qualifications, certifications, or experience they do not possess.</p>
 
   <h2>5. Service Requests and Agreements</h2>
   <p>Submitting a service request through Andy does not automatically guarantee that a service provider will accept or be assigned to the job. Andy decides which service provider, if any, is assigned to a request. So that the job can be done, Andy may share your request details, photos, files and chat messages with the assigned service provider.</p>
-  <p>Before work begins, the customer and Andy should clearly agree on:</p>
+  <p>Before work begins, the client and Andy should clearly agree on:</p>
   <ul>
     <li>The exact work to be performed.</li>
     <li>The total price or pricing method.</li>
@@ -3722,24 +3948,24 @@ MORE_TEMPLATES_3 = {
     <li>The expected start date and completion time.</li>
     <li>Any additional charges that may arise from changes to the original job.</li>
   </ul>
-  <p>Any change to the agreed scope of work should be communicated to Andy and accepted by the customer before the additional work is carried out.</p>
+  <p>Any change to the agreed scope of work should be communicated to Andy and accepted by the client before the additional work is carried out.</p>
   <p>Andy may introduce additional job confirmation or tracking features as the platform develops.</p>
 
   <h2>6. Pricing and Payments</h2>
-  <p>Customers and Andy must ensure that the price and payment arrangements for a job are clearly understood before work begins.</p>
-  <p><b>All payments for jobs arranged through Andy must be made to Andy.</b> Customers must not pay service providers directly, and service providers must not ask for or accept payment directly from customers.</p>
+  <p>Clients and Andy must ensure that the price and payment arrangements for a job are clearly understood before work begins.</p>
+  <p><b>All payments for jobs arranged through Andy must be made to Andy.</b> Clients must not pay service providers directly, and service providers must not ask for or accept payment directly from clients.</p>
   <p>Andy pays the service provider after the job is completed. Where payment is made in the app, the agreed amount is held by Andy and released to the service provider when the job is marked complete. Where in-app payment is not available, Andy will share payment details in the job chat.</p>
-  <p>If Andy cancels a job that has already been paid for, Andy will return the amount to the customer (to their wallet where the payment was made in the app). Phone numbers and similar contact details shared in chat may be hidden by the platform.</p>
-  <p>Customers must not knowingly withhold an agreed payment for properly completed work in violation of their agreement.</p>
+  <p>If Andy cancels a job that has already been paid for, Andy will return the amount to the client (to their wallet where the payment was made in the app). Phone numbers and similar contact details shared in chat may be hidden by the platform.</p>
+  <p>Clients must not knowingly withhold an agreed payment for properly completed work in violation of their agreement.</p>
   <p>Any payment-related procedures introduced by Andy will be communicated to users through the relevant platform features or notices.</p>
 
   <h2>7. Quality of Work and Workmanship</h2>
   <p>Service providers are expected to perform work with reasonable care and skill consistent with the agreed service.</p>
-  <p>For aluminum-related services, customers and service providers should agree in advance on relevant specifications, including measurements, materials, finishes, hardware, installation requirements, and other applicable details.</p>
+  <p>For aluminum-related services, clients and service providers should agree in advance on relevant specifications, including measurements, materials, finishes, hardware, installation requirements, and other applicable details.</p>
   <p><b>Measurements from the Andy tools are estimates only.</b> The Measure a Window tool and any photo-based measurement can be wrong. Always confirm the real size with a tape measure before anything is cut or fabricated.</p>
   <p>Andy encourages both parties to document important specifications and approvals before fabrication or installation begins.</p>
   <p>Andy may review complaints about service quality and take appropriate action against users who repeatedly engage in dishonest, unsafe, or unprofessional conduct.</p>
-  <p>Unless expressly agreed otherwise in writing, Andy does not automatically provide a separate written warranty beyond what is agreed for the job or required by law. Any warranty offered must be communicated clearly to the customer.</p>
+  <p>Unless expressly agreed otherwise in writing, Andy does not automatically provide a separate written warranty beyond what is agreed for the job or required by law. Any warranty offered must be communicated clearly to the client.</p>
 
   <h2>8. Andy's Artisans</h2>
   <p>The service providers who carry out jobs on Andy are Andy's own staff. They work on Andy's behalf, and Andy is responsible for the services they deliver as set out in these Terms and in applicable law.</p>
@@ -3747,19 +3973,19 @@ MORE_TEMPLATES_3 = {
   <p>Nothing in these Terms excludes any responsibility that Andy may have under applicable law.</p>
 
   <h2>9. Safety and Property Protection</h2>
-  <p>Customers and service providers must take reasonable precautions to protect people and property during service delivery.</p>
-  <p>Service providers must use appropriate tools, equipment, and safety practices for their work. Customers should communicate relevant site hazards before work begins.</p>
+  <p>Clients and service providers must take reasonable precautions to protect people and property during service delivery.</p>
+  <p>Service providers must use appropriate tools, equipment, and safety practices for their work. Clients should communicate relevant site hazards before work begins.</p>
   <p>Neither party should request or carry out work in a manner that creates an unreasonable risk of injury or property damage.</p>
   <p>Any incident involving injury, theft, property damage, or serious misconduct should be reported to Andy promptly where relevant.</p>
 
   <h2>10. Cancellations and Job Changes</h2>
-  <p>Customers and service providers should communicate cancellations, rescheduling requests, and changes to agreed job requirements as early as reasonably possible.</p>
-  <p>A customer can cancel a request from the job page before it has been paid for. After that, the customer should contact Andy through the job chat. Andy may also cancel a job where necessary.</p>
+  <p>Clients and service providers should communicate cancellations, rescheduling requests, and changes to agreed job requirements as early as reasonably possible.</p>
+  <p>A client can cancel a request from the job page before it has been paid for. After that, the client should contact Andy through the job chat. Andy may also cancel a job where necessary.</p>
   <p>Where a cancellation or change affects materials already purchased, work already completed, or other commitments, the parties should address those matters according to their existing agreement and applicable law.</p>
   <p>Andy may establish additional cancellation and scheduling procedures as its services develop.</p>
 
   <h2>11. Complaints and Dispute Resolution</h2>
-  <p>If a disagreement arises between a customer and a service provider, both parties are encouraged to communicate respectfully and attempt to resolve the issue directly.</p>
+  <p>If a disagreement arises between a client and a service provider, both parties are encouraged to communicate respectfully and attempt to resolve the issue directly.</p>
   <p>Users may contact Andy through the in-app chat (Contact Andy), or through Feedback and Report a Bug, to report:</p>
   <ul>
     <li>Poor service or alleged defective workmanship.</li>
@@ -3789,7 +4015,7 @@ MORE_TEMPLATES_3 = {
   <p>Andy may take appropriate action when these rules are violated.</p>
 
   <h2>13. Reviews and Feedback</h2>
-  <p>Customers may be permitted to submit ratings, reviews, comments and likes about completed work shown on Andy. Reviews show the reviewer's first name and last initial.</p>
+  <p>Clients may be permitted to submit ratings, reviews, comments and likes about completed work shown on Andy. Reviews show the reviewer's first name and last initial.</p>
   <p>All reviews must be honest, relevant, and based on genuine experience. Users must not submit fabricated reviews, threaten others with false reviews, or manipulate ratings.</p>
   <p>Andy reserves the right to moderate or remove content that violates platform rules or applicable law.</p>
 
@@ -3811,7 +4037,7 @@ MORE_TEMPLATES_3 = {
 
   <h2>17. Limitation of Liability</h2>
   <p>To the extent permitted by applicable law, Andy is not responsible for losses arising solely from circumstances outside its reasonable control, including third-party misconduct or inaccurate information supplied by users.</p>
-  <p>Andy is responsible for the services its artisans deliver as set out in these Terms and in applicable law. Andy is not responsible for losses caused by a customer's inaccurate information, a customer's failure to give access or follow agreed steps, or measurements the customer supplied.</p>
+  <p>Andy is responsible for the services its artisans deliver as set out in these Terms and in applicable law. Andy is not responsible for losses caused by a client's inaccurate information, a client's failure to give access or follow agreed steps, or measurements the client supplied.</p>
   <p>Nothing in these Terms excludes or limits liability where such exclusion or limitation is prohibited by law, including any non-excludable consumer rights.</p>
 
   <h2>18. Account Suspension and Termination</h2>
@@ -4176,12 +4402,12 @@ MORE_TEMPLATES_3 = {
     bubble('user', 'Request Professional Assistance'); save();
     if (!CAN) {
       if (!LOGGED) {
-        say('To send a request you need to log in or create a customer account. Your answers are kept on this device, so you can come back to this summary afterwards.', function() {
+        say('To send a request you need to log in or create a client account. Your answers are kept on this device, so you can come back to this summary afterwards.', function() {
           setQuick([{ label: 'Log in or sign up', primary: true, fn: function() { document.getElementById('authModal').classList.add('open'); again(); } },
                     { label: 'Back to summary', fn: showSummary }]);
         });
       } else {
-        say('Requests can only be sent from a customer account. You are logged in with a different type of account.', function() { setQuick([{ label: 'Back to summary', fn: showSummary }]); });
+        say('Requests can only be sent from a client account. You are logged in with a different type of account.', function() { setQuick([{ label: 'Back to summary', fn: showSummary }]); });
       }
       return;
     }
@@ -4300,7 +4526,7 @@ MORE_TEMPLATES_3 = {
         {% set pu = p.image_filename|photo_url("products") %}
         <div class="pimg" style="--bg:url('{{ pu }}');"><img src="{{ pu }}" alt="{{ p.name }}" loading="lazy" data-lightbox="svc-{{ sv.slug }}" data-full="{{ pu }}" data-caption="{{ p.name }}" onerror="this.closest('.pimg').classList.add('pimg-broken')"></div>
       {% elif p.video_url %}
-        <video class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}#t=0.1"></video>
+        <video playsinline class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}#t=0.1"></video>
       {% else %}
         <div class="pimg pimg-art">{{ category_graphic(p.category)|safe }}</div>
       {% endif %}
@@ -4379,7 +4605,7 @@ MORE_TEMPLATES_3 = {
       {% else %}
         <div class="profile-avatar profile-avatar-placeholder">{{ user.name[0]|upper }}</div>
       {% endif %}
-      <input type="file" name="avatar" accept=".jpg,.jpeg,.png,.webp" style="flex:1;">
+      <input type="file" name="avatar" accept=".jpg,.jpeg,.png,.webp" style="flex:1;min-width:0;max-width:100%;">
     </div>
     <input type="text" name="name" value="{{ user.name }}" placeholder="Your name" maxlength="60" required>
     <textarea name="bio" placeholder="Add a short bio (optional)" rows="3" maxlength="500">{{ user.bio }}</textarea>
@@ -4419,7 +4645,7 @@ MORE_TEMPLATES_3 = {
   <form method="POST" action="{{ url_for('settings') }}" class="auth-form" style="max-width:320px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="form_type" value="password">
     <input type="password" name="current_password" placeholder="Current password" required>
-    <input type="password" name="new_password" placeholder="New password (min 6 chars)" required>
+    <input type="password" name="new_password" placeholder="New password (min 8 chars)" required>
     <button class="btn btn-purple" type="submit">Update password</button>
   </form>
   <p style="font-size:12px;color:var(--text-muted);margin-top:14px;">
@@ -4450,7 +4676,7 @@ MORE_TEMPLATES_3 = {
 <div class="section-title">🔒 Reset Password</div>
 <div class="info-card" style="max-width:400px;">
   <form method="POST" action="{{ url_for('reset_password', token=token) }}" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <input type="password" name="new_password" placeholder="New password (min 6 chars)" required>
+    <input type="password" name="new_password" placeholder="New password (min 8 chars)" required>
     <button class="btn btn-purple" type="submit">Set new password</button>
   </form>
 </div>
@@ -4496,7 +4722,7 @@ MORE_TEMPLATES_3 = {
   {% for v in videos %}
     <div class="reel-card">
       {% if v.video_url %}
-        <video class="reel-video" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
+        <video playsinline class="reel-video" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
       {% else %}
         <div class="video-thumb" style="height:220px;">▶</div>
       {% endif %}
@@ -4581,7 +4807,7 @@ function shareReel(title, url) {
   {% for v in videos %}
     <div class="video-card">
       {% if v.video_url %}
-        <video class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
+        <video playsinline class="video-thumb" style="width:100%;object-fit:cover;" controls muted src="{{ v.video_url|photo_url('videos') }}"></video>
       {% else %}
         <div class="video-thumb">▶</div>
       {% endif %}
@@ -4732,7 +4958,7 @@ function shareReel(title, url) {
     <input type="hidden" name="reference_label" id="formRefLabel">
     <input type="hidden" name="confidence" id="formConfidence">
     <input type="hidden" name="photo_data" id="formPhotoData">
-    <input type="text" name="project_name" placeholder="Project / customer name (optional)">
+    <input type="text" name="project_name" placeholder="Project / client name (optional)">
     <textarea name="notes" id="formNotes" placeholder="Notes (optional)" rows="2"></textarea>
     <div style="display:flex;gap:10px;">
       <button type="button" class="btn btn-outline" style="flex:1;" onclick="location.reload()">Measure Again</button>
@@ -5105,7 +5331,7 @@ function checkActual() {
 {% block content %}
 
 <div class="section-title">📸 Our Work</div>
-<p class="works-intro">Tap a photo to see it full size, or press play on a video (sound on). Like a job, and logged-in customers can rate it and tell us what they think.</p>
+<p class="works-intro">Tap a photo to see it full size, or press play on a video (sound on). Like a job, and logged-in clients can rate it and tell us what they think.</p>
 
 {% if is_owner_view %}
   <div class="post-composer">
@@ -5179,7 +5405,7 @@ function checkActual() {
             <button class="btn btn-purple" type="submit">{{ 'Update review' if w.my_review else 'Post review' }}</button>
           </form>
         {% elif user %}
-          <div class="rev-empty">Only customers can leave reviews.</div>
+          <div class="rev-empty">Only clients can leave reviews.</div>
         {% else %}
           <button class="btn btn-purple" type="button" onclick="document.getElementById('authModal').classList.add('open')">Sign up or log in to review</button>
         {% endif %}
@@ -5583,7 +5809,7 @@ body.dark-mode .cat-filter { background: #111A2E; }
     z-index: 90;
   }
   .bottom-tabs a, .bottom-tabs button {
-    flex: 1;
+    flex: 1 1 0; min-width: 0;
     display: flex; flex-direction: column; align-items: center; gap: 2px;
     padding: 10px 0 8px;
     color: var(--chrome-dim);
@@ -5631,6 +5857,78 @@ body.dark-mode .cat-filter { background: #111A2E; }
 .push-actions { display: flex; gap: 8px; }
 .push-bar button { border: none; border-radius: 8px; padding: 7px 14px; font-size: 12px; font-weight: 700; cursor: pointer; background: #fff; color: #0e5a35; }
 .push-bar .push-later { background: transparent; color: #fff; opacity: .85; }
+.push-gate { position: fixed; inset: 0; z-index: 400; background: rgba(8,14,28,.86); align-items: center; justify-content: center; padding: 20px; }
+.push-gate-card { background: var(--card-bg, #fff); color: var(--navy); border-radius: 20px; padding: 26px 22px 18px; max-width: 380px; width: 100%; text-align: center; box-shadow: 0 24px 60px rgba(0,0,0,.35); max-height: 92vh; overflow-y: auto; }
+.push-gate-icon { font-size: 40px; line-height: 1; }
+.push-gate-card h2 { font-size: 20px; margin: 8px 0; letter-spacing: -0.01em; }
+.push-gate-card p { font-size: 14.5px; line-height: 1.5; color: var(--text-muted); margin: 0 0 14px; }
+.push-gate-card p.push-gate-err { color: #c0392b; font-weight: 600; }
+.push-gate-steps { text-align: left; font-size: 14px; line-height: 1.55; margin: 0 0 14px; padding-left: 20px; }
+.push-gate-btn { width: 100%; padding: 13px; border-radius: 12px; font-size: 16px; }
+.push-gate-btn:disabled { opacity: .6; }
+.push-gate-skip { display: block; width: 100%; background: none; border: 0; color: var(--text-muted); text-decoration: underline; margin-top: 8px; font-size: 13.5px; cursor: pointer; min-height: 40px; font-family: inherit; }
+.push-gate [hidden] { display: none !important; }
+.push-gate-logout { display: block; margin-top: 4px; padding: 8px; font-size: 13px; color: var(--text-muted); }
+body.push-gate-open { overflow: hidden; }
+
+
+/* ===== Chat page: deep black, Andy logo, deep-green client messages, black received messages with a white outline ===== */
+.conv { --bg: #000000; --card-bg: #0A0A0A; --border: rgba(255,255,255,.16); --navy: #FFFFFF; --text-muted: #A3A3AA; background: #000; color: #fff; color-scheme: dark; border-color: rgba(255,255,255,.14); }
+.conv .chat-box { background: #000; }
+.conv .chat-messages { background-color: #000; background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzODAgMTAwIj48ZyBvcGFjaXR5PSIuMiI+PGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoNDYgMTApIHNjYWxlKDIuNykiPjxwYXRoIGQ9Ik0xMSAwIEwyMiAxOSBMMCAxOSBaIiBmaWxsPSIjMjJDNTVFIi8+PHJlY3QgeD0iLTYiIHk9IjciIHdpZHRoPSIxMiIgaGVpZ2h0PSIxMiIgZmlsbD0iIzdGRERBNiIgc3Ryb2tlPSIjMDAwIiBzdHJva2Utd2lkdGg9IjIiLz48L2c+PHRleHQgeD0iMTIyIiB5PSI2NiIgZm9udC1mYW1pbHk9IlBvcHBpbnMsIEludGVyLCBIZWx2ZXRpY2EsIEFyaWFsLCBzYW5zLXNlcmlmIiBmb250LXdlaWdodD0iODAwIiBmb250LXNpemU9IjYyIiBmaWxsPSIjRkZGRkZGIj5BTkRZPHRzcGFuIGZpbGw9IiMyMkM1NUUiPi48L3RzcGFuPjwvdGV4dD48L2c+PC9zdmc+"); background-repeat: no-repeat; background-position: center 42%; background-size: min(78%, 320px) auto; background-attachment: scroll; }
+.conv .chat-messages .msg { background: #000; color: #fff; border: 1px solid #fff; box-shadow: none; }
+.conv .chat-messages .msg.role-customer { background: #0B6E3C; color: #fff; border-color: #0B6E3C; }
+.conv .chat-messages .msg.role-owner, .conv .chat-messages .msg.role-artisan { background: #000; color: #fff; border: 1px solid #fff; }
+.conv .chat-messages .msg-sender { color: #86EFAC; }
+.conv .chat-messages .msg.role-customer .msg-sender { color: #BBF7D0; }
+.conv .chat-messages .msg-meta { color: rgba(255,255,255,.62); }
+.conv .chat-messages .ticks { color: rgba(255,255,255,.55); }
+.conv .chat-messages .ticks-read { color: #4ADE80; }
+.conv .chat-messages .msg.role-customer .ticks-read { color: #BBF7D0; }
+.conv .msg-sys, .conv .msg-day span { background: #0F0F10; color: #A3A3AA; box-shadow: none; border: 1px solid rgba(255,255,255,.12); }
+.conv .chat-messages .empty-state { color: #A3A3AA; }
+.conv .chat-input { background: #0A0A0A; border-top: 1px solid rgba(255,255,255,.16); }
+.conv .chat-input input.chat-text-input { background: #000; color: #fff; border-color: rgba(255,255,255,.5); }
+.conv .chat-input input.chat-text-input::placeholder { color: #8B8B93; }
+.conv .attach-btn { color: #D4D4D8; }
+.conv .send-btn { background: #0B6E3C; }
+.conv .send-btn svg path { fill: #fff; }
+.conv .conv-head, .conv .conv-info { background: #0A0A0A; }
+.conv .conv-head { border-bottom-color: rgba(255,255,255,.16); }
+.conv .conv-info .job-card, .conv .conv-info .post-composer, .conv .conv-info .info-card { background: #000; border: 1px solid rgba(255,255,255,.25); color: #fff; }
+.conv .conv-info select, .conv .conv-info input, .conv .conv-info textarea { background: #0F0F10; color: #fff; border-color: rgba(255,255,255,.35); }
+.conv .conv-info label, .conv .conv-info .meta, .conv .conv-info small { color: #A3A3AA; }
+.conv .chat-file-label { color: #A3A3AA; }
+.voice-note { margin-top: 2px; }
+.voice-label { display: block; font-size: 12px; opacity: .8; margin-bottom: 4px; }
+.voice-note audio { display: block; width: 230px; max-width: 100%; height: 38px; }
+.rec-bar { flex: 1; display: none; align-items: center; gap: 10px; min-width: 0; padding: 0 4px; color: #F4F4F5; font-size: 14px; }
+.rec-bar:not([hidden]) { display: flex; }
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #EF4444; flex-shrink: 0; animation: recPulse 1.2s ease-in-out infinite; }
+@keyframes recPulse { 50% { opacity: .35; } }
+.rec-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.rec-hint { color: #9A9AA2; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rec-cancel { background: none; border: 0; font-size: 20px; min-width: 44px; min-height: 44px; cursor: pointer; flex-shrink: 0; }
+.chat-input.recording .chat-text-input, .chat-input.recording .attach-btn { display: none; }
+.rec-err { margin: 0 12px 8px; padding: 8px 12px; border-radius: 10px; background: rgba(239,68,68,.14); color: #FCA5A5; font-size: 13px; }
+.rec-err[hidden], .mic-btn[hidden] { display: none !important; }
+
+/* iPhone / small-screen polish */
+@media (max-width: 360px) {
+  .bottom-tabs a, .bottom-tabs button { font-size: 10px; }
+  .bottom-tabs a span, .bottom-tabs button span { font-size: 16px; }
+}
+@media (max-width: 900px) {
+  .btn { min-height: 38px; display: inline-flex; align-items: center; justify-content: center; text-align: center; }
+}
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+@media (max-width: 900px) {
+  /* iOS Safari zooms the whole page when a field smaller than 16px is tapped */
+  input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]):not([type=hidden]):not([type=submit]):not([type=button]), select, textarea { font-size: 16px !important; }
+}
+.mode-switch::after { content: ""; position: absolute; inset: -10px -6px; }
+.reel-action-btn { min-height: 40px; min-width: 44px; padding: 8px 8px; }
+.rev-toggle { min-height: 44px; }
 
 
 /* --- Our Work review --- */
@@ -5655,7 +5953,7 @@ h1, h2, h3, h4, .section-title { font-family: 'Poppins', sans-serif; }
   body.guest-site main { max-width: 1120px; padding: 28px 32px 20px; }
   .site-nav {
     display: flex; position: sticky; top: 0; z-index: 90; align-items: center; gap: 32px;
-    padding: 14px 40px; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(14px);
+    padding: 14px 40px; background: var(--bg); background: color-mix(in srgb, var(--bg) 85%, transparent); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
     border-bottom: 1px solid transparent; transition: border-color .3s, box-shadow .3s;
   }
   .site-nav.scrolled { border-bottom-color: var(--border); box-shadow: 0 8px 30px rgba(15,23,42,.12); }
@@ -5877,9 +6175,9 @@ body { overflow-x: clip; }
 .carousel-btn.prev { left: 8px; } .carousel-btn.next { right: 8px; }
 .carousel-btn:disabled { opacity: 0; pointer-events: none; }
 .carousel-btn:hover { transform: translateY(-50%) scale(1.06); }
-.carousel-dots { display: flex; justify-content: center; gap: 8px; margin-top: 6px; }
+.carousel-dots { display: flex; justify-content: center; gap: 12px; margin-top: 6px; }
 .carousel-dots button { width: 8px; height: 8px; border-radius: 50%; border: none; padding: 0; background: rgba(128,128,128,.4); cursor: pointer; position: relative; transition: width .2s, background .2s; }
-.carousel-dots button::after { content: ""; position: absolute; inset: -10px -4px; }
+.carousel-dots button::after { content: ""; position: absolute; inset: -12px -6px; }
 .carousel-dots button.on { width: 22px; border-radius: 4px; background: var(--accent); }
 .carousel.no-scroll .carousel-btn, .carousel.no-scroll .carousel-dots { display: none !important; }
 @media (hover: hover) and (min-width: 721px) { .carousel-btn { display: flex; } }
@@ -6560,19 +6858,76 @@ def _save_base64_photo(data_url, upload_dir):
         return ""
 
 
-def _save_attachment(file_storage, upload_dir, allow_video=False):
-    """Saves an image, doc, or video attachment. Returns (stored_value, kind)
+ALLOWED_AUDIO_EXT = {"webm", "ogg", "oga", "mp3", "m4a", "mp4", "wav", "aac"}
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+
+
+def _file_head(file_storage, n=16):
+    stream = file_storage.stream
+    try:
+        stream.seek(0)
+        head = stream.read(n)
+        stream.seek(0)
+        return head
+    except Exception:
+        return b""
+
+
+def _content_matches(ext, file_storage):
+    """True when the file's first bytes really look like what its extension claims."""
+    head = _file_head(file_storage, 512)
+    if ext in ("jpg", "jpeg"):
+        return head[:3] == b"\xff\xd8\xff"
+    if ext == "png":
+        return head[:8] == b"\x89PNG\r\n\x1a\n"
+    if ext == "webp":
+        return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    if ext == "pdf":
+        return head[:5] == b"%PDF-"
+    if ext in ("docx", "xlsx"):
+        return head[:4] == b"PK\x03\x04"
+    if ext in ("doc", "xls"):
+        return head[:4] == b"\xd0\xcf\x11\xe0"
+    if ext == "txt":
+        return b"\x00" not in head
+    if ext in ALLOWED_AUDIO_EXT:
+        return (head[:4] == b"\x1aE\xdf\xa3" or head[:4] == b"OggS" or head[4:8] == b"ftyp" or head[:3] == b"ID3"
+                or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0) or (head[:4] == b"RIFF" and head[8:12] == b"WAVE"))
+    return True
+
+
+def _save_attachment(file_storage, upload_dir, allow_video=False, allow_audio=False):
+    """Saves an image, doc, voice note, or video attachment. Returns (stored_value, kind)
     or (None, None) if no usable file was given."""
     if not file_storage or file_storage.filename == "":
         return None, None
     ext = file_storage.filename.rsplit(".", 1)[-1].lower() if "." in file_storage.filename else ""
     if ext in ALLOWED_PHOTO_EXT:
+        if not _content_matches(ext, file_storage):
+            return None, None
         cloud_url = upload_media(file_storage)
         if cloud_url:
             return cloud_url, "image"
         safe_name = f"{int(time.time()*1000)}_{secure_filename(file_storage.filename)}"
         file_storage.save(os.path.join(upload_dir, safe_name))
         return safe_name, "image"
+    if allow_audio and ext in ALLOWED_AUDIO_EXT:
+        if not _content_matches(ext, file_storage):
+            return None, None
+        try:
+            file_storage.stream.seek(0, 2)
+            size = file_storage.stream.tell()
+            file_storage.stream.seek(0)
+        except Exception:
+            size = 0
+        if size > MAX_AUDIO_BYTES:
+            return None, None
+        cloud_url = upload_video_media(file_storage)
+        if cloud_url:
+            return cloud_url, "audio"
+        safe_name = f"{int(time.time()*1000)}_{secure_filename(file_storage.filename)}"
+        file_storage.save(os.path.join(upload_dir, safe_name))
+        return safe_name, "audio"
     if allow_video and ext in ALLOWED_VIDEO_EXT:
         cloud_url = upload_video_media(file_storage)
         if cloud_url:
@@ -6581,10 +6936,40 @@ def _save_attachment(file_storage, upload_dir, allow_video=False):
         file_storage.save(os.path.join(upload_dir, safe_name))
         return safe_name, "video"
     if ext in ALLOWED_FILE_EXT:
+        if not _content_matches(ext, file_storage):
+            return None, None
         safe_name = f"{int(time.time()*1000)}_{secure_filename(file_storage.filename)}"
         file_storage.save(os.path.join(upload_dir, safe_name))
         return safe_name, "file"
     return None, None
+
+
+_msg_times = {}
+
+
+def _message_flood(user_id, limit=20, window=60):
+    """True when someone is sending messages faster than a person realistically would."""
+    now = time.time()
+    recent = [t for t in _msg_times.get(user_id, []) if now - t < window]
+    if len(recent) >= limit:
+        _msg_times[user_id] = recent
+        return True
+    recent.append(now)
+    _msg_times[user_id] = recent
+    return False
+
+
+_COMMON_PASSWORDS = {"123456", "1234567", "12345678", "123456789", "1234567890", "password", "password1", "qwerty", "qwerty123", "111111",
+                     "000000", "abc123", "iloveyou", "admin123", "welcome1", "andy123", "andyalloy", "aluminium", "aluminum"}
+
+
+def _password_problem(pw):
+    """None if the password is acceptable, otherwise a plain-words reason."""
+    if len(pw) < 8:
+        return "Your password needs at least 8 characters."
+    if pw.lower() in _COMMON_PASSWORDS or len(set(pw)) < 3:
+        return "That password is too easy to guess. Please choose a different one."
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -6642,8 +7027,9 @@ def signup_customer():
         return _signup_fail("Please enter your full name.")
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         return _signup_fail("That email address doesn't look right. Please check it.")
-    if len(password) < 6:
-        return _signup_fail("Your password needs at least 6 characters.")
+    problem = _password_problem(password)
+    if problem:
+        return _signup_fail(problem)
     conn = get_db()
     if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
         conn.close()
@@ -6856,9 +7242,10 @@ def reset_password(token):
 
     if request.method == "POST":
         new_password = request.form.get("new_password", "")
-        if len(new_password) < 6:
+        problem = _password_problem(new_password)
+        if problem:
             conn.close()
-            flash("New password must be at least 6 characters.", "error")
+            flash(problem, "error")
             return redirect(url_for("reset_password", token=token))
         conn.execute("UPDATE users SET password_hash = ?, reset_token = '', reset_token_expires = '' WHERE id = ?",
                      (generate_password_hash(new_password), user["id"]))
@@ -6915,7 +7302,7 @@ def consultation_request():
     wj = request.headers.get("X-Requested-With") == "fetch"
     user = require_login()
     if not user or not is_customer(user):
-        return _consult_reply(wj, False, "Please log in with a customer account to send this request.", 401)
+        return _consult_reply(wj, False, "Please log in with a client account to send this request.", 401)
 
     labels = dict(REQUEST_CHIPS)
     category = request.form.get("category", "")
@@ -6935,8 +7322,8 @@ def consultation_request():
     if location:
         lines.append(f"Project location: {location}")
     if dimensions:
-        lines.append(f"Dimensions given by customer (estimate, not verified): {dimensions}")
-    lines.append("The customer agreed to share this summary.")
+        lines.append(f"Dimensions given by client (estimate, not verified): {dimensions}")
+    lines.append("The client agreed to share this summary.")
     description = "\n".join(lines) + "\n\n" + summary
 
     conn = None
@@ -7018,7 +7405,7 @@ def services_add():
 def request_service():
     user = require_login()
     if not user or not is_customer(user):
-        flash("Log in as a customer to request a service.", "error")
+        flash("Log in as a client to request a service.", "error")
         return redirect(url_for("home"))
 
     if request.method == "POST":
@@ -7047,7 +7434,7 @@ def request_service():
         conn.close()
         _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category,
                                          "customer_id": user["id"], "artisan_id": None}, description)
-        flash("Request submitted! Andy will review it shortly.", "success")
+        flash("Request submitted! You can follow up in this chat.", "success")
         return redirect(url_for("job_thread", job_id=job_id))
 
     prefill = request.args.get("category", "")
@@ -7192,7 +7579,7 @@ def job_thread(job_id):
         head_title = job["title"]
         head_sub = "Chat with Andy Alloy" + (f" · Artisan: {artisan_name}" if artisan_name else "") + f" · {status_label}"
     else:
-        head_title, head_sub = job["title"], f"Customer: {cname} · {status_label}"
+        head_title, head_sub = job["title"], f"Client: {cname} · {status_label}"
     back_url = url_for("admin_chats") if is_owner(user) else url_for("notifications_page")
     return render_template(
         "job_thread.html", user=user, job=job, customer_name=cname,
@@ -7212,6 +7599,16 @@ def _post_system_message(conn, job_id, text):
         "VALUES (?, 0, 'system', ?, 1, 1, 1)", (job_id, text))
 
 
+ROLE_LABELS = {"customer": "Client", "owner": "Owner", "artisan": "Artisan", "system": "Andy"}
+
+
+def role_label(role):
+    return ROLE_LABELS.get(role or "", (role or "").title())
+
+
+app.jinja_env.filters["role_label"] = role_label
+
+
 _STATUS_EVENT = {"submitted": "Status: submitted.", "assigned": "Status: assigned.", "in_progress": "Work is now in progress.",
                  "completed": "This job was marked completed.", "cancelled": "This request was cancelled."}
 
@@ -7225,7 +7622,8 @@ def _message_payload(m, user, hide_numbers=False):
     avatar = d.get("sender_avatar")
     return {
         "id": d["id"], "sender_id": d["sender_id"], "sender_name": d["sender_name"] or "", "sender_role": d["sender_role"] or "",
-        "sender_role_label": (d["sender_role"] or "").title(),
+        "sender_role_label": role_label(d["sender_role"]),
+        "role_class": "role-" + (d["sender_role"] or "x"),
         "text": d.get("text") or "",
         "attachment_url": photo_url_filter(d["attachment_filename"], "attachments") if d.get("attachment_filename") else "",
         "attachment_kind": d.get("attachment_kind") or "",
@@ -7334,13 +7732,22 @@ def post_job_message(job_id):
         flash("You don't have access to that job.", "error")
         return redirect(url_for("home"))
 
-    text = request.form.get("text", "").strip()
+    if _message_flood(user["id"]):
+        conn.close()
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify(ok=False, message="You're sending messages very fast. Please wait a moment."), 429
+        flash("You're sending messages very fast. Please wait a moment.", "error")
+        return redirect(url_for("job_thread", job_id=job_id))
+
+    text = request.form.get("text", "").strip()[:2000]
     if job["status"] not in ("in_progress",) and user["role"] != "owner":
         # For now a customer's phone number is open to the owner: it stays visible while no artisan is on the job
         keep = user["role"] == "customer" and not job["artisan_id"]
         text = mask_phone_numbers(text, keep_phones=keep) if text else text
 
-    attachment_value, attachment_kind = _save_attachment(request.files.get("attachment"), ATTACHMENTS_UPLOAD_DIR)
+    attachment_value, attachment_kind = _save_attachment(request.files.get("attachment"), ATTACHMENTS_UPLOAD_DIR, allow_audio=True)
+    if attachment_kind == "audio" and not text:
+        text = "🎤 Voice message"
 
     if text or attachment_value:
         owner_read_flag = 1 if user["role"] == "owner" else 0
@@ -7470,7 +7877,7 @@ def complete_service_job(job_id):
         conn.close()
         return redirect(url_for("job_thread", job_id=job_id))
     _release_escrow(conn, dict(job))
-    _post_system_message(conn, job_id, "The customer marked this job complete.")
+    _post_system_message(conn, job_id, "The client marked this job complete.")
     conn.commit()
     conn.close()
     flash("Job marked complete." + (" Payment released to your artisan." if job["escrow_held"] else ""), "success")
@@ -7478,7 +7885,7 @@ def complete_service_job(job_id):
 
 
 def _release_escrow(conn, job):
-    """Pays the artisan from escrow ONCE, and only if the customer really paid in-app."""
+    """Pays the artisan from escrow ONCE, and only if the client really paid in-app."""
     tech = conn.execute("SELECT * FROM artisans WHERE id=?", (job["artisan_id"],)).fetchone() if job.get("artisan_id") else None
     if tech:
         conn.execute("UPDATE artisans SET jobs_completed = jobs_completed + 1 WHERE id=?", (tech["id"],))
@@ -7511,7 +7918,7 @@ def cancel_job(job_id):
         return redirect(url_for("job_thread", job_id=job_id))
     conn.execute("UPDATE jobs SET status='cancelled' WHERE id=? AND status IN ('submitted', 'assigned')", (job_id,))
     owners = [r["id"] for r in conn.execute("SELECT id FROM users WHERE role='owner'").fetchall()]
-    _post_system_message(conn, job_id, "The customer cancelled this request.")
+    _post_system_message(conn, job_id, "The client cancelled this request.")
     conn.commit()
     conn.close()
     send_push_to_users(owners, {"title": "Request cancelled", "body": f"{user['name']} cancelled “{job['title']}”.",
@@ -7941,7 +8348,7 @@ def upload_paid_clip():
         )
         conn.commit()
         conn.close()
-        flash("Paid clip uploaded (shows as 'Coming Soon' to customers until you're ready to sell it).", "success")
+        flash("Paid clip uploaded (shows as 'Coming Soon' to clients until you're ready to sell it).", "success")
     return redirect(url_for("admin_learning") if is_owner(user) else url_for("dashboard"))
 
 
@@ -8091,10 +8498,16 @@ def checkout_cart():
         flash("Not enough CONNECT coins. Top up your wallet first.", "error")
         return redirect(url_for("cart"))
 
-    conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=?", (total, user["id"]))
+    # Claim the cart first (only one request can), then take the coins only if the balance still covers it
+    claimed = conn.execute("UPDATE product_orders SET status='paid' WHERE customer_id=? AND status='cart'", (user["id"],))
+    charged = conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=? AND wallet >= ?", (total, user["id"], total))
+    if claimed.rowcount != len(cart_rows) or charged.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        flash("We couldn't complete that order. Your cart may have changed, or your balance is too low.", "error")
+        return redirect(url_for("cart"))
     conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
                  (user["id"], "Catalog order (held in escrow)", -total))
-    conn.execute("UPDATE product_orders SET status='paid' WHERE customer_id=? AND status='cart'", (user["id"],))
     conn.commit()
     conn.close()
     flash("Order placed! Payment held until Andy fulfills it.", "success")
@@ -8275,7 +8688,7 @@ def save_video(video_id):
         flash("Saved to your collection.", "success")
     conn.commit()
     conn.close()
-    return redirect(request.referrer or url_for("reels"))
+    return redirect(_same_site_referrer(url_for("reels")))
 
 
 @app.route("/reels/<int:video_id>/comment", methods=["POST"])
@@ -8389,10 +8802,17 @@ def buy_video(video_id):
         flash("Not enough CONNECT coins. Top up your wallet first.", "error")
         return redirect(url_for("learning_center"))
 
-    conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=?", (v["price"], user["id"]))
+    # One conditional step: only succeeds if the person still has the coins AND doesn't already own the video
+    got = conn.execute("INSERT INTO video_purchases (video_id, user_id) SELECT ?, ? WHERE NOT EXISTS "
+                       "(SELECT 1 FROM video_purchases WHERE video_id=? AND user_id=?)", (video_id, user["id"], video_id, user["id"]))
+    paid = conn.execute("UPDATE users SET wallet = wallet - ? WHERE id=? AND wallet >= ?", (v["price"], user["id"], v["price"]))
+    if got.rowcount != 1 or paid.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        flash("Couldn't unlock this video. You may already own it, or your balance is too low.", "error")
+        return redirect(url_for("learning_center"))
     conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, ?, ?)",
                  (user["id"], f"Bought video: {v['title']}", -v["price"]))
-    conn.execute("INSERT INTO video_purchases (video_id, user_id) VALUES (?, ?)", (video_id, user["id"]))
     conn.commit()
     conn.close()
     flash("Video unlocked!", "success")
@@ -8415,7 +8835,13 @@ def pro_page():
             conn.close()
             flash("Not enough CONNECT coins. Top up your wallet first.", "error")
             return redirect(url_for("pro_page"))
-        conn.execute("UPDATE users SET wallet = wallet - ?, is_pro = 1 WHERE id=?", (PRO_MEMBERSHIP_COST, user["id"]))
+        upg = conn.execute("UPDATE users SET wallet = wallet - ?, is_pro = 1 WHERE id=? AND is_pro = 0 AND wallet >= ?",
+                           (PRO_MEMBERSHIP_COST, user["id"], PRO_MEMBERSHIP_COST))
+        if upg.rowcount != 1:
+            conn.rollback()
+            conn.close()
+            flash("Couldn't upgrade. You may already be Pro, or your balance is too low.", "error")
+            return redirect(url_for("pro_page"))
         conn.execute("INSERT INTO transactions (user_id, label, amount) VALUES (?, 'Upgraded to Andy Pro', ?)",
                      (user["id"], -PRO_MEMBERSHIP_COST))
         conn.commit()
@@ -8511,7 +8937,7 @@ def work_review(work_id):
     if not user:
         return redirect(url_for("works") + anchor)
     if not is_customer(user):
-        flash("Only customers can leave reviews.", "error")
+        flash("Only clients can leave reviews.", "error")
         return redirect(url_for("works") + anchor)
     try:
         rating = int(request.form.get("rating", "0"))
@@ -8931,9 +9357,10 @@ def settings():
                 conn.close()
                 flash("Current password is incorrect.", "error")
                 return redirect(url_for("settings"))
-            if len(new_password) < 6:
+            problem = _password_problem(new_password)
+            if problem:
                 conn.close()
-                flash("New password must be at least 6 characters.", "error")
+                flash(problem, "error")
                 return redirect(url_for("settings"))
             conn.execute("UPDATE users SET password_hash=? WHERE id=?",
                          (generate_password_hash(new_password), user["id"]))
