@@ -1238,6 +1238,8 @@ def init_db():
     _add_column_if_missing(conn, "videos", "description", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "site_content", "what_offers", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "products", "video_url", "TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "products", "colour", "TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "products", "style", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "messages", "read_by_owner", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "messages", "read_by_customer", "INTEGER DEFAULT 1")
     _add_column_if_missing(conn, "messages", "read_by_artisan", "INTEGER DEFAULT 1")
@@ -1516,6 +1518,24 @@ def job_visible_to(user, job):
         tech = get_artisan_profile(user["id"])
         return tech and job["artisan_id"] == tech["id"]
     return False
+
+
+FINISHES = [("Arctic White", "#F4F6F8"), ("Urban Grey", "#6B7280"), ("Obsidian Black", "#111111"), ("Ocean Blue", "#1E5FA8"),
+            ("Forest Green", "#1F6B45"), ("Champagne Gold", "#C8AD7F"), ("Platinum Silver", "#C3C7CD")]
+FINISH_NAMES = [n for n, _ in FINISHES]
+PRODUCT_STYLES = ["Sliding window", "Fixed window", "Casement window", "Sliding door", "Swing door", "Fixed partition", "Railing", "Shopfront"]
+
+
+def finish_hex(name):
+    return dict(FINISHES).get(name, "")
+
+
+def _clean_finish(value):
+    return value if value in FINISH_NAMES else ""
+
+
+def _clean_short(value, n=60):
+    return " ".join((value or "").split())[:n]
 
 
 def _product_dict(row):
@@ -3623,6 +3643,8 @@ MORE_TEMPLATES_3 = {
       <div class="pbody">
         <div class="pcat">{{ p.category }}</div>
         <h3 class="pname">{{ p.name }}</h3>
+        {% if p.style or p.sizes or p.colour %}<span class="pspec">{% if p.style %}{{ p.style }}{% endif %}{% if p.style and p.sizes %} · {% endif %}{% if p.sizes %}{{ p.sizes|join(', ') }}{% endif %}</span>
+        {% if p.colour %}<span class="finish"><i style="background:{{ finish_hex(p.colour) }};"></i>{{ p.colour }}</span>{% endif %}{% endif %}
         {% if p.description %}<p class="pdesc">{{ p.description }}</p>{% endif %}
         {% if p.price > 0 %}<div class="pprice">₦{{ "{:,}".format(p.price) }} <span>per unit</span></div>{% else %}<div class="pprice pquote">Ask for a quote</div>{% endif %}
         {% if p.price <= 0 %}
@@ -3648,10 +3670,12 @@ MORE_TEMPLATES_3 = {
   <div class="empty-state">No products here yet.{% if active_cat %} <a href="{{ url_for('catalog') }}" style="color:var(--accent);font-weight:600;">See all products</a>.{% endif %}</div>
 {% endif %}
 
-<div class="cat-help">Can't find what you need? Andy also makes custom aluminum work.
-  {% if user and user.role == 'customer' %}<a href="{{ url_for('request_service') }}">Request a service →</a>
-  {% elif not user %}<a href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Request a service →</a>{% endif %}
-</div>
+<section class="ask-more" aria-labelledby="askMoreTitle2">
+  <h3 id="askMoreTitle2">Looking for a different window or door?</h3>
+  <p>Can't see the size, style or colour you want? Tell us what you need and we will look at making it to measure.</p>
+  {% if user and user.role == 'customer' %}<a class="btn btn-purple" href="{{ url_for('request_service') }}">Ask for a different window or door</a>
+  {% elif not user %}<a class="btn btn-purple" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">Ask for a different window or door</a>{% endif %}
+</section>
 
 {% endblock %}
 ''',
@@ -3711,7 +3735,10 @@ MORE_TEMPLATES_3 = {
     </select>
     <textarea name="description" placeholder="Short description" rows="2"></textarea>
     <input type="number" name="price" placeholder="Price in ₦ per unit" required>
-    <input type="text" name="sizes" placeholder="Sizes, comma separated">
+    <select name="colour" aria-label="Colour"><option value="">Colour (choose from the palette)</option>{% for n in finish_names() %}<option value="{{ n }}">{{ n }}</option>{% endfor %}</select>
+    <input type="text" name="style" list="styleList" maxlength="60" placeholder="Style (e.g. Sliding window)">
+    <datalist id="styleList">{% for st in product_styles() %}<option value="{{ st }}">{% endfor %}</datalist>
+    <input type="text" name="sizes" placeholder="Sizes, comma separated (e.g. 3ft x 4ft, 4ft x 5ft)">
     <label style="font-size:12px;color:var(--text-muted);">Photo</label>
     <input type="file" name="image" accept=".jpg,.jpeg,.png,.webp">
     <label style="font-size:12px;color:var(--text-muted);">Demo video (optional)</label>
@@ -3731,7 +3758,7 @@ MORE_TEMPLATES_3 = {
         {% endif %}
         <div class="video-info">
           <div class="video-title">{{ p.name }}</div>
-          <div style="font-size:11px;color:var(--text-muted);">{{ p.category }} · ₦{{ "{:,}".format(p.price) }}</div>
+          <div style="font-size:11px;color:var(--text-muted);">{{ p.category }} · ₦{{ "{:,}".format(p.price) }}{% if p.colour %} · {{ p.colour }}{% endif %}{% if p.style %} · {{ p.style }}{% endif %}</div>
           <form method="POST" action="{{ url_for('delete_product', product_id=p.id) }}" style="margin-top:6px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn btn-outline" type="submit" style="width:100%;padding:6px;font-size:11px;">Remove</button>
           </form>
@@ -4490,6 +4517,10 @@ MORE_TEMPLATES_3 = {
       {% for c in product_categories %}<option value="{{ c }}" {{ 'selected' if c == add_cat }}>{{ c }}</option>{% endfor %}
     </select>
     <input type="text" name="name" placeholder="Name (e.g. 3-panel sliding window)" maxlength="120" required>
+    <select name="colour" aria-label="Colour"><option value="">Colour (choose from the palette)</option>{% for n in finish_names() %}<option value="{{ n }}">{{ n }}</option>{% endfor %}</select>
+    <input type="text" name="style" list="styleList" maxlength="60" placeholder="Style (e.g. Sliding window)">
+    <datalist id="styleList">{% for st in product_styles() %}<option value="{{ st }}">{% endfor %}</datalist>
+    <input type="text" name="size" maxlength="60" placeholder="Size (e.g. 3ft wide × 4ft high)">
     <input type="number" name="price" min="0" step="500" placeholder="Price in ₦ (leave empty or 0 to show 'Ask for a quote')">
     <textarea name="description" rows="2" maxlength="600" placeholder="Short description (optional)"></textarea>
     <input type="file" name="images" accept=".jpg,.jpeg,.png,.webp" multiple required>
@@ -4524,7 +4555,7 @@ MORE_TEMPLATES_3 = {
     <figure class="svcp-item">
       {% if p.image_filename %}
         {% set pu = p.image_filename|photo_url("products") %}
-        <div class="pimg" style="--bg:url('{{ pu }}');"><img src="{{ pu }}" alt="{{ p.name }}" loading="lazy" data-lightbox="svc-{{ sv.slug }}" data-full="{{ pu }}" data-caption="{{ p.name }}" onerror="this.closest('.pimg').classList.add('pimg-broken')"></div>
+        <div class="pimg" style="--bg:url('{{ pu }}');"><img src="{{ pu }}" alt="{{ p.name }}{% if p.colour %}, {{ p.colour }}{% endif %}" loading="lazy" data-lightbox="svc-{{ sv.slug }}" data-full="{{ pu }}" data-caption="{{ p.name }}" onerror="this.closest('.pimg').classList.add('pimg-broken')"></div>
       {% elif p.video_url %}
         <video playsinline class="pvideo" controls muted preload="metadata" src="{{ p.video_url|photo_url('products') }}#t=0.1"></video>
       {% else %}
@@ -4532,6 +4563,8 @@ MORE_TEMPLATES_3 = {
       {% endif %}
       <figcaption>
         <b>{{ p.name }}</b>
+        {% if p.style or p.sizes or p.colour %}<span class="svcp-spec">{% if p.style %}{{ p.style }}{% endif %}{% if p.style and p.sizes %} · {% endif %}{% if p.sizes %}{{ p.sizes|join(', ') }}{% endif %}</span>
+        {% if p.colour %}<span class="finish"><i style="background:{{ finish_hex(p.colour) }};"></i>{{ p.colour }}</span>{% endif %}{% endif %}
         <span>{% if p.price > 0 %}₦{{ "{:,}".format(p.price) }}{% else %}Ask for a quote{% endif %}</span>
         <details class="svcp-more">
           <summary>Details</summary>
@@ -4550,6 +4583,12 @@ MORE_TEMPLATES_3 = {
   {% endif %}
 </section>
 {% endfor %}
+
+<section class="ask-more" aria-labelledby="askMoreTitle">
+  <h3 id="askMoreTitle">Looking for a different window or door?</h3>
+  <p>Can't see the size, style or colour you want? Tell us what you need and we will look at making it to measure.</p>
+  {{ rq_link('', 'Ask for a different window or door', 'btn btn-purple') }}
+</section>
 
 <section class="cons" id="consultation" aria-labelledby="consTitle">
   <div class="cons-intro">
@@ -5913,6 +5952,19 @@ body.push-gate-open { overflow: hidden; }
 .rec-err { margin: 0 12px 8px; padding: 8px 12px; border-radius: 10px; background: rgba(239,68,68,.14); color: #FCA5A5; font-size: 13px; }
 .rec-err[hidden], .mic-btn[hidden] { display: none !important; }
 
+/* Colour palette names, style and size on catalogue cards; end-of-catalogue prompt */
+.svcp-spec, .pspec { display: block; font-size: 12.5px; line-height: 1.4; color: var(--text-muted); margin-top: 2px; }
+.finish { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; margin-top: 3px; }
+.svcp-item figcaption .svcp-spec { color: var(--text-muted); font-weight: 500; font-size: 12.5px; }
+.svcp-item figcaption .finish { color: var(--navy); font-weight: 600; font-size: 12.5px; }
+.pcard .pspec { color: var(--text-muted); font-weight: 500; }
+.pcard .finish { color: var(--navy); }
+.finish i { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(128,128,128,.5); display: inline-block; flex-shrink: 0; }
+.ask-more { margin: 34px auto 0; max-width: 760px; padding: 22px 20px; text-align: center; border: 1px dashed var(--border); border-radius: 14px; }
+.ask-more h3 { margin: 0 0 6px; font-size: 18px; color: var(--navy); }
+.ask-more p { margin: 0 0 14px; font-size: 14.5px; line-height: 1.55; color: var(--text-muted); }
+.ask-more .btn { border-radius: 999px; padding: 12px 24px; }
+
 /* iPhone / small-screen polish */
 @media (max-width: 360px) {
   .bottom-tabs a, .bottom-tabs button { font-size: 10px; }
@@ -6811,6 +6863,9 @@ def style_css():
     return Response(STYLE_CSS, mimetype="text/css")
 
 
+app.jinja_env.globals.update(finish_hex=lambda n: finish_hex(n), finish_names=lambda: FINISH_NAMES, product_styles=lambda: PRODUCT_STYLES)
+
+
 @app.template_filter("photo_url")
 def photo_url_filter(value, folder):
     if not value:
@@ -7386,14 +7441,17 @@ def services_add():
     if category not in PRODUCT_CATEGORIES or not name:
         flash("Choose a category and give the photo a short name.", "error")
         return redirect(back)
+    colour = _clean_finish(request.form.get("colour", ""))
+    style = _clean_short(request.form.get("style", ""))
+    size = _clean_short(request.form.get("size", ""))
     files = [f for f in request.files.getlist("images") if f and f.filename][:12]
     conn = get_db()
     saved = 0
     for i, f in enumerate(files):
         stored, kind = _save_attachment(f, PRODUCTS_UPLOAD_DIR)
         if stored and kind == "image":
-            conn.execute("INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (name + (f" {i + 1}" if len(files) > 1 else ""), category, description, price, "", stored, ""))
+            conn.execute("INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url, colour, style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (name + (f" {i + 1}" if len(files) > 1 else ""), category, description, price, size, stored, "", colour, style))
             saved += 1
     conn.commit()
     conn.close()
@@ -8546,6 +8604,8 @@ def add_product():
     except ValueError:
         price = 0
     sizes = request.form.get("sizes", "").strip()
+    colour = _clean_finish(request.form.get("colour", ""))
+    style = _clean_short(request.form.get("style", ""))
     if not name or price < 0:
         flash("Give the item a name. Leave the price at 0 to show 'Ask for a quote'.", "error")
         return redirect(_safe_next(url_for("dashboard_catalog")))
@@ -8566,8 +8626,8 @@ def add_product():
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (name, category, description, price, sizes, image_value, video_value),
+        "INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url, colour, style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, category, description, price, sizes, image_value, video_value, colour, style),
     )
     conn.commit()
     conn.close()
