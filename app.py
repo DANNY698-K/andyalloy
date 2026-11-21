@@ -140,6 +140,7 @@ def check_csrf():
 
 
 _SITE_CONTROL_EXEMPT_ENDPOINTS = {
+    "icon_png", "og_image", "web_manifest", "robots_txt", "sitemap_xml",
     "login", "logout", "login_google", "google_callback", "static", "style_css",
     "admin_site", "admin_controls", "admin_dashboard", "admin_artisans", "add_artisan",
     "toggle_artisan", "admin_jobs", "admin_chats", "job_thread", "post_job_message",
@@ -676,6 +677,106 @@ def privacy():
     return render_template("privacy.html", user=current_user(), active_page="privacy", auto_open_auth=False)
 
 
+import functools
+import struct
+import zlib
+
+_ICON_BG, _ICON_TRI, _ICON_SQ = (10, 20, 38), (34, 197, 94), (127, 221, 166)
+
+
+def _png_encode(w, h, rows):
+    raw = b"".join(b"\x00" + r for r in rows)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+
+@functools.lru_cache(maxsize=16)
+def _logo_png(w, h, mark_frac):
+    """The Andy mark (green triangle with the square over it) on the dark brand colour, drawn pixel by pixel."""
+    sc = (h * mark_frac) / 19.0
+    ox, oy = w / 2 - 8 * sc, h / 2 - 9.5 * sc
+
+    def colour(px, py):
+        x, y = (px - ox) / sc, (py - oy) / sc
+        if -6 <= x <= 6 and 7 <= y <= 19:
+            return _ICON_SQ
+        if -8 <= x <= 8 and 5 <= y <= 21:
+            return _ICON_BG
+        if 0 <= y <= 19 and abs(x - 11) <= 11 * (y / 19.0):
+            return _ICON_TRI
+        return _ICON_BG
+    x0, x1 = max(0, int(ox - 9 * sc)), min(w, int(ox + 24 * sc))
+    y0, y1 = max(0, int(oy - 1 * sc)), min(h, int(oy + 22 * sc))
+    bg_row = bytes(_ICON_BG) * w
+    rows = []
+    for y in range(h):
+        if y < y0 or y >= y1:
+            rows.append(bg_row)
+            continue
+        row = bytearray(bg_row)
+        for x in range(x0, x1):
+            r = g = b = 0
+            for sy in (0.25, 0.75):
+                for sx in (0.25, 0.75):
+                    cr, cg, cb = colour(x + sx, y + sy)
+                    r += cr; g += cg; b += cb
+            row[x * 3:x * 3 + 3] = bytes((r // 4, g // 4, b // 4))
+        rows.append(bytes(row))
+    return _png_encode(w, h, rows)
+
+
+def _cached_png(data):
+    resp = Response(data, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=604800"
+    return resp
+
+
+@app.route("/icon/<int:size>.png")
+def icon_png(size):
+    if size not in (32, 180, 192, 512):
+        return Response("Not found", status=404)
+    return _cached_png(_logo_png(size, size, 0.56))
+
+
+@app.route("/og-image.png")
+def og_image():
+    return _cached_png(_logo_png(1200, 630, 0.42))
+
+
+@app.route("/manifest.webmanifest")
+def web_manifest():
+    data = {
+        "name": "ANDY", "short_name": "ANDY",
+        "description": "Windows, doors, partitions and more. Browse, get guidance and request a service.",
+        "start_url": "/", "scope": "/", "display": "standalone",
+        "background_color": "#0A1426", "theme_color": "#0A1426",
+        "icons": [{"src": url_for("icon_png", size=192), "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+                  {"src": url_for("icon_png", size=512), "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}],
+    }
+    resp = jsonify(data)
+    resp.mimetype = "application/manifest+json"
+    return resp
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    body = ("User-agent: *\n" + "".join(f"Disallow: {p}\n" for p in
+            ("/admin", "/dashboard", "/settings", "/job/", "/wallet", "/my-jobs", "/notifications", "/cart", "/reset-password/", "/forgot-password", "/staff-login", "/login", "/signup"))
+            + f"\nSitemap: {url_for('sitemap_xml', _external=True)}\n")
+    return Response(body, mimetype="text/plain")
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    pages = ["/", "/services", "/catalog", "/works", "/about", "/consultation/guide", "/terms", "/privacy"]
+    base = request.url_root.rstrip("/")
+    xml = ('<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+           + "".join(f"  <url><loc>{base}{pg}</loc></url>\n" for pg in pages) + "</urlset>\n")
+    return Response(xml, mimetype="application/xml")
+
+
 @app.route("/sw.js")
 def service_worker():
     resp = Response(SERVICE_WORKER_JS, mimetype="application/javascript")
@@ -1010,7 +1111,7 @@ class _PGCursorWrapper:
 
 
 # Tables that have no "id" column (a plain "RETURNING id" on them is an error on Postgres)
-_PG_NO_ID_TABLES = {"video_purchases", "feed_likes", "app_kv", "paystack_refs", "work_likes", "review_likes", "video_likes", "video_saves"}
+_PG_NO_ID_TABLES = {"identity_checks", "video_purchases", "feed_likes", "app_kv", "paystack_refs", "work_likes", "review_likes", "video_likes", "video_saves"}
 _pg_has_id = {}
 
 
@@ -1239,6 +1340,7 @@ def init_db():
     _add_column_if_missing(conn, "site_content", "what_offers", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "products", "video_url", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "products", "colour", "TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "products", "colours_json", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "products", "style", "TEXT DEFAULT ''")
     _add_column_if_missing(conn, "messages", "read_by_owner", "INTEGER DEFAULT 0")
     _add_column_if_missing(conn, "messages", "read_by_customer", "INTEGER DEFAULT 1")
@@ -1263,6 +1365,9 @@ def init_db():
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS app_kv (k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS identity_checks (user_id INTEGER PRIMARY KEY, q1 TEXT, a1 TEXT, q2 TEXT, a2 TEXT, secret TEXT, "
+                 "updated_at TEXT DEFAULT CURRENT_TIMESTAMP, failed INTEGER DEFAULT 0, locked_until TEXT DEFAULT '')")
+    _add_column_if_missing(conn, "users", "reset_check", "TEXT DEFAULT ''")
     conn.execute("CREATE TABLE IF NOT EXISTS paystack_refs (reference TEXT PRIMARY KEY, user_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     _add_column_if_missing(conn, "jobs", "escrow_held", "INTEGER DEFAULT 0")
     if not conn.execute("SELECT 1 FROM app_kv WHERE k='escrow_backfill'").fetchone():
@@ -1526,6 +1631,46 @@ FINISH_NAMES = [n for n, _ in FINISHES]
 PRODUCT_STYLES = ["Sliding window", "Fixed window", "Casement window", "Sliding door", "Swing door", "Fixed partition", "Railing", "Shopfront"]
 
 
+COMMON_COLOURS = {"Arctic White", "Urban Grey"}          # the colours the starting price applies to
+THICKNESS_OPTIONS = [("normal", "Normal"), ("semi", "Semi-thick"), ("thick", "Thick"), ("advise", "Not sure, please advise me")]
+BURGLARY_OPTIONS = [("with", "With burglary protection"), ("without", "Without burglary protection")]
+SIZE_UNITS = [("ft", "feet"), ("in", "inches"), ("cm", "cm"), ("m", "metres")]
+GLASS_SUGGESTIONS = ["Clear", "Frosted", "Tinted"]
+_CM_PER_UNIT = {"ft": 30.48, "in": 2.54, "cm": 1.0, "m": 100.0}
+
+
+def _parse_colour_prices(form):
+    """Reads the colour tick-boxes and price boxes from the owner's form into a small JSON text."""
+    import json as _json
+    out = {}
+    for i, (name, _hex) in enumerate(FINISHES):
+        if form.get(f"cp_on_{i}"):
+            raw = (form.get(f"cp_{i}", "") or "").strip().replace(",", "")
+            try:
+                val = int(float(raw)) if raw else 0
+            except ValueError:
+                val = 0
+            out[name] = max(0, min(val, 100_000_000))
+    return _json.dumps(out) if out else ""
+
+
+def _colour_options(row, starting_price):
+    """Available colours for a product, each with the price to show (None = 'price on request')."""
+    import json as _json
+    try:
+        data = _json.loads(row.get("colours_json") or "") or {}
+    except Exception:
+        data = {}
+    out = []
+    for name, hexv in FINISHES:
+        if name in data:
+            price = int(data[name] or 0)
+            if price <= 0 and name in COMMON_COLOURS and starting_price > 0:
+                price = starting_price
+            out.append({"name": name, "hex": hexv, "price": price if price > 0 else None})
+    return out
+
+
 def finish_hex(name):
     return dict(FINISHES).get(name, "")
 
@@ -1538,10 +1683,21 @@ def _clean_short(value, n=60):
     return " ".join((value or "").split())[:n]
 
 
-def _product_dict(row):
+def _product_dict_base(row):
     p = dict(row)
     p["sizes"] = [s.strip() for s in p["sizes_csv"].split(",") if s.strip()]
     return p
+
+
+def _product_dict(row):
+    d = _product_dict_base(row)
+    d["colour_options"] = _colour_options(d, d.get("price") or 0)
+    try:
+        import json as _json
+        d["colour_prices"] = _json.loads(d.get("colours_json") or "") or {}
+    except Exception:
+        d["colour_prices"] = {}
+    return d
 
 
 CATEGORY_GRAPHICS = {
@@ -1589,6 +1745,24 @@ TEMPLATES = {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>{% block title %}ANDY | Aluminum made simple{% endblock %}</title>
+<meta name="description" content="{% block meta_description %}Andy makes and fits windows, doors, partitions and more. Browse the catalogue, get practical guidance, and request a service online.{% endblock %}">
+<meta name="theme-color" content="#0A1426">
+<link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('icon_png', size=32) }}">
+<link rel="apple-touch-icon" href="{{ url_for('icon_png', size=180) }}">
+<link rel="manifest" href="{{ url_for('web_manifest') }}">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="ANDY">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta property="og:site_name" content="ANDY">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{{ self.title()|striptags|trim }}">
+<meta property="og:description" content="{{ self.meta_description()|striptags|trim }}">
+<meta property="og:url" content="{{ request.base_url }}">
+<meta property="og:image" content="{{ url_for('og_image', _external=True) }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600;700;800&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
@@ -3241,8 +3415,22 @@ MORE_TEMPLATES_2 = {
 {% if resets %}
 <div class="info-card" style="margin-bottom:14px;">
   <b>🔑 Password reset requests</b>
-  <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Only you can see these links. Send one to the client (for example in chat). Each works for 1 hour.</p>
-  {% for r in resets %}<div style="font-size:13px;margin-bottom:8px;word-break:break-all;"><b>{{ r.name }}</b> ({{ r.email }})<br><a href="{{ r.link }}" style="color:var(--accent);">{{ r.link }}</a></div>{% endfor %}
+  <p style="font-size:12px;color:var(--text-muted);margin:4px 0 8px;">Only you can see these. You never see anyone's answers, only whether they matched. Send a link only to someone you are sure about. Each works for 1 hour.</p>
+  {% for r in resets %}<div style="font-size:13px;margin-bottom:12px;word-break:break-all;">
+    <b>{{ r.name }}</b> ({{ r.email }})
+    {% if r.check == 'matched' %}<span class="status-badge" style="background:rgba(34,197,94,.15);color:#15803d;">✅ Answers matched</span>
+    {% elif r.check == 'failed' %}<span class="status-badge" style="background:rgba(239,68,68,.15);color:#b91c1c;">❌ Answers did not match</span>
+    {% elif r.check == 'pending' %}<span class="status-badge" style="background:rgba(245,158,11,.18);color:#b45309;">⏳ Has not answered yet</span>
+    {% elif r.check == 'none' %}<span class="status-badge" style="background:rgba(245,158,11,.18);color:#b45309;">No answers set up</span>
+    {% elif r.check == 'approved' %}<span class="status-badge" style="background:rgba(34,197,94,.15);color:#15803d;">Approved by you</span>
+    {% elif r.check == 'emailed' %}<span class="status-badge">Link emailed to them</span>{% endif %}
+    <br>
+    {% if r.show_link %}<a href="{{ r.link }}" style="color:var(--accent);">{{ r.link }}</a>
+    {% else %}
+      <span style="color:var(--text-muted);">Link hidden until you are sure it is really them. Check another way (for example their last request), then:</span>
+      <form method="POST" action="{{ url_for('admin_approve_reset', user_id=r.id) }}" style="margin-top:6px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn btn-outline" type="submit">I have confirmed them, show the link</button></form>
+    {% endif %}
+  </div>{% endfor %}
 </div>
 {% endif %}
 <div class="stats-grid">
@@ -3616,10 +3804,12 @@ MORE_TEMPLATES_3 = {
 <div class="cat-head">
   <div>
     <div class="section-title" style="margin-bottom:4px;">🛒 Product Catalogue</div>
-    <p class="cat-sub">Standard aluminum windows, doors and partitions. Pick a size and add to your cart.</p>
+    <p class="cat-sub">Browse our windows and doors, choose one, and tell us the details. Andy confirms your final price and transport.</p>
   </div>
   {% if user and user.role == 'customer' %}<a class="cat-cart" href="{{ url_for('cart') }}">🧺 My cart</a>{% endif %}
 </div>
+
+<p class="price-note">Prices shown are standard starting prices. Your final price depends on the colour, size, thickness, glass, burglary protection and where it is delivered, and is confirmed by Andy after you send your details.</p>
 
 <div class="cat-filter-row" role="navigation" aria-label="Product categories">
   <a href="{{ url_for('catalog') }}" class="cat-filter {{ 'active' if not active_cat }}">All <span>{{ total_products }}</span></a>
@@ -3646,21 +3836,14 @@ MORE_TEMPLATES_3 = {
         {% if p.style or p.sizes or p.colour %}<span class="pspec">{% if p.style %}{{ p.style }}{% endif %}{% if p.style and p.sizes %} · {% endif %}{% if p.sizes %}{{ p.sizes|join(', ') }}{% endif %}</span>
         {% if p.colour %}<span class="finish"><i style="background:{{ finish_hex(p.colour) }};"></i>{{ p.colour }}</span>{% endif %}{% endif %}
         {% if p.description %}<p class="pdesc">{{ p.description }}</p>{% endif %}
-        {% if p.price > 0 %}<div class="pprice">₦{{ "{:,}".format(p.price) }} <span>per unit</span></div>{% else %}<div class="pprice pquote">Ask for a quote</div>{% endif %}
-        {% if p.price <= 0 %}
-          {% if user and user.role == 'customer' %}<a class="btn btn-purple pform-login" style="text-align:center;" href="{{ url_for('request_service', category=p.category) }}">Request a quote</a>
-          {% elif not user %}<button class="btn btn-outline pform-login" type="button" onclick="document.getElementById('authModal').classList.add('open')">Log in to ask</button>{% endif %}
-        {% elif user and user.role == 'customer' %}
-          <form method="POST" action="{{ url_for('add_to_cart', product_id=p.id) }}" class="pform"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            {% if p.sizes %}
-              <select name="size" required aria-label="Size">{% for sz in p.sizes %}<option value="{{ sz }}">{{ sz }}</option>{% endfor %}</select>
-            {% endif %}
-            <input type="number" name="quantity" value="1" min="1" aria-label="Quantity">
-            <button class="btn btn-purple" type="submit">Add to cart</button>
-          </form>
-        {% elif not user %}
-          <button class="btn btn-outline pform-login" type="button" onclick="document.getElementById('authModal').classList.add('open')">Log in to order</button>
+        {% if p.price > 0 %}<div class="pprice"><small>From</small> ₦{{ "{:,}".format(p.price) }} <span>standard price</span></div>{% else %}<div class="pprice pquote">Price on request</div>{% endif %}
+        {% if p.colour_options %}
+          <div class="colour-chips" aria-label="Available colours">
+            {% for c in p.colour_options %}<span class="finish"><i style="background:{{ c.hex }};"></i>{{ c.name }}{% if c.price %} <b>₦{{ "{:,}".format(c.price) }}</b>{% endif %}</span>{% endfor %}
+          </div>
         {% endif %}
+        {% if user and user.role == 'customer' %}<a class="btn btn-purple pform-login" style="text-align:center;" href="{{ url_for('quote_request', product_id=p.id) }}">Choose and request</a>
+        {% elif not user %}<button class="btn btn-purple pform-login" type="button" onclick="document.getElementById('authModal').classList.add('open')">Log in to request</button>{% endif %}
       </div>
     </article>
   {% endfor %}
@@ -3724,6 +3907,11 @@ MORE_TEMPLATES_3 = {
 
 "dashboard_catalog.html": '''{% extends "base.html" %}
 {% block content %}
+{% macro colour_grid(chosen) -%}
+<div class="cp-grid"><div class="cp-title">Available colours and their prices</div>
+{% for n, h in finishes() %}{% set i = loop.index0 %}<label class="cp-row"><input type="checkbox" name="cp_on_{{ i }}" {{ 'checked' if n in chosen }}><i style="background:{{ h }};"></i><span>{{ n }}</span><input type="number" name="cp_{{ i }}" min="0" step="500" placeholder="Price in ₦ (blank = standard or on request)" value="{{ chosen.get(n) or '' }}" aria-label="Price for {{ n }}"></label>{% endfor %}
+<div class="cp-help">Tick the colours you offer. White and grey use the standard starting price unless you type a price. Other colours show "Price on request" unless you type one.</div></div>
+{%- endmacro %}
 
 <div class="section-title">🛒 Manage Catalog</div>
 
@@ -3734,8 +3922,9 @@ MORE_TEMPLATES_3 = {
       {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
     </select>
     <textarea name="description" placeholder="Short description" rows="2"></textarea>
-    <input type="number" name="price" placeholder="Price in ₦ per unit" required>
-    <select name="colour" aria-label="Colour"><option value="">Colour (choose from the palette)</option>{% for n in finish_names() %}<option value="{{ n }}">{{ n }}</option>{% endfor %}</select>
+    <input type="number" name="price" placeholder="Standard starting price in ₦ (0 = price on request)" required>
+    {{ colour_grid({}) }}
+    <select name="colour" aria-label="Colour shown in the photo"><option value="">Colour shown in the photo (optional)</option>{% for n in finish_names() %}<option value="{{ n }}">{{ n }}</option>{% endfor %}</select>
     <input type="text" name="style" list="styleList" maxlength="60" placeholder="Style (e.g. Sliding window)">
     <datalist id="styleList">{% for st in product_styles() %}<option value="{{ st }}">{% endfor %}</datalist>
     <input type="text" name="sizes" placeholder="Sizes, comma separated (e.g. 3ft x 4ft, 4ft x 5ft)">
@@ -3759,6 +3948,14 @@ MORE_TEMPLATES_3 = {
         <div class="video-info">
           <div class="video-title">{{ p.name }}</div>
           <div style="font-size:11px;color:var(--text-muted);">{{ p.category }} · ₦{{ "{:,}".format(p.price) }}{% if p.colour %} · {{ p.colour }}{% endif %}{% if p.style %} · {{ p.style }}{% endif %}</div>
+          <details class="cp-edit"><summary>Edit price and colours</summary>
+            <form method="POST" action="{{ url_for('update_product', product_id=p.id) }}" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <input type="number" name="price" value="{{ p.price }}" min="0" step="500" aria-label="Standard starting price">
+              <input type="text" name="style" list="styleList" value="{{ p.style or '' }}" maxlength="60" placeholder="Style">
+              {{ colour_grid(p.colour_prices) }}
+              <button class="btn btn-purple" type="submit">Save</button>
+            </form>
+          </details>
           <form method="POST" action="{{ url_for('delete_product', product_id=p.id) }}" style="margin-top:6px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn btn-outline" type="submit" style="width:100%;padding:6px;font-size:11px;">Remove</button>
           </form>
@@ -4500,6 +4697,9 @@ MORE_TEMPLATES_3 = {
 "services.html": '''{% extends "base.html" %}
 {% block title %}Explore Services | ANDY{% endblock %}
 {% block content %}
+{% macro quote_link(pid, label, cls) -%}
+{% if user and user.role == 'customer' %}<a class="{{ cls }}" href="{{ url_for('quote_request', product_id=pid) }}">{{ label }}</a>{% elif not user %}<a class="{{ cls }}" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">{{ label }}</a>{% endif %}
+{%- endmacro %}
 {% macro rq_link(cat, label, cls) -%}
 {% if user and user.role == 'customer' %}<a class="{{ cls }}" href="{{ url_for('request_service', category=cat) }}">{{ label }}</a>{% elif not user %}<a class="{{ cls }}" href="#" onclick="document.getElementById('authModal').classList.add('open');return false;">{{ label }}</a>{% endif %}
 {%- endmacro %}
@@ -4565,11 +4765,12 @@ MORE_TEMPLATES_3 = {
         <b>{{ p.name }}</b>
         {% if p.style or p.sizes or p.colour %}<span class="svcp-spec">{% if p.style %}{{ p.style }}{% endif %}{% if p.style and p.sizes %} · {% endif %}{% if p.sizes %}{{ p.sizes|join(', ') }}{% endif %}</span>
         {% if p.colour %}<span class="finish"><i style="background:{{ finish_hex(p.colour) }};"></i>{{ p.colour }}</span>{% endif %}{% endif %}
-        <span>{% if p.price > 0 %}₦{{ "{:,}".format(p.price) }}{% else %}Ask for a quote{% endif %}</span>
+        <span>{% if p.price > 0 %}From ₦{{ "{:,}".format(p.price) }}{% else %}Price on request{% endif %}</span>
+        {% if p.colour_options %}<span class="colour-chips">{% for c in p.colour_options %}<span class="finish"><i style="background:{{ c.hex }};"></i>{{ c.name }}</span>{% endfor %}</span>{% endif %}
         <details class="svcp-more">
           <summary>Details</summary>
           <p>{{ p.description or 'Ask us for more details about this one.' }}</p>
-          {{ rq_link(sv.job_cat, 'Ask about this →', 'svcp-ask') }}
+          {{ quote_link(p.id, 'Choose and request →', 'svcp-ask') }}
         </details>
         {% if user and user.role == 'owner' %}
         <form method="POST" action="{{ url_for('delete_product', product_id=p.id) }}" onsubmit="return confirm('Remove this photo?');"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="next" value="{{ url_for('services') }}#{{ sv.slug }}"><button class="svcp-del" type="submit">Remove</button></form>
@@ -4619,6 +4820,69 @@ MORE_TEMPLATES_3 = {
   <p>Tell us what you need and we will take it from there.</p>
   {{ rq_link('', 'Request a Service', 'btn btn-purple') }}
 </div>
+{% endblock %}
+''',
+
+"quote_request.html": '''{% extends "base.html" %}
+{% block title %}Request {{ p.name }} | ANDY{% endblock %}
+{% block content %}
+<a class="qr-back" href="{{ url_for('catalog') }}">← Back to the catalogue</a>
+<div class="qr-product">
+  {% if p.image_filename %}<img src="{{ p.image_filename|photo_url('products') }}" alt="{{ p.name }}">{% else %}<div class="qr-art">{{ category_graphic(p.category)|safe }}</div>{% endif %}
+  <div>
+    <div class="pcat">{{ p.category }}{% if p.style %} · {{ p.style }}{% endif %}</div>
+    <h1 class="qr-name">{{ p.name }}</h1>
+    {% if p.price > 0 %}<div class="pprice"><small>From</small> ₦{{ "{:,}".format(p.price) }} <span>standard price</span></div>{% else %}<div class="pprice pquote">Price on request</div>{% endif %}
+  </div>
+</div>
+<p class="price-note">This is a standard starting price, not your final price. Send your details below and Andy will reply in your chat with the final price, transport and any other costs. Nothing is charged now.</p>
+
+<form class="qr-form" method="POST" action="{{ url_for('quote_request', product_id=p.id) }}" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  {% if error %}<div class="cons-err" role="alert" style="margin-bottom:12px;color:#b91c1c;background:rgba(239,68,68,.1);border:1px solid #ef4444;border-radius:8px;padding:10px 12px;">{{ error }}</div>{% endif %}
+
+  <div class="qr-step"><b>1. Colour</b></div>
+  <div class="opt-grid two">
+    {% for n in colour_names %}{% set c = (p.colour_options|selectattr('name', 'equalto', n)|list|first) %}
+    <label class="opt"><input class="opt-input" type="radio" name="colour" value="{{ n }}" {{ 'checked' if f.colour == n }} required><span class="opt-box"><i class="sw" style="background:{{ finish_hex(n) }};"></i><span>{{ n }}{% if c and c.price %}<small>₦{{ "{:,}".format(c.price) }}</small>{% elif p.colour_options %}<small>Price on request</small>{% endif %}</span></span></label>
+    {% endfor %}
+    <label class="opt"><input class="opt-input" type="radio" name="colour" value="Other" {{ 'checked' if f.colour == 'Other' }}><span class="opt-box"><i class="sw sw-other"></i><span>Another colour<small>Write it below</small></span></span></label>
+  </div>
+  <input type="text" name="colour_other" maxlength="60" value="{{ f.colour_other or '' }}" placeholder="Only if you chose Another colour">
+
+  <div class="qr-step"><b>2. Thickness</b> <small>Thicker frames use more aluminium and affect the price. Not sure? Let Andy advise.</small></div>
+  <div class="opt-grid two">
+    {% for v, label in thickness_options %}<label class="opt"><input class="opt-input" type="radio" name="thickness" value="{{ v }}" {{ 'checked' if f.thickness == v }} required><span class="opt-box"><span>{{ label }}</span></span></label>{% endfor %}
+  </div>
+
+  <div class="qr-step"><b>3. Size of one window or door</b> <small>Measure from the floor only. Never climb or lean out to measure. Andy will confirm exact sizes before anything is made.</small></div>
+  <div class="qr-size">
+    <label>Width<input type="number" name="width" inputmode="decimal" step="any" min="0" value="{{ f.width or '' }}" required></label>
+    <label>Height<input type="number" name="height" inputmode="decimal" step="any" min="0" value="{{ f.height or '' }}" required></label>
+    <label>Unit<select name="unit">{% for v, label in size_units %}<option value="{{ v }}" {{ 'selected' if f.unit == v }}>{{ label }}</option>{% endfor %}</select></label>
+    <label>How many<input type="number" name="quantity" min="1" max="200" value="{{ f.quantity or 1 }}" required></label>
+  </div>
+
+  <div class="qr-step"><b>4. Burglary protection</b></div>
+  <div class="opt-grid two">
+    {% for v, label in burglary_options %}<label class="opt"><input class="opt-input" type="radio" name="burglary" value="{{ v }}" {{ 'checked' if f.burglary == v }} required><span class="opt-box"><span>{{ label }}</span></span></label>{% endfor %}
+  </div>
+
+  <div class="qr-step"><b>5. Glass</b> <small>Type or choose the glass you prefer. Andy will confirm what is available.</small></div>
+  <input type="text" name="glass" list="glassList" maxlength="80" value="{{ f.glass or '' }}" placeholder="e.g. Clear, Frosted, Tinted" required>
+  <datalist id="glassList">{% for g in glass_suggestions %}<option value="{{ g }}">{% endfor %}</datalist>
+
+  <div class="qr-step"><b>6. Where will it go?</b></div>
+  <input type="text" name="location" maxlength="120" value="{{ f.location or '' }}" placeholder="Area or town for delivery and fitting" required>
+  <textarea name="notes" rows="3" maxlength="1000" placeholder="Anything else Andy should know (optional)">{{ f.notes or '' }}</textarea>
+  <label class="qr-file">Photos of the opening (optional, up to 6)<input type="file" name="attachments" accept="image/*,.pdf" multiple></label>
+
+  <button class="btn btn-purple qr-submit" type="submit" id="qrSubmit">Send request to Andy</button>
+  <p class="qr-fine">You will get your final price, transport and any other costs from Andy in your chat. Your sizes are your own measurements until Andy confirms them.</p>
+</form>
+<script>
+(function() { var f = document.querySelector('.qr-form'); if (!f) return; f.addEventListener('submit', function() { var b = document.getElementById('qrSubmit'); b.disabled = true; b.textContent = 'Sending…'; }); })();
+</script>
 {% endblock %}
 ''',
 
@@ -4692,6 +4956,35 @@ MORE_TEMPLATES_3 = {
   </p>
 </div>
 
+<div class="settings-card" id="verify">
+  <div class="settings-card-header">
+    <span class="settings-icon">🛡️</span>
+    <div>
+      <div class="settings-card-title">Verify it's you</div>
+      <div class="settings-card-sub">Answer two questions and choose a secret word, so Andy can confirm it is really you if you ever forget your password</div>
+    </div>
+  </div>
+  {% if verify %}<p style="font-size:13px;margin:0 0 10px;color:#15803d;font-weight:600;">✅ Set up. Questions you chose: {{ verify.q1 }} · {{ verify.q2 }}</p>{% endif %}
+  <form method="POST" action="{{ url_for('settings_verify') }}" class="auth-form" style="max-width:380px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="save">
+    <select name="q1" required aria-label="First question"><option value="">First question</option>{% for q in verify_questions %}<option value="{{ q }}">{{ q }}</option>{% endfor %}</select>
+    <input type="text" name="a1" placeholder="Your answer" autocomplete="off" maxlength="120" required>
+    <select name="q2" required aria-label="Second question"><option value="">Second question</option>{% for q in verify_questions %}<option value="{{ q }}">{{ q }}</option>{% endfor %}</select>
+    <input type="text" name="a2" placeholder="Your answer" autocomplete="off" maxlength="120" required>
+    <input type="text" name="secret" placeholder="Your secret word or phrase" autocomplete="off" maxlength="120" required>
+    <input type="password" name="current_password" placeholder="Current password" required>
+    <button class="btn btn-purple" type="submit">{{ 'Replace my answers' if verify else 'Save my answers' }}</button>
+  </form>
+  <p style="font-size:12px;color:var(--text-muted);margin:10px 0 0;">Your answers are stored scrambled. Nobody, including Andy, can read them. Andy only sees whether they matched.</p>
+  {% if verify %}
+  <form method="POST" action="{{ url_for('settings_verify') }}" class="auth-form" style="max-width:380px;margin-top:10px;"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="remove">
+    <input type="password" name="current_password" placeholder="Current password" required>
+    <button class="btn btn-outline" type="submit">Remove my answers</button>
+  </form>
+  {% endif %}
+</div>
+
 {% endblock %}
 ''',
 
@@ -4702,7 +4995,27 @@ MORE_TEMPLATES_3 = {
 <div class="info-card" style="max-width:400px;">
   <form method="POST" action="{{ url_for('forgot_password') }}" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="email" name="email" placeholder="Your account email" required>
-    <button class="btn btn-purple" type="submit">Send reset link</button>
+    <button class="btn btn-purple" type="submit">Continue</button>
+  </form>
+</div>
+
+{% endblock %}
+''',
+
+"verify_identity.html": '''{% extends "base.html" %}
+{% block content %}
+
+<div class="section-title">🔒 Verify it's you</div>
+<div class="info-card" style="max-width:420px;">
+  <p style="font-size:14px;color:var(--text-muted);margin:0 0 12px;">Answer the questions you chose in Settings. Spelling, capital letters and spaces do not matter.</p>
+  <form method="POST" action="{{ url_for('verify_identity') }}" class="auth-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label style="font-size:13px;font-weight:600;">{{ q1 }}</label>
+    <input type="text" name="a1" autocomplete="off" maxlength="120" required>
+    <label style="font-size:13px;font-weight:600;">{{ q2 }}</label>
+    <input type="text" name="a2" autocomplete="off" maxlength="120" required>
+    <label style="font-size:13px;font-weight:600;">Your secret word</label>
+    <input type="text" name="secret" autocomplete="off" maxlength="120" required>
+    <button class="btn btn-purple" type="submit">Check my answers</button>
   </form>
 </div>
 
@@ -5965,6 +6278,47 @@ body.push-gate-open { overflow: hidden; }
 .ask-more p { margin: 0 0 14px; font-size: 14.5px; line-height: 1.55; color: var(--text-muted); }
 .ask-more .btn { border-radius: 999px; padding: 12px 24px; }
 
+/* Catalogue: prices, colours, request form */
+.price-note { margin: 0 0 14px; padding: 10px 12px; border-left: 3px solid var(--accent); background: var(--card-bg); border-radius: 0 10px 10px 0; font-size: 13.5px; line-height: 1.5; color: var(--text-muted); }
+.pprice small { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-right: 2px; }
+.colour-chips { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 10px; }
+.colour-chips .finish { margin-top: 0; font-size: 12.5px; white-space: nowrap; max-width: 100%; }
+.colour-chips .finish b { color: var(--accent); font-weight: 700; margin-left: 2px; }
+.qr-back { display: inline-block; margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--accent); text-decoration: none; min-height: 32px; line-height: 32px; }
+.qr-product { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; }
+.qr-product img, .qr-art { width: 96px; height: 96px; border-radius: 12px; object-fit: cover; flex-shrink: 0; background: #0A1426; overflow: hidden; }
+.qr-art svg { width: 100%; height: 100%; }
+.qr-name { margin: 2px 0 4px; font-size: 21px; letter-spacing: -0.01em; color: var(--navy); }
+.qr-form { max-width: 640px; }
+.qr-form input[type=text], .qr-form input[type=number], .qr-form select, .qr-form textarea { width: 100%; box-sizing: border-box; min-height: 44px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-family: inherit; background: var(--bg); color: var(--navy); margin-top: 8px; }
+.qr-form textarea { min-height: 84px; resize: vertical; }
+.qr-step { margin: 22px 0 8px; font-size: 15px; color: var(--navy); }
+.qr-step small { display: block; font-size: 12.5px; font-weight: 400; color: var(--text-muted); line-height: 1.45; margin-top: 2px; }
+.opt-grid { display: grid; gap: 8px; grid-template-columns: 1fr; }
+.opt { position: relative; display: block; cursor: pointer; }
+.opt-input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.opt-box { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 10px 12px; border: 1.5px solid var(--border); border-radius: 12px; background: var(--card-bg); color: var(--navy); font-size: 14.5px; line-height: 1.3; }
+.opt-box small { display: block; font-size: 12px; color: var(--text-muted); }
+.opt-input:checked + .opt-box { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(34,197,94,.28); }
+.opt-input:focus-visible + .opt-box { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sw { width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(128,128,128,.5); flex-shrink: 0; display: inline-block; }
+.sw-other { background: conic-gradient(#C0C4CC, #1E5FA8, #1F6B45, #C8AD7F, #C0C4CC); }
+.qr-size { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.qr-size label { font-size: 12.5px; color: var(--text-muted); display: block; }
+.qr-file { display: block; margin-top: 12px; font-size: 13px; color: var(--text-muted); }
+.qr-file input { display: block; margin-top: 6px; max-width: 100%; }
+.qr-submit { width: 100%; margin-top: 20px; padding: 14px; border-radius: 12px; font-size: 16px; }
+.qr-fine { font-size: 12.5px; line-height: 1.5; color: var(--text-muted); margin: 10px 0 0; }
+@media (min-width: 560px) { .opt-grid.two { grid-template-columns: 1fr 1fr; } .qr-size { grid-template-columns: repeat(4, 1fr); } }
+.cp-grid { margin: 8px 0; }
+.cp-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+.cp-row { display: grid; grid-template-columns: 22px 18px 1fr; gap: 8px; align-items: center; margin-bottom: 6px; font-size: 13.5px; }
+.cp-row i { width: 16px; height: 16px; border-radius: 50%; border: 1px solid rgba(128,128,128,.5); }
+.cp-row input[type=number] { grid-column: 1 / -1; margin: 0 0 4px; }
+.cp-help { font-size: 12px; color: var(--text-muted); line-height: 1.45; }
+.cp-edit { margin-top: 6px; font-size: 12px; }
+.cp-edit summary { cursor: pointer; font-weight: 600; color: var(--accent); min-height: 32px; display: flex; align-items: center; }
+
 /* iPhone / small-screen polish */
 @media (max-width: 360px) {
   .bottom-tabs a, .bottom-tabs button { font-size: 10px; }
@@ -6863,7 +7217,7 @@ def style_css():
     return Response(STYLE_CSS, mimetype="text/css")
 
 
-app.jinja_env.globals.update(finish_hex=lambda n: finish_hex(n), finish_names=lambda: FINISH_NAMES, product_styles=lambda: PRODUCT_STYLES)
+app.jinja_env.globals.update(finishes=lambda: FINISHES, finish_hex=lambda n: finish_hex(n), finish_names=lambda: FINISH_NAMES, product_styles=lambda: PRODUCT_STYLES)
 
 
 @app.template_filter("photo_url")
@@ -7016,6 +7370,32 @@ def _message_flood(user_id, limit=20, window=60):
 
 _COMMON_PASSWORDS = {"123456", "1234567", "12345678", "123456789", "1234567890", "password", "password1", "qwerty", "qwerty123", "111111",
                      "000000", "abc123", "iloveyou", "admin123", "welcome1", "andy123", "andyalloy", "aluminium", "aluminum"}
+
+
+VERIFY_QUESTIONS = [
+    "In which town or area did you grow up?",
+    "What was the name of your first school?",
+    "What was the first thing you bought with your own money?",
+    "Which teacher do you remember best (first name and surname)?",
+    "What was your first phone (brand and model)?",
+    "Where did you spend a holiday you will never forget?",
+    "What was the name of your first job or business?",
+]
+VERIFY_MAX_FAILS = 5
+
+
+def _norm_answer(text):
+    """Letters and numbers only, lower case, no accents: 'St. Mary's ' and 'st marys' count as the same answer."""
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text or "")
+    return "".join(ch.lower() for ch in text if ch.isalnum() and not unicodedata.combining(ch))
+
+
+def _verify_locked(row):
+    try:
+        return bool(row["locked_until"]) and __import__("datetime").datetime.fromisoformat(str(row["locked_until"])) > __import__("datetime").datetime.utcnow()
+    except Exception:
+        return False
 
 
 def _password_problem(pw):
@@ -7259,6 +7639,10 @@ def forgot_password():
             reset_link = url_for("reset_password", token=token, _external=True)
             # The link is only ever sent to the account's own email (when SMTP is set up) or shown
             # to the owner in the admin overview. It is NEVER shown to the person making the request.
+            has_answers = conn.execute("SELECT 1 FROM identity_checks WHERE user_id = ?", (user["id"],)).fetchone() is not None
+            check = "emailed" if email_configured() else ("pending" if has_answers else "none")
+            conn.execute("UPDATE users SET reset_check = ? WHERE id = ?", (check, user["id"]))
+            conn.commit()
             if email_configured():
                 send_email_async(user["email"], "Reset your ANDY password",
                                  f"Hi {user['name']},\n\nUse this link within 1 hour to choose a new password:\n{reset_link}\n\n"
@@ -7269,10 +7653,57 @@ def forgot_password():
         conn.close()
         if email_configured():
             flash("A reset link has been sent to that email. It works for 1 hour. If you don't see it, check your spam folder.", "success")
+        elif check == "pending":
+            session["fp_user"] = {"id": user["id"], "t": time.time()}
+            return redirect(url_for("verify_identity"))
         else:
-            flash("Email isn't set up on this site yet, so no email was sent. Andy has been told about your request and can send you a reset link.", "error")
+            flash("Andy has been told about your request. You haven't set up \"Verify it's you\" yet, so Andy will check with you another way before sending a reset link.", "success")
         return redirect(url_for("forgot_password"))
     return render_template("forgot_password.html", user=None, active_page="forgot_password", auto_open_auth=False)
+
+
+@app.route("/forgot-password/verify", methods=["GET", "POST"])
+def verify_identity():
+    """Step 2 of a reset when email can't be sent: the person answers the questions they chose in Settings."""
+    fp = session.get("fp_user") or {}
+    if not fp or time.time() - fp.get("t", 0) > 900:
+        session.pop("fp_user", None)
+        return redirect(url_for("forgot_password"))
+    conn = get_db()
+    row = conn.execute("SELECT * FROM identity_checks WHERE user_id = ?", (fp["id"],)).fetchone()
+    if not row:
+        conn.close()
+        session.pop("fp_user", None)
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        if _login_rate_limited(f"verify:{request.remote_addr}"):
+            conn.close()
+            flash("Too many attempts. Please wait a few minutes and try again.", "error")
+            return redirect(url_for("verify_identity"))
+        _record_login_attempt(f"verify:{request.remote_addr}")
+        if _verify_locked(row):
+            conn.close()
+            session.pop("fp_user", None)
+            flash("Too many wrong answers. Andy has been told and will check with you another way.", "error")
+            return redirect(url_for("forgot_password"))
+        ok = (check_password_hash(row["a1"], _norm_answer(request.form.get("a1", "")))
+              & check_password_hash(row["a2"], _norm_answer(request.form.get("a2", "")))
+              & check_password_hash(row["secret"], _norm_answer(request.form.get("secret", ""))))
+        if ok:
+            conn.execute("UPDATE identity_checks SET failed = 0, locked_until = '' WHERE user_id = ?", (fp["id"],))
+            conn.execute("UPDATE users SET reset_check = 'matched' WHERE id = ?", (fp["id"],))
+            conn.commit(); conn.close(); session.pop("fp_user", None)
+            flash("Thank you. Your answers matched. Andy has been told and will send you a reset link.", "success")
+            return redirect(url_for("forgot_password"))
+        fails = (row["failed"] or 0) + 1
+        locked = (__import__("datetime").datetime.utcnow() + __import__("datetime").timedelta(hours=1)).isoformat() if fails >= VERIFY_MAX_FAILS else ""
+        conn.execute("UPDATE identity_checks SET failed = ?, locked_until = ? WHERE user_id = ?", (fails, locked, fp["id"]))
+        conn.execute("UPDATE users SET reset_check = 'failed' WHERE id = ?", (fp["id"],))
+        conn.commit(); conn.close()
+        flash("Those answers didn't match. Please try again.", "error")
+        return redirect(url_for("verify_identity"))
+    conn.close()
+    return render_template("verify_identity.html", user=None, q1=row["q1"], q2=row["q2"], active_page="forgot_password", auto_open_auth=False)
 
 
 @app.route("/reset-password/<token>", methods=["GET", "POST"])
@@ -7302,7 +7733,7 @@ def reset_password(token):
             conn.close()
             flash(problem, "error")
             return redirect(url_for("reset_password", token=token))
-        conn.execute("UPDATE users SET password_hash = ?, reset_token = '', reset_token_expires = '' WHERE id = ?",
+        conn.execute("UPDATE users SET password_hash = ?, reset_token = '', reset_token_expires = '', reset_check = '' WHERE id = ?",
                      (generate_password_hash(new_password), user["id"]))
         conn.commit()
         conn.close()
@@ -8121,10 +8552,13 @@ def admin_dashboard():
         JOIN users ON jobs.customer_id = users.id ORDER BY jobs.id DESC LIMIT 10
     """).fetchall()
     resets = []
-    for r in conn.execute("SELECT name, email, reset_token, reset_token_expires FROM users WHERE reset_token IS NOT NULL AND reset_token != ''").fetchall():
+    for r in conn.execute("SELECT id, name, email, reset_token, reset_token_expires, reset_check FROM users WHERE reset_token IS NOT NULL AND reset_token != ''").fetchall():
         try:
             if __import__("datetime").datetime.fromisoformat(str(r["reset_token_expires"])) > __import__("datetime").datetime.utcnow():
-                resets.append({"name": r["name"], "email": r["email"], "link": url_for("reset_password", token=r["reset_token"], _external=True)})
+                chk = r["reset_check"] or ""
+                resets.append({"id": r["id"], "name": r["name"], "email": r["email"], "check": chk,
+                               "show_link": chk in ("matched", "approved", "emailed", ""),
+                               "link": url_for("reset_password", token=r["reset_token"], _external=True)})
         except Exception:
             pass
     conn.close()
@@ -8472,6 +8906,125 @@ def catalog():
                             total_products=sum(counts.values()), active_cat=active_cat, active_page="catalog", auto_open_auth=False)
 
 
+@app.route("/dashboard/update_product/<int:product_id>", methods=["POST"])
+def update_product(product_id):
+    user = require_owner()
+    if not user:
+        return redirect(url_for("home"))
+    try:
+        price = max(0, int(float((request.form.get("price", "0") or "0").replace(",", ""))))
+    except ValueError:
+        price = 0
+    conn = get_db()
+    conn.execute("UPDATE products SET price = ?, style = ?, colours_json = ? WHERE id = ?",
+                 (price, _clean_short(request.form.get("style", "")), _parse_colour_prices(request.form), product_id))
+    conn.commit()
+    conn.close()
+    flash("Product updated.", "success")
+    return redirect(url_for("dashboard_catalog"))
+
+
+@app.route("/catalogue/request/<int:product_id>", methods=["GET", "POST"])
+def quote_request(product_id):
+    """Browse -> choose a product -> specifications -> sent to Andy. No price is calculated for the client."""
+    user = current_user()
+    if not user:
+        flash("Please log in or create an account to send a request.", "login_error")
+        return redirect(url_for("home") + "#login")
+    if not is_customer(user):
+        flash("Requests are sent from client accounts.", "error")
+        return redirect(url_for("catalog"))
+    conn = get_db()
+    row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    conn.close()
+    if not row:
+        return _error_response(404, "Product not found", "That product isn't in the catalogue any more.", "🔎")
+    prod = _product_dict(row)
+    colour_names = [c["name"] for c in prod["colour_options"]] or FINISH_NAMES
+
+    def page(form, error="", status=200):
+        return render_template("quote_request.html", user=user, p=prod, f=form, error=error, colour_names=colour_names,
+                               thickness_options=THICKNESS_OPTIONS, burglary_options=BURGLARY_OPTIONS, size_units=SIZE_UNITS,
+                               glass_suggestions=GLASS_SUGGESTIONS, active_page="catalog", auto_open_auth=False), status
+
+    if request.method == "GET":
+        return page({"unit": "ft", "quantity": "1"})
+
+    form = {k: request.form.get(k, "").strip() for k in ("colour", "colour_other", "thickness", "width", "height", "unit", "quantity",
+                                                           "burglary", "glass", "location", "notes")}
+    form["glass"], form["location"], form["colour_other"] = _clean_short(form["glass"], 80), _clean_short(form["location"], 120), _clean_short(form["colour_other"], 60)
+    form["notes"] = form["notes"][:1000]
+    colour_ok = form["colour"] in colour_names or (form["colour"] == "Other" and form["colour_other"])
+    labels = dict(THICKNESS_OPTIONS)
+    try:
+        width, height, qty = float(form["width"]), float(form["height"]), int(form["quantity"] or 1)
+    except ValueError:
+        return page(form, "Please enter the width and height as numbers, and the quantity as a whole number.", 400)
+    cm = _CM_PER_UNIT.get(form["unit"])
+    if not colour_ok:
+        return page(form, "Please choose a colour, or choose Other and write the colour you want.", 400)
+    if form["thickness"] not in labels:
+        return page(form, "Please choose a thickness.", 400)
+    if not cm or not (10 <= width * cm <= 1000) or not (10 <= height * cm <= 1000):
+        return page(form, "Please check the size. Enter the width and height of one window or door.", 400)
+    if not (1 <= qty <= 200):
+        return page(form, "Please enter how many you need (1 to 200).", 400)
+    if form["burglary"] not in dict(BURGLARY_OPTIONS):
+        return page(form, "Please choose with or without burglary protection.", 400)
+    if not form["glass"]:
+        return page(form, "Please tell us the glass you prefer, for example Clear, Frosted or Tinted.", 400)
+    if not form["location"]:
+        return page(form, "Please tell us the area where it will be delivered and fitted.", 400)
+    if _login_rate_limited(f"quote:{user['id']}"):
+        return page(form, "You have sent several requests in a short time. Please wait a few minutes and try again.", 429)
+
+    colour_label = form["colour_other"] if form["colour"] == "Other" else form["colour"]
+    shown = next((c["price"] for c in prod["colour_options"] if c["name"] == form["colour"] and c["price"]), None) or (prod["price"] if prod["price"] > 0 else None)
+    lines = ["Quote request from the catalogue",
+             f"Product: {prod['name']} ({prod['category']}{', ' + prod['style'] if prod.get('style') else ''}) - catalogue item #{prod['id']}",
+             f"Standard price shown to the client: {'N{:,}'.format(shown) if shown else 'price on request'} (not a final price)",
+             f"Colour: {colour_label}", f"Thickness: {labels[form['thickness']]}",
+             f"Size (client's own measurement, not verified): {width:g} wide x {height:g} high, in {dict(SIZE_UNITS)[form['unit']]}",
+             f"Quantity: {qty}", f"Burglary protection: {'With' if form['burglary'] == 'with' else 'Without'}",
+             f"Glass: {form['glass']}", f"Delivery and fitting area: {form['location']}"]
+    if form["notes"]:
+        lines.append(f"Notes: {form['notes']}")
+    description = "\n".join(lines)
+    title = f"Quote request: {prod['name']}"[:120]
+    category = prod["category"] if prod["category"] in JOB_CATEGORIES else "Aluminum Fabrication"
+    conn = None
+    try:
+        conn = get_db()
+        dup = conn.execute("SELECT id FROM jobs WHERE customer_id=? AND title=? AND description=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1",
+                           (user["id"], title, description)).fetchone()
+        if dup:
+            conn.close()
+            flash("You already sent this request. Here is its chat.", "success")
+            return redirect(url_for("job_thread", job_id=dup["id"]))
+        cur = conn.execute("INSERT INTO jobs (customer_id, title, description, category, track, status) VALUES (?, ?, ?, ?, 'standard', 'submitted')",
+                           (user["id"], title, description, category))
+        job_id = cur.lastrowid
+        for f in [f for f in request.files.getlist("attachments") if f and f.filename][:6]:
+            stored, kind = _save_attachment(f, ATTACHMENTS_UPLOAD_DIR)
+            if stored:
+                conn.execute("INSERT INTO job_attachments (job_id, filename, kind) VALUES (?, ?, ?)", (job_id, stored, kind))
+        _post_system_message(conn, job_id, "Request submitted. Andy will review your specifications and reply in this chat with the final price, transport and any other costs. Nothing has been charged.")
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print("[ANDY] Quote request failed:", exc)
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return page(form, "Sorry, we could not send your request just now and nothing was submitted. Please try again.", 500)
+    _record_login_attempt(f"quote:{user['id']}")
+    _notify_owner_new_request(user, {"id": job_id, "title": title, "category": category, "customer_id": user["id"], "artisan_id": None}, description, "quote request")
+    flash("Your request has been sent. Andy will reply in this chat with the final price, transport and any other costs.", "success")
+    return redirect(url_for("job_thread", job_id=job_id))
+
+
 @app.route("/catalog/add_to_cart/<int:product_id>", methods=["POST"])
 def add_to_cart(product_id):
     user = require_login()
@@ -8626,8 +9179,8 @@ def add_product():
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url, colour, style) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (name, category, description, price, sizes, image_value, video_value, colour, style),
+        "INSERT INTO products (name, category, description, price, sizes_csv, image_filename, video_url, colour, style, colours_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, category, description, price, sizes, image_value, video_value, colour, style, _parse_colour_prices(request.form)),
     )
     conn.commit()
     conn.close()
@@ -9382,6 +9935,61 @@ def paystack_verify():
 # SETTINGS
 # ---------------------------------------------------------------------------
 
+@app.route("/settings/verify", methods=["POST"])
+def settings_verify():
+    user = require_login()
+    if not user:
+        return redirect(url_for("home"))
+    action = request.form.get("action", "save")
+    key = f"verifyset:{user['id']}"
+    if _login_rate_limited(key):
+        flash("Too many attempts. Please wait a few minutes and try again.", "error")
+        return redirect(url_for("settings") + "#verify")
+    if not check_password_hash(user["password_hash"], request.form.get("current_password", "")):
+        _record_login_attempt(key)
+        flash("That isn't your current password, so nothing was changed.", "error")
+        return redirect(url_for("settings") + "#verify")
+    conn = get_db()
+    if action == "remove":
+        conn.execute("DELETE FROM identity_checks WHERE user_id = ?", (user["id"],))
+        conn.commit(); conn.close()
+        flash("Your \"Verify it's you\" answers were removed.", "success")
+        return redirect(url_for("settings") + "#verify")
+    q1, q2 = request.form.get("q1", ""), request.form.get("q2", "")
+    a1, a2, secret = _norm_answer(request.form.get("a1", "")), _norm_answer(request.form.get("a2", "")), _norm_answer(request.form.get("secret", ""))
+    problem = None
+    if q1 not in VERIFY_QUESTIONS or q2 not in VERIFY_QUESTIONS:
+        problem = "Please choose two questions from the list."
+    elif q1 == q2:
+        problem = "Please choose two different questions."
+    elif len(a1) < 2 or len(a2) < 2:
+        problem = "Please answer both questions."
+    elif len(secret) < 4:
+        problem = "Your secret word needs at least 4 letters or numbers."
+    if problem:
+        conn.close()
+        flash(problem, "error")
+        return redirect(url_for("settings") + "#verify")
+    conn.execute("DELETE FROM identity_checks WHERE user_id = ?", (user["id"],))
+    conn.execute("INSERT INTO identity_checks (user_id, q1, a1, q2, a2, secret) VALUES (?, ?, ?, ?, ?, ?)",
+                 (user["id"], q1, generate_password_hash(a1), q2, generate_password_hash(a2), generate_password_hash(secret)))
+    conn.commit(); conn.close()
+    flash("Saved. Your answers are stored scrambled, so nobody (including Andy) can read them.", "success")
+    return redirect(url_for("settings") + "#verify")
+
+
+@app.route("/admin/reset/<int:user_id>/approve", methods=["POST"])
+def admin_approve_reset(user_id):
+    user = require_owner()
+    if not user:
+        return redirect(url_for("home"))
+    conn = get_db()
+    conn.execute("UPDATE users SET reset_check = 'approved' WHERE id = ? AND reset_token != ''", (user_id,))
+    conn.commit(); conn.close()
+    flash("Reset link unlocked. Send it only to the person you have confirmed.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     user = require_login()
@@ -9448,7 +10056,11 @@ def settings():
                 return resp
             conn.close()
             return redirect(url_for("settings"))
-    return render_template("settings.html", user=user, active_page="settings", auto_open_auth=False)
+    conn = get_db()
+    vrow = conn.execute("SELECT q1, q2, updated_at FROM identity_checks WHERE user_id = ?", (user["id"],)).fetchone()
+    conn.close()
+    return render_template("settings.html", user=user, active_page="settings", auto_open_auth=False,
+                           verify=dict(vrow) if vrow else None, verify_questions=VERIFY_QUESTIONS)
 
 
 init_db()
